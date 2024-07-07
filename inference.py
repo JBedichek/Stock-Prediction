@@ -2,11 +2,14 @@ import torch
 import torch.nn as nn
 import datetime
 from utils import *
+from Models import *
 from Training import QTrainingData, GenerateDataDict
 from tqdm import tqdm
+import os
 
 class stock_inference:
-    def __init__(self, model_pth, s_pth, p_pth, device='cuda', start_date=(2024, 5, 1), end_date=(2024, 5, 1), n=5, seq_len=50, num_bins=160, load_dataset=False):
+    def __init__(self, model_pth, s_pth, p_pth, sectors_pth, device='cuda', start_date=(2024, 5, 1), 
+                 end_date=(2024, 5, 1), n=5, seq_len=50, num_bins=160, load_dataset=False, data_dict_pth='DataDict_2024-06-26'):
         # Data dict -> date : company : data(tensor)
         self.num_bins = num_bins
         self.start_date = datetime.date(start_date[0], start_date[1], start_date[2])
@@ -14,11 +17,14 @@ class stock_inference:
         self.model = torch.load(model_pth).eval().to(device)
         if load_dataset:
             self.dataset = pic_load('InferenceDataset')
+            print('Loaded Dataset...')
         else:
-            self.dataset = QTrainingData(s_pth, p_pth, seq_len, n=n, full=False, load=True, inference=(self.start_date, self.end_date))
+            
+            self.dataset = QTrainingData(s_pth, p_pth, seq_len, n=n, full=False, load=1, data_dict_pth=data_dict_pth,
+                                        inference=(self.start_date, self.end_date), sectors_pth=sectors_pth,
+                                    )
             save_pickle(self.dataset, 'InferenceDataset')
         self.companies = self.dataset.companies
-        #print(len(self.companies))
         self.i_dataset = self.dataset.inference_data
         self.n = n
         self.cum_money = 1000
@@ -28,26 +34,32 @@ class stock_inference:
         #print(day_data)
         return day_data
     
-    def get_expected_q(self, pred, num_bins=21, device='cuda'):
+    def get_expected_q(self, pred, device='cuda'):
+        '''
+        Takes a vector of logits, corresponding to probability bins, and outputs a mean
+        price prediction.
+        '''
         softmax = nn.Softmax(dim=0)
-        reward_values = torch.linspace(-0.2, 0.2, self.num_bins).repeat(2, 1).to(device)
-        expected_reward = torch.sum(reward_values*softmax(pred), dim=1)
-        r_val = torch.max(expected_reward).item()
-        return r_val
+        #reward_values = torch.linspace(-0.2, 0.2, self.num_bins).repeat(2, 1).to(device)
+        reward_values = torch.linspace(-0.2, 0.2, self.num_bins, device='cuda:0')
+        #expected_reward = torch.sum(reward_values*softmax(pred), dim=1)
+        expected_reward = torch.sum(reward_values*softmax(pred), dim=0)
+        #r_val = torch.max(expected_reward).item()
+        return expected_reward
 
     def get_top_q_buy(self, top_n, date, show=True, low=False, entropy=True):
+        '''
+        Iterates through all companies in the dataset on a given date, gets
+        the model predictions, and selects the top_n best companies to buy based
+        on those predictions.
+        '''
         with torch.no_grad():
             pred = {}
             best_pred = {}
             entropies = {}
             for company in tqdm(self.companies):
                 try:
-                    #a = list(self.i_dataset[date].keys())
-
-                    #print(a[0:3])
                     data = self.i_dataset[date][company]
-                    
-                    
                     if data is None:
                         pass
                     else:
@@ -127,6 +139,13 @@ class stock_inference:
         return profits
     
     def get_price_volume_bounds(self, date):
+        '''
+        This calculates the upper and lower bounds, as well as the mean and 
+        std deviation of the total money traded for companies on the stock market
+        on a given date (price * volume). Downstream, it is used to generate a z-score
+        and unit cube placement of individual companies to get a relative indicator of
+        market cash flow on the stock. 
+        '''
         price_volumes = []
         for company in self.companies:
             try:
@@ -161,13 +180,26 @@ class stock_inference:
     
 
 def main():
-    model_pth = 'Dist600_warm141'
-    summaries_pth = 'inf_summary_embs.pickle'
-    prices_pth = 'unnorm_price_series_inf_-5y-2024-06-25__.pickle'
-    load_dataset = 1
+   # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    #os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+    l_model_pth = 'L1_Dist600_E22'
+    b_model_pth = 'Dist600__E12'
+    model_pth = 'inf_model'
+    gen_model = 1
+
+    if gen_model:
+        model = Composed_Dist_Pred(b_model_pth, l_model_pth)
+        torch.save(model, model_pth)
+
+    summaries_pth = 'i_summary_embs.pickle'
+    sectors_pth = 'i_sector_dict'
+    prices_pth = 'unnorm_price_series_i_-10y-2024-07-01__.pickle'
+    data_dict_pth = 'DataDict_inf_10y'
+    load_dataset = 0
     low = 0
     entropy = 0
-    a = stock_inference(model_pth, summaries_pth, prices_pth, start_date=(2024, 4, 3), end_date=(2024, 6, 25), n=2, seq_len=600, load_dataset=load_dataset)
+    a = stock_inference(model_pth, summaries_pth, prices_pth, start_date=(2024, 1, 3), end_date=(2024, 6, 26), 
+            n=2, seq_len=600, load_dataset=load_dataset, num_bins=320, sectors_pth=sectors_pth)
     a.run_trading_sim(1, datetime.date(2024, 4, 5), 55, low=low, entropy=entropy)
 if __name__ == '__main__':
     main()
