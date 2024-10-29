@@ -25,4 +25,6 @@ There are 5 pieces of stock information which are defined every market day for a
 
 open, high, low, close, volume
 
-The firs
+
+
+This code was not made with the intention of being easy or intuitive to read by others, so it may appear somewhat disorganized.
