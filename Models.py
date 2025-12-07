@@ -233,6 +233,83 @@ class L1_Dist_Pred(nn.Module):
         x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
         return x
 
+    def transformer(self, x):
+        batch_size = x.shape[0]
+        #print(x.shape)
+        # Send the data through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+        return x
+    
+class L2_Dist_Pred(nn.Module):
+    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1, s_scale=0, dropout=0.1):
+        super(L2_Dist_Pred, self).__init__()
+        self.num_bins = num_bins
+        self.seq_len = seq_len
+        self.dim = data_dim
+        self.num_preds = num_days-1
+        self.act_fn = nn.GELU
+        self.act = nn.GELU()
+        self.scale = scale
+        self.s_scale = s_scale
+        self.sum_emb = 768
+        self.seq_dim = (self.seq_len+19)*self.dim
+        self.dropout = nn.Dropout(dropout)
+        
+        # Transformer Layers
+        self.layers = nn.ModuleList([base_transformer_layer(act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
+                                            dim_ff=ff, dropout=0.1) for i in range(layers)])  
+        linear_in_dim = 800
+        
+        # Classification Head
+        self.linear_in = nn.Sequential(
+            nn.Linear(self.seq_dim, linear_in_dim),
+            self.act_fn())
+        
+        self.cls_head_in = nn.Sequential(
+            nn.Linear(320*4, 320*4+200),
+            self.act_fn(),
+            nn.Linear(320*4+200, 320*4+200),
+            self.act_fn())
+
+        self.linear_out = nn.Sequential(
+            nn.Linear(linear_in_dim+320*4+200, int(linear_in_dim*2.5)),
+            self.act_fn(),
+            nn.Linear(int(linear_in_dim*2.5), int(linear_in_dim*2.5)),
+            self.act_fn(),
+            nn.Linear(int(linear_in_dim*2.5), num_bins*self.num_preds))
+
+        print('Linear Params: ', sum(param.numel() for param in self.linear_in.parameters()))
+        print('Transformer params ', sum(param.numel() for param in self.layers.parameters()))
+    
+    def forward(self, x, pred):
+        batch_size = x.shape[0]
+        #print(x.shape)
+        # Send the data through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+
+        # Send transformer activation through linear classification head
+        x = torch.reshape(x, (batch_size, self.seq_dim))
+        
+        pred = self.cls_head_in(torch.reshape(pred, (batch_size, self.num_bins*4)))
+        x = self.linear_in(x)
+        x = torch.cat((x, pred), dim=1)
+        x = self.linear_out(x)
+
+        # Return reshaped output
+        x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
+        return x
+
+    def transformer(self, x):
+        batch_size = x.shape[0]
+        #print(x.shape)
+        # Send the data through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+        return x
+    
+    
 class Composed_Dist_Pred(nn.Module):
     def __init__(self, base_pth, layer_pth):
         super(Composed_Dist_Pred, self).__init__()

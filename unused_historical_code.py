@@ -1223,6 +1223,251 @@ class MarketDayDAE(nn.Module):
             x = self.act_fn(layer(x))
         return x
 
+class Dist_DirectPredSumTran(nn.Module):
+    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1):
+        super(Dist_DirectPredSumTran, self).__init__()
+        self.num_bins = num_bins
+        self.seq_len = seq_len
+        self.dim = data_dim
+        self.num_preds = num_days-1
+        self.act_fn = nn.GELU
+        self.scale = scale
+        self.sum_emb = sum_emb
+        self.seq_dim = self.seq_len*self.dim
+
+        self.layers = nn.ModuleList([c_transformer_layer(static_dim=sum_emb, seq_dim=self.seq_dim, act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
+                                            dim_ff=ff, dropout=0.1) for i in range(layers)])  
+        self.linear = nn.Sequential(
+            nn.Linear(seq_len*data_dim, int(self.scale*seq_len*data_dim)),
+            nn.GELU(),
+            nn.Linear(int(self.scale*seq_len*data_dim), int(self.scale*seq_len*data_dim)),
+            nn.GELU(),
+            nn.Linear(int(self.scale*seq_len*data_dim), int(self.scale*seq_len*data_dim)),
+            nn.GELU(),
+            nn.Linear(int(self.scale*seq_len*data_dim), int(self.scale*seq_len*data_dim)),
+            nn.GELU(),
+            nn.Linear(int(self.scale*seq_len*data_dim), num_bins*self.num_preds),
+            )
+        self.pos_encoding = PositionalEncoding(data_dim, seq_len)
+        self._encoding = nn.Parameter(self.pos_encoding.encoding, requires_grad=False)   
+
+    def pos_encode(self, x):
+        batch_size, seq_len, data_dim = x.size()
+        return self._encoding[:seq_len, :]
+    
+
+    def encode(self, x, s):
+        batch_size = x.shape[0]
+        x = x + self.pos_encode(x)
+        res = 0
+        init_res = 0
+        res_2 = 0
+        res_3 = 0
+        res_4 = 0
+        res_5 = 0
+        res_6 = 0
+        res_7 = 0
+        res_8 = 0
+        res_9 = 0
+        res_10 = 0
+        res_11 = 0
+        res_12 = 0
+        res_13 = 0
+        res_14 = 0
+        i = 0
+        for layer in self.layers:
+            n = i+3
+            x = (layer(x, s) + (res + init_res + res_2 + res_3+res_4+res_5+res_6+res_7+res_8+res_9+res_10+
+                                res_11+res_12+res_13+res_14))/(sqrt(n))
+            res = x 
+            if i == 0:
+                init_res = x
+            if i == 1:
+                res_2 = x
+            if i == 2:
+                res_3 = x
+            if i == 3:
+                res_4 = x
+            if i == 4:
+                res_5 = x
+            if i == 5:
+                res_6 = x
+            if i == 6:
+                res_7 = x
+            if i == 7:
+                res_8 = x
+            if i == 8:
+                res_9 = x
+            if i == 9:
+                res_10 = x
+            if i == 10:
+                res_11 = x
+            if i == 11:
+                res_12 = x
+            if i == 12:
+                res_13 = x
+            if i == 13:
+                res_14 = x
+            i += 1
+        transformer_activation = x
+        x = torch.reshape(x, (batch_size, self.seq_dim))
+        x = self.linear(x) # 1 160 4
+        #print(x.shape)
+        softmax = nn.Softmax(dim=1)
+        x = softmax(x)
+        linear_output = x.flatten()
+        return (transformer_activation, linear_output) # Shape (200, 52), ()
+    
+    def forward(self, x, s):
+        #print(x.shape, s.shape)
+        #print(self.pos_enc.encoding.device, x.device)
+        batch_size = x.shape[0]
+        #print(x.shape, self.pos_encode(x).shape)
+        x = x + self.pos_encode(x)
+        res = 0
+        init_res = 0
+        res_2 = 0
+        res_3 = 0
+        res_4 = 0
+        res_5 = 0
+        res_6 = 0
+        res_7 = 0
+        res_8 = 0
+        res_9 = 0
+        res_10 = 0
+        res_11 = 0
+        res_12 = 0
+        res_13 = 0
+        res_14 = 0
+        res_15 = 0
+        res_16 = 0
+        res_17 = 0
+        res_18 = 0
+        res_19 = 0
+        #res_20 = 0
+        #res_21 = 0
+        #res_22 = 0
+        #res_23 = 0
+        #res_24 = 0
+        #res_25 = 0
+        i = 0
+        for layer in self.layers:
+            n = i+3
+            x = (layer(x, s) + (res + init_res + res_2 + res_3+res_4+res_5+res_6+res_7+res_8+res_9+res_10+
+                                res_11+res_12+res_13+res_14))/(sqrt(n))
+            res = x 
+            if i == 0:
+                init_res = x
+            if i == 1:
+                res_2 = x
+            if i == 2:
+                res_3 = x
+            if i == 3:
+                res_4 = x
+            if i == 4:
+                res_5 = x
+            if i == 5:
+                res_6 = x
+            if i == 6:
+                res_7 = x
+            if i == 7:
+                res_8 = x
+            if i == 8:
+                res_9 = x
+            if i == 9:
+                res_10 = x
+            if i == 10:
+                res_11 = x
+            if i == 11:
+                res_12 = x
+            if i == 12:
+                res_13 = x
+            if i == 13:
+                res_14 = x
+            i += 1
+        x = torch.reshape(x, (batch_size, self.seq_dim))
+        x = self.linear(x)
+        x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
+        return x
+
+class Layer_Dist_DirectPredSumTran(nn.Module):
+    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1,num_lin_layers=8):
+        super(Layer_Dist_DirectPredSumTran, self).__init__()
+        self.num_lin_layers = num_lin_layers
+        self.num_bins = num_bins
+        self.seq_len = seq_len*2
+        self.dim = data_dim
+        #self.dim = data_dim*2
+        self.num_preds = num_days-1
+        self.act_fn = nn.GELU
+        self.act = nn.GELU()
+        self.scale = scale
+        self.sum_emb = sum_emb
+        self.seq_dim = self.seq_len*self.dim
+        self.layer_act_dim = 160*4
+        self.layers = nn.ModuleList([c_transformer_layer(static_dim=self.layer_act_dim, seq_dim=self.seq_dim, act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
+                                            dim_ff=ff, dropout=0.1) for i in range(layers)])  
+        self.summary_module_dim = 300
+        self.sum_scale = 3
+        self.linear_in = nn.Sequential(
+            nn.Linear(self.seq_len*self.dim+self.summary_module_dim+4*160, int(self.scale*self.seq_len*data_dim)),
+            nn.GELU(),
+            )
+        self.linear_layers = nn.ModuleList([nn.Linear(int(self.scale*self.seq_len*data_dim), int(self.scale*self.seq_len*data_dim)) for i in range(self.num_lin_layers)]) 
+        self.linear_out = nn.Linear(int(self.scale*self.seq_len*data_dim), num_bins*self.num_preds)
+        self.summary_module = nn.Sequential(
+            nn.Linear(sum_emb, int(self.sum_scale*sum_emb)),
+            nn.GELU(),
+            nn.Linear(int(self.sum_scale*sum_emb), int(self.sum_scale*sum_emb)),
+            nn.GELU(),
+            nn.Linear(int(self.sum_scale*sum_emb), int(self.sum_scale*sum_emb)),
+            nn.GELU(),
+            nn.Linear(int(self.sum_scale*sum_emb), self.summary_module_dim),
+            nn.GELU()
+        )
+        self.pos_encoding = PositionalEncoding(self.dim, int(self.seq_len/2))
+        self._encoding = nn.Parameter(self.pos_encoding.encoding, requires_grad=False)   
+
+    def pos_encode(self, x):
+        batch_size, seq_len, data_dim = x.size()
+        return self._encoding[:seq_len, :]
+
+    def forward(self, x, s, a_lin):
+        # x -> previous 200 days
+        # s -> summary embedding
+        # a_seq -> first 200 days from previous model
+        # a_lin -> flattened linear activation from  previous model
+        #print(x.shape, s.shape)
+        #print(self.pos_enc.encoding.device, x.device)
+        batch_size = x.shape[0]
+        #x = x + self.pos_encode(x)
+        #print(x[:,200:,:].shape, self.pos_encode(x[:,200:,:]).shape)
+        x[:,200:,:] = x[:,200:,:] + self.pos_encode(x[:,200:,:])
+        i = 0
+        #res = 0
+        for layer in self.layers:
+            x = layer(x, a_lin)
+        x = torch.reshape(x, (batch_size, self.seq_dim))
+        s = self.summary_module(s.squeeze(1))
+        #print(x.shape, s.shape)
+        x = torch.cat((x, s, a_lin), dim=-1)
+        x = self.linear_in(x)
+        #print(x, type(x))
+        l_res = 0
+        l_res_0 = 0
+        i = 0
+        for layer in self.linear_layers:
+            x = layer(x) + l_res + l_res_0
+            x = self.act(x)
+            l_res = x
+            if i == 0:
+                l_res_0 = x
+                i += 1
+        x = self.linear_out(x)
+        x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
+        return x
+    
+
 class V_DirectPredSumTran(nn.Module):
     def __init__(self, seq_len=350, data_dim=5, num_bins=21, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1):
         super(V_DirectPredSumTran, self).__init__()

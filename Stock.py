@@ -311,8 +311,8 @@ all_stocks.update(y_lot_of_stocks)
 all_stocks.update(z_lot_of_stocks)
 
 inference_stocks = s_lot_of_stocks
-inference_stocks.update(t_lot_of_stocks)
-inference_stocks.update(u_lot_of_stocks)
+#inference_stocks.update(t_lot_of_stocks)
+#inference_stocks.update(u_lot_of_stocks)
 
 print(f'Current Tickers Available: {len(all_stocks)}')
 
@@ -608,13 +608,13 @@ class stock_info:
     
 def main():
 
-    a = stock_info(all_stocks, 'a-z')
+    a = stock_info(inference_stocks, 'i')
     print(len(a.stocks.keys()), len(a.company_names))
-    #a.get_bulk_price_data_series('10y')
+    a.get_bulk_price_data_series('10y')
     #a.get_company_sectors()
-    b = a.get_company_text_info()
-    with open('a-z_summary_embs.pickle', 'wb') as out:
-        pickle.dump(b, out)
+    #b = a.get_company_text_info()
+    #with open('i_summary_embs.pickle', 'wb') as out:
+    #    pickle.dump(b, out)
 
 if __name__ == '__main__':
     main()

@@ -8,7 +8,7 @@ from math import sqrt
 from torch import Tensor
 from typing import Optional, Any, Union, Callable
 import torch.nn.functional as F
-
+import random
 
 class RobertaEncoder(nn.Module):
     def __init__(self, device='cuda:0'):
@@ -69,7 +69,7 @@ class base_transformer_layer(nn.Module):
     def __init__(self, act_fn, data_dim, nhead, dim_ff, dropout):
         super(base_transformer_layer, self).__init__()
         self.tran_layer = nn.TransformerEncoderLayer(d_model=data_dim, nhead=nhead, dim_feedforward=dim_ff, 
-                                    activation=act_fn(), batch_first=True, dropout=dropout)
+                                    activation=act_fn(), batch_first=True, dropout=dropout, norm_first=True)
         
     def forward(self, x):
         x = self.tran_layer(x)
@@ -173,6 +173,197 @@ class Dist_Pred(nn.Module):
 
         return x
 
+def temp_softmax(tensor, temp=1.0):
+    softmax = torch.nn.Softmax(dim=1)
+    return softmax(tensor/temp)
+
+class t_Dist_Pred(nn.Module):
+    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1, s_scale=0, num_cls_layers=6, dropout=0.15):
+        super(t_Dist_Pred, self).__init__()
+        self.num_bins = num_bins
+        self.seq_len = seq_len
+        self.dim = data_dim
+        self.num_preds = num_days-1
+        self.act_fn = nn.GELU
+        self.act = nn.GELU()
+        self.scale = scale
+        self.s_scale = s_scale
+        self.sum_emb = sum_emb
+        self.seq_dim = self.seq_len*self.dim
+        self.num_lin_layers = num_cls_layers
+        self.softmax = temp_softmax
+        self.dropout = nn.Dropout(dropout)
+        # Transformer Layers
+        self.layers = nn.ModuleList([base_transformer_layer(act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
+                                            dim_ff=ff, dropout=0.1) for i in range(layers)])  
+        
+        linear_in_dim = 2200
+        # Classification Head
+        '''
+        self.linear_layers = nn.ModuleList([nn.Linear(int(self.scale*self.seq_len*data_dim), int(self.scale*self.seq_len*data_dim)) for i in range(self.num_lin_layers)]) 
+        self.linear_out = nn.Linear(int(self.scale*self.seq_len*data_dim), num_bins*self.num_preds)
+        self.linear_in = nn.Sequential(
+            nn.Linear(self.seq_len*self.dim+self.sum_emb, int(self.scale*self.seq_len*data_dim)),
+            self.act_fn(),)
+        '''
+        self.linear_in = nn.Sequential(
+            self.dropout,
+            #nn.LayerNorm(normalized_shape=(1208)),
+            nn.Linear(604*2, linear_in_dim),
+            self.act_fn(),
+            self.dropout,
+            nn.Linear(linear_in_dim, linear_in_dim),
+            self.act_fn(),
+            self.dropout,
+            nn.Linear(linear_in_dim, num_bins*self.num_preds)
+            )
+
+        print('Linear Params: ', sum(param.numel() for param in self.linear_in.parameters()))
+        print('Transformer params ', sum(param.numel() for param in self.layers.parameters()))
+        
+        
+        # Summary Module
+        #self.summary_in = nn.Sequential(nn.Linear(sum_emb, int(self.s_scale*sum_emb)),
+        #                                self.act_fn())
+        #self.summary_layers = nn.ModuleList([nn.Linear(int(self.s_scale*sum_emb), int(self.s_scale*sum_emb))])
+        self.pos_emb = nn.Embedding(seq_len,data_dim)
+        nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+
+        self.pos_encoding = PositionalEncoding(data_dim, seq_len)
+        self._encoding = nn.Parameter(self.pos_encoding.encoding, requires_grad=False)
+        self.stochastic_depth_prob = 0.4
+        self.layer_drop_probs = [((i+1)/layers)*self.stochastic_depth_prob for i in range(layers)]
+
+    # For use in forward()
+    def pos_encode(self, x):
+        batch_size, seq_len, data_dim = x.size()
+        return self._encoding[:seq_len, :]
+    
+    def forward(self, x, s):
+        #print(x.shape)
+        batch_size = x.shape[0]
+        #x = x[:,:,:243]
+        #print(x.shape, s.shape)
+        #x = torch.flip(x,[1])
+        #x = x + self.pos_encode(x)
+        positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        pos_emb = self.pos_emb(positions)
+        pos_emb = self.dropout(pos_emb)
+        x = x + pos_emb
+        
+        # Reshape this to (batch, _, 52) so it can be appended to the end of the sequence
+        #print(s.shape)
+        s = s[:,:218*4]
+        #print(s.shape)
+        s = torch.reshape(s, (batch_size, 4, 218))
+        
+        # Add these data points to existing seqence
+        x = torch.cat((x, s), dim=1)
+
+        # Send the final data through transformer layers
+        init_res1 = x
+        init_res2 = 0
+        init_res3 = 0
+        init_res4 = 0
+        init_res5 = 0
+        #i = 0
+        for i, layer in enumerate(self.layers):
+            #x = layer(x) + init_res1*0.6+init_res2*0.6+init_res3*0.6+init_res4*0.6+init_res5*0.6
+            if random.random() > self.layer_drop_probs[i] and self.training:
+                x = layer(x) + init_res1
+            elif self.training:
+                x = x
+            else:
+                x = layer(x)*(1-self.layer_drop_probs[i]) + init_res1
+            #x = layer(x)
+            #if i == 2:
+            #    init_res2 = x
+            #if i == 4:
+            #    init_res3 = x
+            #if i == 6:
+            #    init_res4 = x
+            #if i == 8:
+            #    init_res5 = x
+            if i % int(len(self.layers)/7) == 0: 
+                init_res1 = x
+            #i += 1
+        # Send transformer activation through linear classification head
+        #print(x.shape)
+        x1 = torch.mean(x[:,:,int(x.shape[2]/2):], dim=2)
+        x2 = torch.mean(x[:,:,:int(x.shape[2]/2)], dim=2)
+        #print(x1.shape, x2.shape)
+        x = torch.cat((x1, x2), dim=1)
+        #x = x.squeeze(2)
+        #x = torch.reshape(x, (batch_size, self.seq_dim+self.sum_emb+156))
+        #x = torch.reshape(x, (batch_size, 619*2))
+
+        x = self.linear_in(x)
+        #for lin_layer in self.linear_layers:
+        #    x = lin_layer(x)
+        #    x = self.act(x)
+            # x = self.dropout(x)
+        #x = self.linear_out(x)
+
+        # Return reshaped output
+        x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
+        # = self.softmax(x)
+        if not self.training:
+            x = self.softmax(x)
+        return x
+    
+    def forward_with_t_act(self, x, s):
+        batch_size = x.shape[0]
+        positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        pos_emb = self.pos_emb(positions)
+        pos_emb = self.dropout(pos_emb)
+        x = x + pos_emb
+        
+        # Reshape this to (batch, _, 52) so it can be appended to the end of the sequence
+        s = s[:,:218*4]
+        s = torch.reshape(s, (batch_size, 4, 218))
+        
+        # Add these data points to existing seqence
+        x = torch.cat((x, s), dim=1)
+
+        # Send the final data through transformer layers
+        init_res1 = x
+        for i, layer in enumerate(self.layers):
+            x = layer(x) + init_res1
+            if i % int(len(self.layers)/4) == 0: 
+                init_res1 = x
+            #i += 1
+        # Send transformer activation through linear classification head
+        #print(x.shape)
+        x1 = torch.mean(x[:,:,int(x.shape[2]/2):], dim=2)
+        x2 = torch.mean(x[:,:,:int(x.shape[2]/2)], dim=2)
+        #print(x1.shape, x2.shape)
+        t_act = torch.cat((x1, x2), dim=1)
+
+
+        x = self.linear_in(t_act)
+
+        # Return reshaped output
+        x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
+        x = self.softmax(x)
+
+        return x, t_act
+    
+    def transformer(self, x, s):
+        '''
+        Returns the transformer activation of the network
+        for downstream greedy training.
+        '''
+        
+        batch_size = x.shape[0]
+        x = torch.flip(x, [1])
+        x = x + self.pos_encode(x)
+        s = torch.reshape(s, (batch_size, 19, 52))
+        x = torch.cat((x, s), dim=1)
+        for layer in self.layers:
+            x = layer(x)
+
+        return x
+
 class L1_Dist_Pred(nn.Module):
     def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1, s_scale=0, dropout=0.1):
         super(L1_Dist_Pred, self).__init__()
@@ -233,270 +424,163 @@ class L1_Dist_Pred(nn.Module):
         x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
         return x
 
-class Composed_Dist_Pred(nn.Module):
-    def __init__(self, base_pth, layer_pth):
-        super(Composed_Dist_Pred, self).__init__()
-        self.base = torch.load(base_pth).eval()
-        self.layer = torch.load(layer_pth).eval()
-        for param in self.base.parameters():
-            param.requires_grad = False
-        for param in self.layer.parameters():
-            param.requires_grad = False
-        
-    
-    def forward(self, data, sum):
-        pred = self.base(data, sum)
-        t_act = self.base.transformer(data, sum)
-        data = torch.flip(data,[1])
-        data = data + self.base.pos_encode(data)
-        sum = torch.reshape(sum, (1, 19, 52))
-        data = torch.cat((data, sum), dim=1)
-        t_act = torch.cat((t_act, data), dim=2)
-        return self.layer(t_act, pred)
-class Dist_DirectPredSumTran(nn.Module):
-    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1):
-        super(Dist_DirectPredSumTran, self).__init__()
+    def transformer(self, x):
+        batch_size = x.shape[0]
+        #print(x.shape)
+        # Send the data through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+class L2_Dist_Pred(nn.Module):
+    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1, s_scale=0, dropout=0.1):
+        super(L2_Dist_Pred, self).__init__()
         self.num_bins = num_bins
         self.seq_len = seq_len
         self.dim = data_dim
         self.num_preds = num_days-1
         self.act_fn = nn.GELU
-        self.scale = scale
-        self.sum_emb = sum_emb
-        self.seq_dim = self.seq_len*self.dim
-
-        self.layers = nn.ModuleList([c_transformer_layer(static_dim=sum_emb, seq_dim=self.seq_dim, act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
-                                            dim_ff=ff, dropout=0.1) for i in range(layers)])  
-        self.linear = nn.Sequential(
-            nn.Linear(seq_len*data_dim, int(self.scale*seq_len*data_dim)),
-            nn.GELU(),
-            nn.Linear(int(self.scale*seq_len*data_dim), int(self.scale*seq_len*data_dim)),
-            nn.GELU(),
-            nn.Linear(int(self.scale*seq_len*data_dim), int(self.scale*seq_len*data_dim)),
-            nn.GELU(),
-            nn.Linear(int(self.scale*seq_len*data_dim), int(self.scale*seq_len*data_dim)),
-            nn.GELU(),
-            nn.Linear(int(self.scale*seq_len*data_dim), num_bins*self.num_preds),
-            )
-        self.pos_encoding = PositionalEncoding(data_dim, seq_len)
-        self._encoding = nn.Parameter(self.pos_encoding.encoding, requires_grad=False)   
-
-    def pos_encode(self, x):
-        batch_size, seq_len, data_dim = x.size()
-        return self._encoding[:seq_len, :]
-    
-
-    def encode(self, x, s):
-        batch_size = x.shape[0]
-        x = x + self.pos_encode(x)
-        res = 0
-        init_res = 0
-        res_2 = 0
-        res_3 = 0
-        res_4 = 0
-        res_5 = 0
-        res_6 = 0
-        res_7 = 0
-        res_8 = 0
-        res_9 = 0
-        res_10 = 0
-        res_11 = 0
-        res_12 = 0
-        res_13 = 0
-        res_14 = 0
-        i = 0
-        for layer in self.layers:
-            n = i+3
-            x = (layer(x, s) + (res + init_res + res_2 + res_3+res_4+res_5+res_6+res_7+res_8+res_9+res_10+
-                                res_11+res_12+res_13+res_14))/(sqrt(n))
-            res = x 
-            if i == 0:
-                init_res = x
-            if i == 1:
-                res_2 = x
-            if i == 2:
-                res_3 = x
-            if i == 3:
-                res_4 = x
-            if i == 4:
-                res_5 = x
-            if i == 5:
-                res_6 = x
-            if i == 6:
-                res_7 = x
-            if i == 7:
-                res_8 = x
-            if i == 8:
-                res_9 = x
-            if i == 9:
-                res_10 = x
-            if i == 10:
-                res_11 = x
-            if i == 11:
-                res_12 = x
-            if i == 12:
-                res_13 = x
-            if i == 13:
-                res_14 = x
-            i += 1
-        transformer_activation = x
-        x = torch.reshape(x, (batch_size, self.seq_dim))
-        x = self.linear(x) # 1 160 4
-        #print(x.shape)
-        softmax = nn.Softmax(dim=1)
-        x = softmax(x)
-        linear_output = x.flatten()
-        return (transformer_activation, linear_output) # Shape (200, 52), ()
-    
-    def forward(self, x, s):
-        #print(x.shape, s.shape)
-        #print(self.pos_enc.encoding.device, x.device)
-        batch_size = x.shape[0]
-        #print(x.shape, self.pos_encode(x).shape)
-        x = x + self.pos_encode(x)
-        res = 0
-        init_res = 0
-        res_2 = 0
-        res_3 = 0
-        res_4 = 0
-        res_5 = 0
-        res_6 = 0
-        res_7 = 0
-        res_8 = 0
-        res_9 = 0
-        res_10 = 0
-        res_11 = 0
-        res_12 = 0
-        res_13 = 0
-        res_14 = 0
-        res_15 = 0
-        res_16 = 0
-        res_17 = 0
-        res_18 = 0
-        res_19 = 0
-        #res_20 = 0
-        #res_21 = 0
-        #res_22 = 0
-        #res_23 = 0
-        #res_24 = 0
-        #res_25 = 0
-        i = 0
-        for layer in self.layers:
-            n = i+3
-            x = (layer(x, s) + (res + init_res + res_2 + res_3+res_4+res_5+res_6+res_7+res_8+res_9+res_10+
-                                res_11+res_12+res_13+res_14))/(sqrt(n))
-            res = x 
-            if i == 0:
-                init_res = x
-            if i == 1:
-                res_2 = x
-            if i == 2:
-                res_3 = x
-            if i == 3:
-                res_4 = x
-            if i == 4:
-                res_5 = x
-            if i == 5:
-                res_6 = x
-            if i == 6:
-                res_7 = x
-            if i == 7:
-                res_8 = x
-            if i == 8:
-                res_9 = x
-            if i == 9:
-                res_10 = x
-            if i == 10:
-                res_11 = x
-            if i == 11:
-                res_12 = x
-            if i == 12:
-                res_13 = x
-            if i == 13:
-                res_14 = x
-            i += 1
-        x = torch.reshape(x, (batch_size, self.seq_dim))
-        x = self.linear(x)
-        x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
-        return x
-
-class Layer_Dist_DirectPredSumTran(nn.Module):
-    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1,num_lin_layers=8):
-        super(Layer_Dist_DirectPredSumTran, self).__init__()
-        self.num_lin_layers = num_lin_layers
-        self.num_bins = num_bins
-        self.seq_len = seq_len*2
-        self.dim = data_dim
-        #self.dim = data_dim*2
-        self.num_preds = num_days-1
-        self.act_fn = nn.GELU
         self.act = nn.GELU()
         self.scale = scale
-        self.sum_emb = sum_emb
-        self.seq_dim = self.seq_len*self.dim
-        self.layer_act_dim = 160*4
-        self.layers = nn.ModuleList([c_transformer_layer(static_dim=self.layer_act_dim, seq_dim=self.seq_dim, act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
+        self.s_scale = s_scale
+        self.sum_emb = 768
+        self.seq_dim = (self.seq_len+19)*self.dim
+        self.dropout = nn.Dropout(dropout)
+        
+        # Transformer Layers
+        self.layers = nn.ModuleList([base_transformer_layer(act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
                                             dim_ff=ff, dropout=0.1) for i in range(layers)])  
-        self.summary_module_dim = 300
-        self.sum_scale = 3
+        linear_in_dim = 700
+        
+        # Classification Head
         self.linear_in = nn.Sequential(
-            nn.Linear(self.seq_len*self.dim+self.summary_module_dim+4*160, int(self.scale*self.seq_len*data_dim)),
-            nn.GELU(),
-            )
-        self.linear_layers = nn.ModuleList([nn.Linear(int(self.scale*self.seq_len*data_dim), int(self.scale*self.seq_len*data_dim)) for i in range(self.num_lin_layers)]) 
-        self.linear_out = nn.Linear(int(self.scale*self.seq_len*data_dim), num_bins*self.num_preds)
-        self.summary_module = nn.Sequential(
-            nn.Linear(sum_emb, int(self.sum_scale*sum_emb)),
-            nn.GELU(),
-            nn.Linear(int(self.sum_scale*sum_emb), int(self.sum_scale*sum_emb)),
-            nn.GELU(),
-            nn.Linear(int(self.sum_scale*sum_emb), int(self.sum_scale*sum_emb)),
-            nn.GELU(),
-            nn.Linear(int(self.sum_scale*sum_emb), self.summary_module_dim),
-            nn.GELU()
-        )
-        self.pos_encoding = PositionalEncoding(self.dim, int(self.seq_len/2))
-        self._encoding = nn.Parameter(self.pos_encoding.encoding, requires_grad=False)   
+            nn.Linear(self.seq_dim, linear_in_dim),
+            self.dropout,
+            self.act_fn())
+        
+        self.cls_head_in = nn.Sequential(
+            nn.Linear(320*4, 320*4+200),
+            self.act_fn(),
+            nn.Linear(320*4+200, 320*4+200),
+            self.dropout,
+            self.act_fn())
 
-    def pos_encode(self, x):
-        batch_size, seq_len, data_dim = x.size()
-        return self._encoding[:seq_len, :]
+        self.linear_out = nn.Sequential(
+            nn.Linear(linear_in_dim+320*4+200, int(linear_in_dim*2.5)),
+            self.dropout,
+            self.act_fn(),
+            nn.Linear(int(linear_in_dim*2.5), int(linear_in_dim*2.5)),
+            self.act_fn(),
+            nn.Linear(int(linear_in_dim*2.5), num_bins*self.num_preds))
 
-    def forward(self, x, s, a_lin):
-        # x -> previous 200 days
-        # s -> summary embedding
-        # a_seq -> first 200 days from previous model
-        # a_lin -> flattened linear activation from  previous model
-        #print(x.shape, s.shape)
-        #print(self.pos_enc.encoding.device, x.device)
+        print('Linear Params: ', sum(param.numel() for param in self.linear_in.parameters()))
+        print('Transformer params ', sum(param.numel() for param in self.layers.parameters()))
+    
+    def forward(self, x, pred):
         batch_size = x.shape[0]
-        #x = x + self.pos_encode(x)
-        #print(x[:,200:,:].shape, self.pos_encode(x[:,200:,:]).shape)
-        x[:,200:,:] = x[:,200:,:] + self.pos_encode(x[:,200:,:])
-        i = 0
-        #res = 0
+        #print(x.shape)
+        # Send the data through transformer layers
         for layer in self.layers:
-            x = layer(x, a_lin)
+            x = layer(x)
+
+        # Send transformer activation through linear classification head
         x = torch.reshape(x, (batch_size, self.seq_dim))
-        s = self.summary_module(s.squeeze(1))
-        #print(x.shape, s.shape)
-        x = torch.cat((x, s, a_lin), dim=-1)
+        
+        pred = self.cls_head_in(torch.reshape(pred, (batch_size, self.num_bins*4)))
         x = self.linear_in(x)
-        #print(x, type(x))
-        l_res = 0
-        l_res_0 = 0
-        i = 0
-        for layer in self.linear_layers:
-            x = layer(x) + l_res + l_res_0
-            x = self.act(x)
-            l_res = x
-            if i == 0:
-                l_res_0 = x
-                i += 1
+        x = torch.cat((x, pred), dim=1)
         x = self.linear_out(x)
+
+        # Return reshaped output
         x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
         return x
+
+class Full_L1_Dist_Pred(nn.Module):
+    def __init__(self, base_pth, layer_pth, train=True):
+        super(Full_L1_Dist_Pred, self).__init__()
+        self.base = torch.load(base_pth)
+        self.layer = torch.load(layer_pth)
+        if not train:
+            for param in self.base.parameters():
+                param.requires_grad = False
+            for param in self.layer.parameters():
+                param.requires_grad = False
+        
     
+    def forward(self, data, sum):
+        batch_size = data.shape[0]
+        pred = self.base(data, sum)
+        t_act = self.base.transformer(data, sum)
+        data = torch.flip(data,[1])
+        data = data + self.base.pos_encode(data)
+        sum = torch.reshape(sum, (batch_size, 19, 52))
+        data = torch.cat((data, sum), dim=1)
+        t_act = torch.cat((t_act, data), dim=2)
+        layer_pred = self.layer(t_act, pred)
+        return layer_pred
+
+
+class Composed_Dist_Pred(nn.Module):
+    def __init__(self, base_pth, layer_pth, layer2_pth, train=False):
+        super(Composed_Dist_Pred, self).__init__()
+        self.base = torch.load(base_pth)
+        self.layer = torch.load(layer_pth)
+        self.layer2 = torch.load(layer2_pth)
+        if not train:
+            for param in self.base.parameters():
+                param.requires_grad = False
+            for param in self.layer.parameters():
+                param.requires_grad = False
+            for param in self.layer2.parameters():
+                param.requires_grad = False
+        
+        
+    
+    def forward(self, data, sum):
+        batch_size = data.shape[0]
+        pred = self.base(data, sum)
+        t_act = self.base.transformer(data, sum)
+        data = torch.flip(data,[1])
+        data = data + self.base.pos_encode(data)
+        sum = torch.reshape(sum, (batch_size, 19, 52))
+        data = torch.cat((data, sum), dim=1)
+        t_act = torch.cat((t_act, data), dim=2)
+        layer_pred = self.layer(t_act, pred)
+        layer_t_act = self.layer.transformer(t_act)
+        t_activation = torch.cat((data, layer_t_act), dim=2)
+        x = self.layer2(t_activation, layer_pred)
+        softmax = nn.Softmax(dim=1)
+        return softmax(x)
+
+class Full_Dist_Pred(nn.Module):
+    def __init__(self, base_pth):
+        super(Full_Dist_Pred, self).__init__()
+        self.base = torch.load(base_pth)
+        self.extension = nn.Sequential(
+            nn.Linear(4*320, 2200),
+            nn.BatchNorm1d(2200),
+            nn.GELU(),
+            nn.Linear(2200, 2200),
+            nn.BatchNorm1d(2200),
+            nn.GELU(),
+            nn.Linear(2200, 2200),
+            nn.BatchNorm1d(2200),
+            nn.GELU(),
+            nn.Linear(2200, 2200),
+            nn.BatchNorm1d(2200),
+            nn.GELU(),
+            nn.Linear(2200, 320*4)
+        )
+        
+    
+    def forward(self, data, sum):
+        batch_size = data.shape[0]
+        _pred = self.base(data, sum)
+        _pred = torch.reshape(_pred, (batch_size, 320*4))
+        pred = self.extension(_pred)
+        pred = pred + _pred
+        return torch.reshape(pred, (batch_size, 320, 4))
+
 # The following is from hyunwoongko's implementation of the Transformer model: https://github.com/hyunwoongko/transformer
 class PositionalEncoding(nn.Module):
     """
@@ -541,4 +625,115 @@ class PositionalEncoding(nn.Module):
         # [seq_len = 30, d_model = 512]
         # it will add with tok_emb : [128, 30, 512]         
 
-   
+class meta_model(nn.Module):
+    def __init__(self, width, depth):
+        super(meta_model, self).__init__()
+        self.input = nn.Linear(2408, width)
+        self.network = nn.ModuleList([nn.Linear(width,width) for i in range(depth)])
+        self.output = nn.Linear(width,1)
+        self.act_fn = nn.GELU()
+        self.dropout = nn.Dropout(p=0.1)
+
+    def forward(self, t_act, pred):
+        batch_size = pred.shape[0]
+        pred = torch.reshape(pred, (batch_size, 300*4))
+        t_act = t_act.squeeze(1)
+        #print(t_act.shape)
+        x = torch.cat((t_act, pred), dim=1)
+    
+        
+        x = self.input(x)
+        x = self.act_fn(x)
+        for layer in self.network:
+            x = layer(x)
+            x = self.act_fn(x)
+            x = self.dropout(x)
+        #softmax = nn.Softmax(dim=1)
+        return self.output(x)
+
+class t_universal_transformer_Dist_Pred(nn.Module):
+    def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1, s_scale=0, num_cls_layers=6, dropout=0.15):
+        super(t_universal_transformer_Dist_Pred, self).__init__()
+        self.num_bins = num_bins
+        self.seq_len = seq_len
+        self.dim = data_dim
+        self.num_preds = num_days-1
+        self.act_fn = nn.GELU
+        self.act = nn.GELU()
+        self.scale = scale
+        self.s_scale = s_scale
+        self.sum_emb = sum_emb
+        self.seq_dim = self.seq_len*self.dim
+        self.num_lin_layers = num_cls_layers
+        self.softmax = temp_softmax
+        self.dropout = nn.Dropout(dropout)
+        self.depth = layers
+        # Transformer Layers
+        self.layers = nn.ModuleList([base_transformer_layer(act_fn=self.act_fn,data_dim=self.dim, nhead=nhead, 
+                                            dim_ff=ff, dropout=dropout)])  
+        
+        linear_in_dim = 2200
+        self.linear_in = nn.Sequential(
+            self.dropout,
+            #nn.LayerNorm(normalized_shape=(1208)),
+            nn.Linear(604*2, linear_in_dim),
+            self.act_fn(),
+            self.dropout,
+            nn.Linear(linear_in_dim, linear_in_dim),
+            self.act_fn(),
+            self.dropout,
+            nn.Linear(linear_in_dim, num_bins*self.num_preds)
+            )
+
+        print('Linear Params: ', sum(param.numel() for param in self.linear_in.parameters()))
+        print('Transformer params ', sum(param.numel() for param in self.layers.parameters()))
+        
+        
+        self.pos_emb = nn.Embedding(seq_len,data_dim)
+        nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+
+        self.pos_encoding = PositionalEncoding(data_dim, seq_len)
+        self._encoding = nn.Parameter(self.pos_encoding.encoding, requires_grad=False)
+        self.stochastic_depth_prob = 0.4
+        self.layer_drop_probs = [((i+1)/layers)*self.stochastic_depth_prob for i in range(layers)]
+
+    # For use in forward()
+    def pos_encode(self, x):
+        batch_size, seq_len, data_dim = x.size()
+        return self._encoding[:seq_len, :]
+    
+    def forward(self, x, s):
+        #print(x.shape)
+        batch_size = x.shape[0]
+
+        positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        pos_emb = self.pos_emb(positions)
+        pos_emb = self.dropout(pos_emb)
+        x = x + pos_emb
+        
+        # Reshape this to (batch, _, 52) so it can be appended to the end of the sequence
+        #print(s.shape)
+        s = s[:,:218*4]
+        #print(s.shape)
+        s = torch.reshape(s, (batch_size, 4, 218))
+        
+        # Add these data points to existing seqence
+        x = torch.cat((x, s), dim=1)
+        layer = self.layers[0]
+        for i in range(self.depth):
+            x = layer(x)
+
+            #i += 1
+        # Send transformer activation through linear classification head
+        x1 = torch.mean(x[:,:,int(x.shape[2]/2):], dim=2)
+        x2 = torch.mean(x[:,:,:int(x.shape[2]/2)], dim=2)
+        x = torch.cat((x1, x2), dim=1)
+
+        x = self.linear_in(x)
+
+
+        # Return reshaped output
+        x = torch.reshape(x, (batch_size, self.num_bins, self.num_preds))
+        if not self.training:
+            x = self.softmax(x)
+        return x
