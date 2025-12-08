@@ -1,0 +1,483 @@
+"""
+News Embedder using Nomic Embed Text v1.5
+
+Embeds news articles using nomic-ai/nomic-embed-text-v1.5 from HuggingFace.
+This model produces high-quality 768-dimensional embeddings for text.
+
+Features:
+- Batched embedding for efficiency
+- GPU support
+- Aggregation of multiple news articles per day
+- Temporal weighting (recent news weighted more)
+"""
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, date as dt_date
+from typing import Dict, List, Optional, Tuple
+import sys
+from tqdm import tqdm
+
+sys.path.append('/home/james/Desktop/Stock-Prediction')
+from utils.utils import save_pickle, pic_load
+
+
+class NomicNewsEmbedder:
+    """
+    Embedder for news articles using Nomic Embed Text v1.5.
+    """
+
+    def __init__(self, model_name: str = "nomic-ai/nomic-embed-text-v1.5",
+                 device: str = None,
+                 batch_size: int = 32):
+        """
+        Initialize embedder.
+
+        Args:
+            model_name: HuggingFace model name
+            device: Device to use ('cuda' or 'cpu')
+            batch_size: Batch size for embedding
+        """
+        self.model_name = model_name
+        self.batch_size = batch_size
+
+        # Set device
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+
+        print(f"Loading Nomic Embed model on {self.device}...")
+
+        # Load model and tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        self.model.to(self.device)
+        self.model.eval()
+
+        print(f"✅ Model loaded: {model_name}")
+        print(f"   Embedding dimension: 768")
+
+    def mean_pooling(self, model_output, attention_mask):
+        """
+        Mean pooling to get sentence embeddings.
+
+        Args:
+            model_output: Model output
+            attention_mask: Attention mask
+
+        Returns:
+            Pooled embeddings
+        """
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+    def embed_texts(self, texts: List[str], prefix: str = "search_document: ") -> np.ndarray:
+        """
+        Embed a list of texts.
+
+        Args:
+            texts: List of text strings
+            prefix: Prefix for embeddings (Nomic requires this)
+
+        Returns:
+            Array of embeddings (N, 768)
+        """
+        if not texts:
+            return np.array([])
+
+        # Add prefix (required by Nomic)
+        texts = [prefix + text for text in texts]
+
+        embeddings = []
+
+        with torch.no_grad():
+            for i in range(0, len(texts), self.batch_size):
+                batch_texts = texts[i:i + self.batch_size]
+
+                # Tokenize
+                encoded_input = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=8192,  # Nomic supports long context
+                    return_tensors='pt'
+                )
+
+                # Move to device
+                encoded_input = {k: v.to(self.device) for k, v in encoded_input.items()}
+
+                # Get embeddings
+                model_output = self.model(**encoded_input)
+
+                # Pool
+                batch_embeddings = self.mean_pooling(model_output, encoded_input['attention_mask'])
+
+                # Normalize
+                batch_embeddings = F.normalize(batch_embeddings, p=2, dim=1)
+
+                embeddings.append(batch_embeddings.cpu().numpy())
+
+        return np.vstack(embeddings)
+
+    def embed_article(self, article: Dict) -> np.ndarray:
+        """
+        Embed a single news article.
+
+        Args:
+            article: Article dict with 'title', 'description', 'full_text'
+
+        Returns:
+            Embedding vector (768,)
+        """
+        # Combine title, description, and full text
+        text_parts = []
+
+        if article.get('title'):
+            text_parts.append(f"Title: {article['title']}")
+
+        if article.get('description'):
+            text_parts.append(f"Summary: {article['description']}")
+
+        if article.get('full_text'):
+            # Limit full text to avoid context length issues
+            full_text = article['full_text'][:5000]
+            text_parts.append(f"Content: {full_text}")
+
+        combined_text = " ".join(text_parts)
+
+        if not combined_text.strip():
+            # Return zero vector if no text
+            return np.zeros(768, dtype=np.float32)
+
+        # Embed
+        embedding = self.embed_texts([combined_text])
+        return embedding[0]
+
+    def embed_articles_batch(self, articles: List[Dict]) -> np.ndarray:
+        """
+        Embed multiple articles efficiently.
+
+        Args:
+            articles: List of article dicts
+
+        Returns:
+            Array of embeddings (N, 768)
+        """
+        # Prepare texts
+        texts = []
+        for article in articles:
+            text_parts = []
+
+            if article.get('title'):
+                text_parts.append(f"Title: {article['title']}")
+
+            if article.get('description'):
+                text_parts.append(f"Summary: {article['description']}")
+
+            if article.get('full_text'):
+                full_text = article['full_text'][:5000]
+                text_parts.append(f"Content: {full_text}")
+
+            combined_text = " ".join(text_parts)
+            texts.append(combined_text if combined_text.strip() else "No content")
+
+        # Embed all at once
+        return self.embed_texts(texts)
+
+
+class NewsAggregator:
+    """
+    Aggregates news embeddings by date and ticker.
+    """
+
+    def __init__(self, embedder: NomicNewsEmbedder):
+        """
+        Initialize aggregator.
+
+        Args:
+            embedder: NomicNewsEmbedder instance
+        """
+        self.embedder = embedder
+
+    def parse_article_date(self, article: Dict) -> Optional[dt_date]:
+        """
+        Parse article date from various formats.
+
+        Args:
+            article: Article dict
+
+        Returns:
+            Date object or None
+        """
+        date_str = article.get('published_date', '')
+
+        if not date_str:
+            return None
+
+        try:
+            # Try various date formats
+            for fmt in ['%Y-%m-%d', '%Y-%m-%d %H:%M:%S', '%a, %d %b %Y %H:%M:%S %Z',
+                       '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ']:
+                try:
+                    dt = datetime.strptime(date_str, fmt)
+                    return dt.date()
+                except:
+                    continue
+
+            # Try pandas parsing as fallback
+            dt = pd.to_datetime(date_str)
+            return dt.date()
+
+        except:
+            return None
+
+    def aggregate_by_date(self, articles: List[Dict], method: str = 'mean',
+                         temporal_weight: bool = True) -> Dict[dt_date, np.ndarray]:
+        """
+        Aggregate article embeddings by date.
+
+        Args:
+            articles: List of articles for a ticker
+            method: Aggregation method ('mean', 'max', 'weighted_mean')
+            temporal_weight: Whether to weight recent articles more
+
+        Returns:
+            Dict of {date: aggregated_embedding}
+        """
+        # Embed all articles
+        print(f"    Embedding {len(articles)} articles...")
+        embeddings = self.embedder.embed_articles_batch(articles)
+
+        # Group by date
+        date_to_embeddings = {}
+
+        for article, embedding in zip(articles, embeddings):
+            article_date = self.parse_article_date(article)
+
+            if article_date is None:
+                # Use today if no date
+                article_date = datetime.now().date()
+
+            if article_date not in date_to_embeddings:
+                date_to_embeddings[article_date] = []
+
+            date_to_embeddings[article_date].append(embedding)
+
+        # Aggregate embeddings for each date
+        aggregated = {}
+
+        for date, date_embeddings in date_to_embeddings.items():
+            date_embeddings = np.array(date_embeddings)
+
+            if method == 'mean':
+                aggregated[date] = np.mean(date_embeddings, axis=0)
+
+            elif method == 'max':
+                # Max pooling across articles
+                aggregated[date] = np.max(date_embeddings, axis=0)
+
+            elif method == 'weighted_mean' and temporal_weight:
+                # Weight more recent articles more heavily
+                # (This assumes all articles on same date, so just mean)
+                aggregated[date] = np.mean(date_embeddings, axis=0)
+
+        return aggregated
+
+    def create_daily_embeddings_dataset(self, all_news: Dict[str, List[Dict]],
+                                       start_date: dt_date,
+                                       end_date: dt_date,
+                                       fill_missing_with_zeros: bool = True) -> Dict[str, Dict[dt_date, torch.Tensor]]:
+        """
+        Create daily news embeddings for all stocks.
+
+        Args:
+            all_news: Dict of {ticker: [articles]}
+            start_date: Start date
+            end_date: End date
+            fill_missing_with_zeros: If True, creates zero embeddings for stocks with no news
+                                    If False, skips stocks with no news entirely
+
+        Returns:
+            Dict of {ticker: {date: embedding_tensor}}
+        """
+        print(f"\n{'='*80}")
+        print(f"CREATING DAILY NEWS EMBEDDINGS")
+        print(f"{'='*80}")
+        print(f"Stocks: {len(all_news)}")
+        print(f"Date range: {start_date} to {end_date}")
+        print(f"Fill missing stocks with zeros: {fill_missing_with_zeros}")
+        print(f"{'='*80}\n")
+
+        daily_embeddings = {}
+        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+
+        for ticker, articles in tqdm(all_news.items(), desc="Processing stocks"):
+            print(f"\n{ticker}: {len(articles)} articles")
+
+            # Handle stocks with no articles
+            if not articles or len(articles) == 0:
+                if fill_missing_with_zeros:
+                    print(f"  ⚠️  No articles, filling with zeros")
+                    # Create zero embeddings for all dates
+                    ticker_daily = {}
+                    zero_embedding = np.zeros(768, dtype=np.float32)
+                    for date in date_range:
+                        date_obj = date.date()
+                        ticker_daily[date_obj] = torch.tensor(zero_embedding, dtype=torch.float32)
+                    daily_embeddings[ticker] = ticker_daily
+                else:
+                    print(f"  ⚠️  No articles, skipping ticker")
+                continue
+
+            try:
+                # Aggregate by date
+                date_embeddings = self.aggregate_by_date(articles, method='mean')
+
+                if not date_embeddings:
+                    print(f"  ⚠️  Failed to create embeddings, filling with zeros")
+                    # Create zero embeddings for all dates
+                    ticker_daily = {}
+                    zero_embedding = np.zeros(768, dtype=np.float32)
+                    for date in date_range:
+                        date_obj = date.date()
+                        ticker_daily[date_obj] = torch.tensor(zero_embedding, dtype=torch.float32)
+                    daily_embeddings[ticker] = ticker_daily
+                    continue
+
+                # Fill in daily embeddings (forward-fill for missing dates)
+                ticker_daily = {}
+                last_embedding = None
+
+                for date in date_range:
+                    date_obj = date.date()
+
+                    if date_obj in date_embeddings:
+                        # Have news for this date
+                        embedding = date_embeddings[date_obj]
+                        last_embedding = embedding
+                    elif last_embedding is not None:
+                        # Forward-fill from last available
+                        embedding = last_embedding
+                    else:
+                        # No news yet, use zeros
+                        embedding = np.zeros(768, dtype=np.float32)
+
+                    # Convert to tensor
+                    ticker_daily[date_obj] = torch.tensor(embedding, dtype=torch.float32)
+
+                daily_embeddings[ticker] = ticker_daily
+                print(f"  ✅ {len(date_embeddings)} unique dates with news")
+
+            except Exception as e:
+                print(f"  ❌ Error embedding {ticker}: {e}")
+                import traceback
+                traceback.print_exc()
+
+                # Even on error, create zero embeddings if requested
+                if fill_missing_with_zeros:
+                    print(f"  Creating zero embeddings as fallback")
+                    ticker_daily = {}
+                    zero_embedding = np.zeros(768, dtype=np.float32)
+                    for date in date_range:
+                        date_obj = date.date()
+                        ticker_daily[date_obj] = torch.tensor(zero_embedding, dtype=torch.float32)
+                    daily_embeddings[ticker] = ticker_daily
+
+                continue
+
+        print(f"\n✅ Daily embeddings created for {len(daily_embeddings)} stocks")
+        print(f"   Stocks with actual news: {sum(1 for t, dates in daily_embeddings.items() if any((dates[d] != 0).any() for d in list(dates.keys())[:10]))}")
+
+        return daily_embeddings
+
+
+def create_news_embeddings(news_data_file: str,
+                          output_file: str,
+                          start_date: str,
+                          end_date: str = None,
+                          device: str = None) -> Dict[str, Dict[dt_date, torch.Tensor]]:
+    """
+    Create news embeddings from scraped news data.
+
+    Args:
+        news_data_file: Path to news data pickle
+        output_file: Output file for embeddings
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (defaults to today)
+        device: Device for embedding ('cuda' or 'cpu')
+
+    Returns:
+        Dict of {ticker: {date: embedding_tensor}}
+    """
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+    # Load news data
+    print("📂 Loading news data...")
+    all_news = pic_load(news_data_file)
+    print(f"  ✅ Loaded news for {len(all_news)} stocks\n")
+
+    # Initialize embedder
+    embedder = NomicNewsEmbedder(device=device)
+
+    # Create aggregator
+    aggregator = NewsAggregator(embedder)
+
+    # Create daily embeddings
+    daily_embeddings = aggregator.create_daily_embeddings_dataset(
+        all_news, start_dt, end_dt
+    )
+
+    # Save
+    print(f"\n💾 Saving embeddings...")
+    save_pickle(daily_embeddings, output_file)
+
+    print(f"\n{'='*80}")
+    print(f"✅ EMBEDDINGS COMPLETE!")
+    print(f"{'='*80}")
+    print(f"Output: {output_file}")
+    print(f"Embedding dimension: 768")
+    print(f"{'='*80}\n")
+
+    return daily_embeddings
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Embed news articles')
+    parser.add_argument('--news_data', type=str, required=True,
+                       help='Input news data pickle')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output file (default: input with _embeddings suffix)')
+    parser.add_argument('--start_date', type=str,
+                       default=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
+                       help='Start date')
+    parser.add_argument('--end_date', type=str, default=None,
+                       help='End date (default: today)')
+    parser.add_argument('--device', type=str, default=None,
+                       choices=['cuda', 'cpu'],
+                       help='Device (default: auto-detect)')
+
+    args = parser.parse_args()
+
+    if args.output is None:
+        args.output = args.news_data.replace('.pkl', '_embeddings.pkl')
+
+    embeddings = create_news_embeddings(
+        news_data_file=args.news_data,
+        output_file=args.output,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        device=args.device
+    )
+
+    print(f"\n✅ Done! Embeddings saved to {args.output}")

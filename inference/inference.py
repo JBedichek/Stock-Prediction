@@ -1,15 +1,15 @@
 import torch
 import torch.nn as nn
 import datetime
-from utils import *
-from models import *
-from training import QTrainingData, GenerateDataDict
+from utils.utils import *
+from training.models import *
+from dataset_creation.dataset_processing import QTrainingData, GenerateDataDict
 from tqdm import tqdm
 import os
 import random 
 
 def generate_current_day_dataset(i_keep):
-    from stock import generate_day_data
+    from data_scraping.Stock import generate_day_data
     #generate_day_data()
     #bulk_prices_pth = 'unnorm_price_series_prediction_-5y-'+ f'{datetime.date.today()}'+'__.pickle'
     bulk_prices_pth = 'unnorm_price_series_prediction_-5y-'+ f'2024-12-15'+'__.pickle'

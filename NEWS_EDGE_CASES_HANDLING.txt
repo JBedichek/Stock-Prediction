@@ -1,0 +1,246 @@
+NEWS EMBEDDINGS: EDGE CASE HANDLING
+=====================================
+
+This document explains how the news scraping and embedding pipeline handles
+various edge cases when dealing with thousands of different stock tickers.
+
+## Edge Case 1: Stock Has No News Articles At All
+-------------------------------------------------
+
+Scenario: A small-cap or obscure stock has zero news articles across all sources.
+
+How it's handled:
+1. News scraper returns empty list [] for that ticker
+2. News embedder detects empty list
+3. Creates zero embeddings (768 zeros) for ALL dates in the range
+4. Ensures consistent tensor shape across all stocks
+
+Code path:
+- news_embedder.py:323-335 (create_daily_embeddings_dataset)
+- If fill_missing_with_zeros=True (default), creates zeros
+- If fill_missing_with_zeros=False, skips ticker entirely
+
+Result: Stock still processable, but with zero news signal
+
+
+## Edge Case 2: Stock Has News for Some Dates, Not Others
+----------------------------------------------------------
+
+Scenario: Stock has 50 news articles over 365 days (sparse coverage).
+
+How it's handled:
+1. Embed all 50 articles
+2. Group by publication date
+3. For dates WITH news: use actual embedding
+4. For dates WITHOUT news: forward-fill from last available
+5. For dates BEFORE first news: use zeros
+
+Code path:
+- news_embedder.py:356-371 (create_daily_embeddings_dataset)
+- Maintains last_embedding variable
+- Forward-fills gaps between news articles
+- Zeros before first article
+
+Result: Smooth temporal transition, no sudden jumps
+
+Example timeline:
+Jan 1-10:   [zeros] (no news yet)
+Jan 11:     [actual embedding from article on Jan 11]
+Jan 12-20:  [forward-fill from Jan 11] (no new news)
+Jan 21:     [actual embedding from article on Jan 21]
+Jan 22-31:  [forward-fill from Jan 21]
+
+
+## Edge Case 3: News Scraping Fails for a Ticker
+-------------------------------------------------
+
+Scenario: API error, timeout, or other exception during scraping.
+
+How it's handled:
+1. Exception caught in news_scraper.py
+2. Returns empty list for that ticker
+3. Processing continues with next ticker
+4. See Edge Case 1 for how empty list is handled
+
+Code path:
+- news_scraper.py: try/except blocks in each scraper method
+- news_embedder.py:376-390 (exception handling with fallback)
+
+Result: One failed ticker doesn't stop entire pipeline
+
+
+## Edge Case 4: News Embedding Fails for a Ticker
+--------------------------------------------------
+
+Scenario: Nomic model crashes, CUDA OOM, or malformed article text.
+
+How it's handled:
+1. Exception caught during embedding
+2. Traceback printed for debugging
+3. If fill_missing_with_zeros=True, creates zero embeddings
+4. Processing continues with next ticker
+
+Code path:
+- news_embedder.py:376-390 (exception with zero fallback)
+
+Result: Pipeline completes even if some tickers fail
+
+
+## Edge Case 5: Different Tickers Have Different News Availability
+-------------------------------------------------------------------
+
+Scenario: AAPL has 10,000 articles, obscure stock XYZ has 5.
+
+How it's handled:
+1. Each ticker processed independently
+2. AAPL: 10,000 articles embedded → rich daily signal
+3. XYZ: 5 articles embedded → sparse signal, mostly forward-filled
+4. Both end up with same tensor shape (768 dims per day)
+
+Code path:
+- news_embedder.py:319-391 (processes each ticker separately)
+
+Result: All stocks have consistent dimensions, varying signal quality
+
+
+## Edge Case 6: Stock Scraped for Fundamentals but Not News
+------------------------------------------------------------
+
+Scenario: Stock in comprehensive FMP data, but no news embeddings exist.
+
+How it's handled:
+1. Enhanced processor checks if news_embeddings exist for ticker
+2. If not found: uses zero embedding (768 zeros)
+3. Concatenates zeros with base features
+4. Tensor shape remains consistent
+
+Code path:
+- fmp_enhanced_processor.py:258-270 (to_tensor_dict_enhanced)
+- Checks if ticker in news_embeddings_all
+- Uses zeros as fallback
+
+Result: Stock still usable in training, just without news signal
+
+
+## Edge Case 7: News Embedding for Date Doesn't Exist
+------------------------------------------------------
+
+Scenario: Have news embeddings for ticker, but not for this specific date.
+
+How it's handled:
+1. Check if date in news_embeddings dict
+2. If not found: use zero embedding for that date
+3. Keeps tensor shape consistent
+
+Code path:
+- fmp_enhanced_processor.py:259-264
+
+Result: Graceful degradation to zeros for missing dates
+
+
+## Edge Case 8: No News Embeddings File Provided At All
+--------------------------------------------------------
+
+Scenario: Running enhanced processor without --news_embeddings argument.
+
+How it's handled:
+1. news_embeddings_file = None
+2. news_embeddings_all = None
+3. Processor runs normally
+4. include_news defaults to True, but zeros used for all stocks/dates
+
+Code path:
+- fmp_enhanced_processor.py:326-329 (loading check)
+- fmp_enhanced_processor.py:258-270 (zero fallback)
+
+Result: Pipeline still works, all stocks get zero news embeddings
+
+
+## Edge Case 9: Malformed Article Data
+---------------------------------------
+
+Scenario: Article has no title, description, or full_text.
+
+How it's handled:
+1. Embedder checks each field with .get()
+2. Combines available fields only
+3. If all empty: embeds "No content" string
+4. Model still produces valid 768-dim embedding
+
+Code path:
+- news_embedder.py:173-190 (embed_articles_batch)
+
+Result: Never crashes on bad data
+
+
+## Edge Case 10: Extremely Long Articles
+-----------------------------------------
+
+Scenario: Article full_text is 50,000 characters (book-length).
+
+How it's handled:
+1. Truncate to 5,000 characters
+2. Still provides context without exceeding model limits
+3. Prevents CUDA OOM errors
+
+Code path:
+- news_embedder.py:183 (truncation)
+- Tokenizer max_length=8192 enforced
+
+Result: Long articles handled gracefully
+
+
+## Summary: Robustness Guarantees
+==================================
+
+1. Pipeline NEVER crashes due to missing news
+2. All stocks end up with SAME tensor shape
+3. Missing news → zeros (explicit "no signal")
+4. Partial news → forward-filled (smooth signal)
+5. Error during embedding → zeros with traceback
+6. Malformed data → handled gracefully
+7. Works with any subset of stocks having news
+
+## Testing Edge Cases
+
+Run the test suite:
+    python tests/test_news_pipeline.py
+
+This tests:
+- Empty news lists
+- Sparse coverage
+- Missing dates
+- Integration with enhanced processor
+
+## Configuration Options
+
+In create_daily_embeddings_dataset():
+- fill_missing_with_zeros=True (default)
+  → All stocks get embeddings (zeros if no news)
+
+- fill_missing_with_zeros=False
+  → Skips stocks with no news entirely
+  → Use if you only want stocks WITH news
+
+In to_tensor_dict_enhanced():
+- include_news=True (default)
+  → Always adds 768-dim news embedding (zeros if missing)
+  → Keeps tensor shapes consistent
+
+- include_news=False
+  → Skips news embeddings entirely
+  → Use for ablation studies
+
+## Recommendation
+
+For production use:
+- Keep fill_missing_with_zeros=True
+- Keep include_news=True
+- Let model learn that zeros = "no news signal"
+- Ensures all stocks usable in training
+
+The model can learn to distinguish:
+- Rich news signal (actual embeddings)
+- Sparse news signal (forward-filled)
+- No news signal (zeros)
+- And weight them accordingly!

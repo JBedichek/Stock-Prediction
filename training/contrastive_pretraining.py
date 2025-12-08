@@ -1,11 +1,11 @@
-import Models
+from . import models
 import datetime
 import torch
 import torch.nn as nn
 import pickle
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from Stock import a_lot_of_stocks, stock_info, all_stocks
+from data_scraping.Stock import a_lot_of_stocks, stock_info, all_stocks
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -17,9 +17,9 @@ import wandb
 # 2. Autoencoded stock price embeddings (movement over next few weeks)
 
 
-#NewsVAE = Models.NewsEmbeddingVAE().to('cuda')
-#d_enc = Models.mpNetEncoder().to('cuda')
-#rob_enc = Models.RobertaEncoder().to('cuda:3')
+#NewsVAE = models.NewsEmbeddingVAE().to('cuda')
+#d_enc = models.mpNetEncoder().to('cuda')
+#rob_enc = models.RobertaEncoder().to('cuda:3')
 articles_pic = 'articles_1.pickle'
 full_data_pic = 'stock_data.pickle'
         
@@ -52,7 +52,7 @@ def get_articles(data, pth=articles_pic):
     out_data = np.array(out_data)
     out_data = np.hstack(out_data)
     for i in range(len(out_data)):
-        out_data[i] = Models.DailyNewsEncoder(out_data[i])
+        out_data[i] = models.DailyNewsEncoder(out_data[i])
     mean = np.mean(out_data)
     std = np.std(out_data, ddof=1)
     data_with_normalization = {0 : out_data, 1:(mean, std)}
@@ -374,7 +374,7 @@ def main():
     epochs = 9
     noise_level = 0.00
     grad_norm = 1
-    model = Models.MixedLayeredDAE(100).to('cuda')
+    model = models.MixedLayeredDAE(100).to('cuda')
     #model = torch.load('PricesSumVAE2.pth')
     pth = 'MixedDAE_250_L1.pth'
     print('Model Size:', sum(param.numel() for param in model.parameters()))

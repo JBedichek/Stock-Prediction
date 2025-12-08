@@ -1,0 +1,134 @@
+===============================================================================
+QUICK COMMAND REFERENCE
+===============================================================================
+
+BASIC USAGE
+-----------
+# Test run (3 stocks, 1 year)
+python generate_full_dataset.py --dataset test --years 1
+
+# Production (370 stocks, 25 years)
+python generate_full_dataset.py --dataset s_lot --years 25
+
+# Full dataset (4000+ stocks, 25 years)
+python generate_full_dataset.py --dataset all --years 25
+
+
+RESUME AFTER INTERRUPTION
+--------------------------
+# Skip completed steps
+python generate_full_dataset.py --dataset s_lot --skip-steps 1 2
+
+# Resume fundamentals from specific ticker
+python generate_full_dataset.py --dataset s_lot --resume-from MSFT
+
+# Resume with both
+python generate_full_dataset.py --dataset s_lot --skip-steps 1 --resume-from MSFT
+
+
+SPEED OPTIMIZATIONS
+-------------------
+# Skip cross-sectional features (30% faster)
+python generate_full_dataset.py --dataset s_lot --skip-cross-sectional
+
+# Use CPU instead of GPU (if CUDA OOM)
+python generate_full_dataset.py --dataset s_lot --device cpu
+
+# Shorter news period (faster scraping)
+python generate_full_dataset.py --dataset s_lot --years 25 --news-years 5
+
+
+CUSTOM CONFIGURATIONS
+---------------------
+# Custom output directory
+python generate_full_dataset.py --dataset s_lot --output-dir /data/stocks
+
+# Force rescrape all
+python generate_full_dataset.py --dataset s_lot --force-rescrape
+
+# Different API key
+python generate_full_dataset.py --dataset s_lot --api-key YOUR_KEY
+
+
+BACKGROUND EXECUTION
+--------------------
+# Run in background with logging
+nohup python generate_full_dataset.py --dataset all --years 25 > generation.log 2>&1 &
+
+# Monitor progress
+tail -f generation.log
+
+# Check if still running
+ps aux | grep generate_full_dataset
+
+
+STEP-BY-STEP EXECUTION
+-----------------------
+# Run only step 1 (market indices)
+python generate_full_dataset.py --dataset s_lot --skip-steps 2 3 4 5
+
+# Run only steps 3-5 (use existing fundamentals)
+python generate_full_dataset.py --dataset s_lot --skip-steps 1 2
+
+
+COMMON WORKFLOWS
+----------------
+# First time - complete generation
+python generate_full_dataset.py --dataset s_lot --years 25
+
+# Weekly update - only rescrape news
+python generate_full_dataset.py --dataset s_lot --skip-steps 1 2 --force-rescrape
+
+# Testing changes - skip scraping
+python generate_full_dataset.py --dataset test --skip-steps 1 2 3 4
+
+# Ablation - no news features
+python generate_full_dataset.py --dataset s_lot --skip-steps 3 4
+
+
+HELP & OPTIONS
+--------------
+# Show all options
+python generate_full_dataset.py --help
+
+# Show examples
+python generate_full_dataset.py --help | grep -A 20 "Examples:"
+
+
+OUTPUT FILES
+------------
+market_indices_data.pkl          - Market data (shared across all datasets)
+{dataset}_fmp_comprehensive.pkl  - Stock fundamentals
+{dataset}_news_data.pkl          - Raw news articles
+{dataset}_news_embeddings.pkl    - News embeddings (768-dim)
+{dataset}_complete_dataset.pkl   - FINAL DATASET ⭐
+
+
+VERIFICATION
+------------
+# Check file exists and size
+ls -lh *_complete_dataset.pkl
+
+# Load and inspect in Python
+from utils.utils import pic_load
+data = pic_load('s_lot_complete_dataset.pkl')
+print(f"Stocks: {len(data)}")
+ticker = list(data.keys())[0]
+date = list(data[ticker].keys())[0]
+print(f"Features: {data[ticker][date].shape}")
+
+
+TROUBLESHOOTING
+---------------
+# Not enough disk space
+df -h .
+
+# Check GPU memory
+nvidia-smi
+
+# Kill running process
+pkill -f generate_full_dataset
+
+# Clear cache and restart
+rm -rf __pycache__
+python generate_full_dataset.py --dataset test --years 1

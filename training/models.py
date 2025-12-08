@@ -251,9 +251,14 @@ class t_Dist_Pred(nn.Module):
         pos_emb = self.dropout(pos_emb)
         x = x + pos_emb
         
-        # Reshape this to (batch, _, 52) so it can be appended to the end of the sequence
+        # Reshape summary embedding to (batch, 4, 218) for appending to sequence
+        # Summary structure (988 dims total):
+        #   [0:768]   - RoBERTa company summary embedding
+        #   [768:795] - Time-varying fundamental metrics (27 dims: margins, ratios, valuations, etc.)
+        #   [795:988] - Padding
+        # Model uses first 872 dims (4 * 218), so fundamentals ARE included in transformer input
         #print(s.shape)
-        s = s[:,:218*4]
+        s = s[:,:218*4]  # Take first 872 dims (includes BERT + fundamentals)
         #print(s.shape)
         s = torch.reshape(s, (batch_size, 4, 218))
         
@@ -711,9 +716,14 @@ class t_universal_transformer_Dist_Pred(nn.Module):
         pos_emb = self.dropout(pos_emb)
         x = x + pos_emb
         
-        # Reshape this to (batch, _, 52) so it can be appended to the end of the sequence
+        # Reshape summary embedding to (batch, 4, 218) for appending to sequence
+        # Summary structure (988 dims total):
+        #   [0:768]   - RoBERTa company summary embedding
+        #   [768:795] - Time-varying fundamental metrics (27 dims: margins, ratios, valuations, etc.)
+        #   [795:988] - Padding
+        # Model uses first 872 dims (4 * 218), so fundamentals ARE included in transformer input
         #print(s.shape)
-        s = s[:,:218*4]
+        s = s[:,:218*4]  # Take first 872 dims (includes BERT + fundamentals)
         #print(s.shape)
         s = torch.reshape(s, (batch_size, 4, 218))
         

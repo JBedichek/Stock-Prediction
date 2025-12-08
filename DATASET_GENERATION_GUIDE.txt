@@ -1,0 +1,379 @@
+===============================================================================
+COMPLETE DATASET GENERATION GUIDE
+===============================================================================
+
+This guide explains how to use generate_full_dataset.py to create the complete
+stock prediction dataset with all features.
+
+===============================================================================
+QUICK START
+===============================================================================
+
+# Test with 3 stocks, 1 year
+python generate_full_dataset.py --dataset test --years 1
+
+# Generate s_lot dataset (370 stocks, 25 years)
+python generate_full_dataset.py --dataset s_lot --years 25
+
+# Generate ALL stocks (4000+, 25 years) - PRODUCTION
+python generate_full_dataset.py --dataset all --years 25
+
+
+===============================================================================
+WHAT GETS GENERATED
+===============================================================================
+
+Output files:
+1. market_indices_data.pkl          - Market indices and sector ETFs
+2. {dataset}_fmp_comprehensive.pkl  - Stock fundamentals
+3. {dataset}_news_data.pkl          - Raw news articles
+4. {dataset}_news_embeddings.pkl    - Embedded news (768-dim)
+5. {dataset}_complete_dataset.pkl   - FINAL dataset (all features)
+
+Final dataset structure:
+{
+    'AAPL': {
+        datetime.date(2000, 1, 1): tensor([...]),  # 1100-1200 features
+        datetime.date(2000, 1, 2): tensor([...]),
+        ...
+    },
+    'MSFT': {...},
+    ...
+}
+
+Feature breakdown:
+- Quarterly fundamentals: 200-300
+- Technical indicators: 20-25
+- Derived features: 40-50
+- Market-relative: 15-25
+- Cross-sectional: 15-20
+- News embeddings: 768
+- TOTAL: ~1100-1200 per day
+
+
+===============================================================================
+DATASET OPTIONS
+===============================================================================
+
+--dataset test
+  Stocks: 3 (MSFT, AAPL, TSLA)
+  Time: ~5-10 minutes for 1 year
+  Use for: Testing, development
+
+--dataset s_lot
+  Stocks: ~370 (all S-companies)
+  Time: ~2-4 hours for 25 years
+  Use for: Production training, experiments
+
+--dataset a_lot
+  Stocks: ~800 (all A-companies)
+  Time: ~5-8 hours for 25 years
+  Use for: Larger-scale experiments
+
+--dataset all
+  Stocks: ~4000+ (all available)
+  Time: ~24-48 hours for 25 years
+  Use for: Full production dataset
+
+
+===============================================================================
+TIME & RESOURCE ESTIMATES
+===============================================================================
+
+For s_lot (370 stocks, 25 years):
+  Step 1: Market indices       ~2-3 minutes     15 API calls
+  Step 2: Fundamentals         ~30-60 minutes   11,000 API calls
+  Step 3: News scraping        ~1-2 hours       Web scraping
+  Step 4: News embedding       ~10-20 minutes   Local GPU/CPU
+  Step 5: Enhanced processing  ~15-30 minutes   CPU processing
+  TOTAL: ~2-4 hours
+
+For all_stocks (4000+ stocks, 25 years):
+  Step 1: Market indices       ~2-3 minutes     15 API calls
+  Step 2: Fundamentals         ~8-12 hours      120,000 API calls
+  Step 3: News scraping        ~10-20 hours     Web scraping
+  Step 4: News embedding       ~1-3 hours       Local GPU/CPU
+  Step 5: Enhanced processing  ~2-4 hours       CPU processing
+  TOTAL: ~24-48 hours
+
+Disk space requirements:
+  s_lot: ~2-5 GB
+  all_stocks: ~20-50 GB
+
+
+===============================================================================
+COMMON USAGE PATTERNS
+===============================================================================
+
+1. FIRST-TIME GENERATION (Complete workflow)
+   ==========================================
+   python generate_full_dataset.py --dataset s_lot --years 25
+
+   This runs all 5 steps sequentially.
+   Progress is saved after each step.
+
+
+2. USING EXISTING FILES (Skip completed steps)
+   =============================================
+   python generate_full_dataset.py --dataset s_lot --skip-steps 1 2
+
+   Skips steps 1 and 2, uses existing files.
+   Useful when you already have market indices and fundamentals.
+
+
+3. RESUME AFTER INTERRUPTION
+   ===========================
+   # If interrupted during fundamentals scraping
+   python generate_full_dataset.py --dataset s_lot --skip-steps 1 --resume-from MSFT
+
+   Skips step 1 (market indices already done)
+   Resumes fundamentals from ticker MSFT
+
+
+4. FORCE RESCRAPE EVERYTHING
+   ===========================
+   python generate_full_dataset.py --dataset s_lot --force-rescrape
+
+   Ignores existing files, scrapes everything fresh.
+   Useful when you want updated data.
+
+
+5. CUSTOM OUTPUT DIRECTORY
+   ========================
+   python generate_full_dataset.py --dataset all --output-dir /data/stocks
+
+   Saves all files to /data/stocks/ instead of current directory.
+   Useful for organizing multiple datasets.
+
+
+6. FASTER PROCESSING (Skip cross-sectional)
+   =========================================
+   python generate_full_dataset.py --dataset s_lot --skip-cross-sectional
+
+   Skips cross-sectional ranking features.
+   Saves ~30% processing time.
+   Reduces features by ~15-20.
+
+
+7. CPU-ONLY (No GPU for embedding)
+   ================================
+   python generate_full_dataset.py --dataset s_lot --device cpu
+
+   Uses CPU for news embedding instead of GPU.
+   Slower but works on any machine.
+
+
+8. DIFFERENT NEWS PERIOD
+   ======================
+   python generate_full_dataset.py --dataset s_lot --years 25 --news-years 5
+
+   25 years of stock data, only 5 years of news.
+   Useful if news scraping is slow.
+
+
+===============================================================================
+STEP-BY-STEP BREAKDOWN
+===============================================================================
+
+STEP 1: Market Indices
+  What: Scrapes S&P 500, Nasdaq, VIX, sector ETFs
+  Time: ~2-3 minutes
+  API calls: ~15 total (NOT per stock)
+  Output: market_indices_data.pkl
+  Can skip: Yes, if file exists
+
+STEP 2: Stock Fundamentals
+  What: Scrapes financial statements, ratios, metrics for each stock
+  Time: ~30 seconds per stock
+  API calls: ~30 per stock
+  Output: {dataset}_fmp_comprehensive.pkl
+  Can skip: Yes, if file exists
+  Can resume: Yes, with --resume-from TICKER
+
+STEP 3: News Scraping
+  What: Scrapes news articles from Google News, Yahoo RSS
+  Time: Variable (depends on source availability)
+  API calls: Minimal (web scraping)
+  Output: {dataset}_news_data.pkl
+  Can skip: Yes, if file exists
+  Handles errors: Yes, creates empty dict and continues
+
+STEP 4: News Embedding
+  What: Embeds news articles with Nomic AI (768-dim)
+  Time: ~5-20 minutes depending on GPU
+  API calls: 0 (local model)
+  Output: {dataset}_news_embeddings.pkl
+  Can skip: Yes, if file exists
+  Handles errors: Yes, creates empty embeddings and continues
+
+STEP 5: Enhanced Features
+  What: Combines all data, adds derived features, cross-sectional rankings
+  Time: ~15-30 minutes
+  API calls: 0 (all local processing)
+  Output: {dataset}_complete_dataset.pkl
+  Can skip: No (final step, needs all inputs)
+
+
+===============================================================================
+ERROR HANDLING & RECOVERY
+===============================================================================
+
+The script handles all common errors gracefully:
+
+1. INTERRUPTED DURING SCRAPING
+   - Progress is saved
+   - Resume with --skip-steps for completed steps
+   - Use --resume-from for partial fundamentals
+
+2. API RATE LIMITS
+   - Automatic retry with backoff
+   - Progress saved every 10 stocks
+   - Resume from last saved point
+
+3. MISSING NEWS FOR STOCK
+   - Creates zero embeddings (768 zeros)
+   - Continues processing normally
+   - All stocks end up with same tensor shape
+
+4. EMBEDDING FAILS FOR STOCK
+   - Exception caught and logged
+   - Creates zero embeddings as fallback
+   - Continues with next stock
+
+5. OUT OF DISK SPACE
+   - Check --output-dir has enough space
+   - s_lot needs ~5 GB
+   - all_stocks needs ~50 GB
+
+6. OUT OF MEMORY (GPU)
+   - Use --device cpu instead
+   - Or reduce batch size in code
+   - Or process smaller dataset first
+
+
+===============================================================================
+INTERACTIVE MODE
+===============================================================================
+
+If you run without --force-rescrape, the script will prompt you:
+
+  ✅ Found existing file: s_lot_fmp_comprehensive.pkl (1.2 GB)
+  Use existing file? [Y/n]:
+
+This lets you selectively reuse existing files.
+
+
+===============================================================================
+RECOMMENDED WORKFLOWS
+===============================================================================
+
+1. DEVELOPMENT & TESTING
+   =====================
+   # Quick test with minimal data
+   python generate_full_dataset.py --dataset test --years 1
+
+   # Iterate on features without rescraping
+   python generate_full_dataset.py --dataset test --skip-steps 1 2 3 4
+
+
+2. PRODUCTION DATASET (s_lot)
+   ===========================
+   # Initial generation
+   python generate_full_dataset.py --dataset s_lot --years 25
+
+   # Weekly updates (use existing fundamentals, rescrape news)
+   python generate_full_dataset.py --dataset s_lot --skip-steps 1 2 --force-rescrape
+
+
+3. FULL DATASET (all_stocks)
+   ==========================
+   # Start overnight
+   nohup python generate_full_dataset.py --dataset all --years 25 > generation.log 2>&1 &
+
+   # Monitor progress
+   tail -f generation.log
+
+   # If interrupted, resume
+   python generate_full_dataset.py --dataset all --skip-steps 1 --resume-from LAST_TICKER
+
+
+4. ABLATION STUDIES
+   =================
+   # Without cross-sectional features
+   python generate_full_dataset.py --dataset s_lot --skip-cross-sectional
+
+   # Without news
+   python generate_full_dataset.py --dataset s_lot --skip-steps 3 4
+
+   # Only fundamental features
+   python generate_full_dataset.py --dataset s_lot --skip-steps 3 4 --skip-cross-sectional
+
+
+===============================================================================
+OUTPUT FILE USAGE
+===============================================================================
+
+After generation, use the final dataset in training:
+
+from utils.utils import pic_load
+
+# Load dataset
+data = pic_load('s_lot_complete_dataset.pkl')
+
+# Access features
+aapl_features = data['AAPL']
+tensor_for_date = aapl_features[datetime.date(2024, 12, 7)]
+
+print(tensor_for_date.shape)  # torch.Size([1100-1200])
+
+# In your Dataset class
+class StockDataset(Dataset):
+    def __init__(self, dataset_file):
+        self.data = pic_load(dataset_file)
+
+    def __getitem__(self, idx):
+        ticker, date = self.index[idx]
+        return self.data[ticker][date]
+
+
+===============================================================================
+TROUBLESHOOTING
+===============================================================================
+
+Problem: "API key invalid"
+Solution: Check --api-key is correct, has proper permissions
+
+Problem: "Rate limit exceeded"
+Solution: Wait and resume, or upgrade FMP plan
+
+Problem: "CUDA out of memory" during embedding
+Solution: Use --device cpu or reduce stocks (use test dataset first)
+
+Problem: "No news found for most stocks"
+Solution: Normal for small-cap stocks, zeros will be used
+
+Problem: Script is slow
+Solution:
+  - Use --skip-cross-sectional for faster processing
+  - Use --device cuda for faster embedding
+  - Use smaller dataset (test or s_lot instead of all)
+
+Problem: Files are huge
+Solution: Normal! Final dataset for all_stocks can be 20-50 GB
+  - Use compression if needed
+  - Store on external drive
+  - Consider using smaller dataset for experiments
+
+
+===============================================================================
+NEXT STEPS
+===============================================================================
+
+After generation:
+1. Load dataset and verify: pic_load('{dataset}_complete_dataset.pkl')
+2. Check tensor shapes are consistent
+3. Update your training script to use new dataset
+4. Run baseline training to validate
+5. Experiment with feature selection/ablation
+
+Happy training! 🚀

@@ -1,14 +1,14 @@
 import yfinance as yf
 from gnews import GNews
 import torch
-import datetime 
+import datetime
 import pandas as pd
 import pickle
-from Models import RobertaEncoder
+from training.models import RobertaEncoder
 import gc
 import time
 import os
-from utils import save_pickle
+from utils.utils import save_pickle
 
 a_lot_of_stocks = {'A':"Agilent Technologies", 'AA': "Alcoa", "AACG" : "ATA Creativity Global", "AAL" : "American Airlines Group",  "AAME" : "Atlantic American", "AAN" : "The Aaron's Company", "AAOI":"Applied Optoelectronics","AAON":"AAON, Inc.","AAP":"Advance Auto Parts","AAT":"American Assets Trust","AB":"AllianceBernstein Holding L.P.","ABAT":"American Battery Technology Co","ABBV":"AbbVie","ABCB":"Ameris Bancorp",
                    "ABCL":"AbCellera Biologics","ABEO":"Abeona Therapeutics","ABEV":"Ambev","ABG":"Asbury Automotive Group","ABIO":"ARCA biopharma","ABL":"Abacus Life","ABM":"ABM Industries","ABNB":"Airbnb","ABOS":"Acumen Pharmaceuticals","ABR":"Arbor Realty Trust","ABSI":"Absci","ABT":"Abbott Laboratories","ABTS":"Abits Group","ABUS":"Arbutus Biopharma","ABVC":"ABVC BioPharma","AC":"Associated Capital Group","ACA":"Arcosa","ACAD":"ACADIA Pharmaceuticals",
@@ -373,7 +373,7 @@ class stock_info:
         data = {}
         i = 0
         for symbol, ticker in self.stocks.items():
-                i += 1                
+                i += 1
                 try:
                     d = [ticker.info['sector'], ticker.info['industry']]
                 except Exception as e:
@@ -383,6 +383,340 @@ class stock_info:
         a = list(data.values())
         print(a[0:20])
         save_pickle(data, f'{self.dataset_name}_sector_dict')
+
+    def get_fundamental_metrics(self, use_cache=True, cache_file=None):
+        """
+        Extract 24 recommended fundamental metrics for all stocks.
+
+        Based on availability testing:
+        - 24 metrics with ≥75% availability
+        - Includes imputation for missing values using industry averages
+
+        Args:
+            use_cache: Whether to load from cache if available
+            cache_file: Optional cache file path
+
+        Returns:
+            dict: {ticker: {metric_name: value}} with 24 metrics per stock
+        """
+        # Define the 24 recommended fundamental metrics (≥75% availability)
+        RECOMMENDED_METRICS = {
+            # Profitability & Margins (85.5% availability)
+            'ebitdaMargins': 'EBITDA Margin',
+            'grossMargins': 'Gross Margin',
+            'operatingMargins': 'Operating Margin',
+            'profitMargins': 'Profit Margin',
+
+            # Financial Health (80-85% availability)
+            'totalCash': 'Total Cash',
+            'totalDebt': 'Total Debt',
+            'currentRatio': 'Current Ratio',
+            'quickRatio': 'Quick Ratio',
+
+            # Valuation Metrics (74.5-85% availability)
+            'priceToBook': 'Price to Book',
+            'priceToSalesTrailing12Months': 'Price to Sales',
+            'enterpriseToRevenue': 'Enterprise Value / Revenue',
+
+            # Returns (78-84.5% availability)
+            'returnOnEquity': 'Return on Equity',
+            'returnOnAssets': 'Return on Assets',
+
+            # Cash Flow (72.5-81.5% availability)
+            'operatingCashflow': 'Operating Cash Flow',
+            'freeCashflow': 'Free Cash Flow',
+
+            # Market Metrics (84-85.5% availability)
+            'beta': 'Beta',
+            'fiftyTwoWeekHigh': '52-Week High',
+            'fiftyTwoWeekLow': '52-Week Low',
+            'marketCap': 'Market Cap',
+
+            # Per-Share Metrics (72-85.5% availability)
+            'bookValue': 'Book Value per Share',
+            'revenuePerShare': 'Revenue per Share',
+            'trailingEps': 'Trailing EPS',
+
+            # Growth & Other (76-85.5% availability)
+            'revenueGrowth': 'Revenue Growth',
+            'payoutRatio': 'Payout Ratio',
+        }
+
+        # Optional: Add conditional metrics (70-75% availability) - commented out
+        CONDITIONAL_METRICS = {
+            'enterpriseToEbitda': 'Enterprise Value / EBITDA',  # 74.5%
+            'forwardEps': 'Forward EPS',  # 72%
+            'debtToEquity': 'Debt to Equity',  # 70%
+        }
+
+        # Combine recommended + conditional (total 27 metrics)
+        ALL_METRICS = {**RECOMMENDED_METRICS, **CONDITIONAL_METRICS}
+
+        # Check cache
+        if cache_file is None:
+            cache_file = f'{self.dataset_name}_fundamental_metrics.pickle'
+
+        if use_cache:
+            try:
+                data = load_pickle(cache_file)
+                print(f"Loaded fundamental metrics from cache: {cache_file}")
+                return data
+            except:
+                print(f"No cache found, collecting fundamental metrics...")
+
+        # Collect raw data
+        print(f"\nCollecting fundamental metrics for {len(self.stocks)} stocks...")
+        raw_data = {}
+        sectors = {}
+
+        i = 0
+        for symbol, ticker in self.stocks.items():
+            i += 1
+            print(f'\rProgress: {i}/{len(self.stocks)} ({100*i/len(self.stocks):.1f}%)', end='')
+
+            try:
+                info = ticker.info
+
+                # Extract metrics
+                metrics = {}
+                for metric_key in ALL_METRICS.keys():
+                    metrics[metric_key] = info.get(metric_key, None)
+
+                # Also store sector/industry for imputation
+                sector = info.get('sector', 'Unknown')
+                industry = info.get('industry', 'Unknown')
+
+                raw_data[symbol] = metrics
+                sectors[symbol] = {'sector': sector, 'industry': industry}
+
+            except Exception as e:
+                print(f"\nError fetching {symbol}: {e}")
+                # Store None for all metrics
+                raw_data[symbol] = {key: None for key in ALL_METRICS.keys()}
+                sectors[symbol] = {'sector': 'Unknown', 'industry': 'Unknown'}
+
+        print(f"\n\nRaw data collected. Now applying imputation...")
+
+        # Apply imputation
+        imputed_data = self._impute_fundamental_metrics(raw_data, sectors, ALL_METRICS)
+
+        # Save to cache
+        save_pickle(imputed_data, cache_file)
+        print(f"Saved fundamental metrics to: {cache_file}")
+
+        # Also save sector mapping
+        save_pickle(sectors, f'{self.dataset_name}_fundamental_sectors.pickle')
+
+        return imputed_data
+
+    def _impute_fundamental_metrics(self, raw_data, sectors, metric_definitions):
+        """
+        Impute missing fundamental metrics using industry/sector averages.
+
+        Imputation strategy:
+        1. Calculate industry averages for each metric
+        2. Fall back to sector averages if no industry data
+        3. Fall back to global average if no sector data
+        4. Fall back to 0 if no data at all (for ratios/margins)
+
+        Args:
+            raw_data: {ticker: {metric: value or None}}
+            sectors: {ticker: {'sector': str, 'industry': str}}
+            metric_definitions: {metric_key: metric_name}
+
+        Returns:
+            dict: {ticker: {metric: imputed_value}}
+        """
+        import numpy as np
+        from collections import defaultdict
+
+        print("Calculating industry/sector averages for imputation...")
+
+        # Group stocks by industry and sector
+        industry_groups = defaultdict(list)
+        sector_groups = defaultdict(list)
+
+        for ticker, sector_info in sectors.items():
+            industry_groups[sector_info['industry']].append(ticker)
+            sector_groups[sector_info['sector']].append(ticker)
+
+        # Calculate averages for each metric
+        metric_stats = {}
+
+        for metric_key in metric_definitions.keys():
+            metric_stats[metric_key] = {
+                'industry_avg': {},  # {industry: avg_value}
+                'sector_avg': {},    # {sector: avg_value}
+                'global_avg': None,  # overall average
+                'global_median': None,
+            }
+
+            # Collect all non-null values
+            all_values = []
+            for ticker, metrics in raw_data.items():
+                if metrics[metric_key] is not None:
+                    try:
+                        all_values.append(float(metrics[metric_key]))
+                    except:
+                        pass
+
+            if len(all_values) > 0:
+                # Remove outliers (beyond 3 std devs)
+                mean = np.mean(all_values)
+                std = np.std(all_values)
+                filtered_values = [v for v in all_values if abs(v - mean) < 3 * std]
+
+                if len(filtered_values) > 0:
+                    metric_stats[metric_key]['global_avg'] = np.mean(filtered_values)
+                    metric_stats[metric_key]['global_median'] = np.median(filtered_values)
+
+            # Calculate industry averages
+            for industry, tickers in industry_groups.items():
+                industry_values = []
+                for ticker in tickers:
+                    if raw_data[ticker][metric_key] is not None:
+                        try:
+                            industry_values.append(float(raw_data[ticker][metric_key]))
+                        except:
+                            pass
+
+                if len(industry_values) >= 3:  # Need at least 3 data points
+                    metric_stats[metric_key]['industry_avg'][industry] = np.mean(industry_values)
+
+            # Calculate sector averages
+            for sector, tickers in sector_groups.items():
+                sector_values = []
+                for ticker in tickers:
+                    if raw_data[ticker][metric_key] is not None:
+                        try:
+                            sector_values.append(float(raw_data[ticker][metric_key]))
+                        except:
+                            pass
+
+                if len(sector_values) >= 5:  # Need at least 5 data points
+                    metric_stats[metric_key]['sector_avg'][sector] = np.mean(sector_values)
+
+        # Apply imputation
+        imputed_data = {}
+        imputation_counts = defaultdict(int)
+
+        for ticker, metrics in raw_data.items():
+            imputed_metrics = {}
+            sector_info = sectors[ticker]
+
+            for metric_key, value in metrics.items():
+                if value is not None:
+                    # Value exists, use it
+                    imputed_metrics[metric_key] = float(value)
+                else:
+                    # Value missing, impute
+                    industry = sector_info['industry']
+                    sector = sector_info['sector']
+
+                    # Try industry average first
+                    if industry in metric_stats[metric_key]['industry_avg']:
+                        imputed_metrics[metric_key] = metric_stats[metric_key]['industry_avg'][industry]
+                        imputation_counts[f'{metric_key}_industry'] += 1
+
+                    # Fall back to sector average
+                    elif sector in metric_stats[metric_key]['sector_avg']:
+                        imputed_metrics[metric_key] = metric_stats[metric_key]['sector_avg'][sector]
+                        imputation_counts[f'{metric_key}_sector'] += 1
+
+                    # Fall back to global median (more robust than mean)
+                    elif metric_stats[metric_key]['global_median'] is not None:
+                        imputed_metrics[metric_key] = metric_stats[metric_key]['global_median']
+                        imputation_counts[f'{metric_key}_global'] += 1
+
+                    # Last resort: use 0 for ratios/margins, None for absolute values
+                    else:
+                        # Ratios and margins should default to 0
+                        if any(x in metric_key.lower() for x in ['margin', 'ratio', 'return', 'growth', 'payout']):
+                            imputed_metrics[metric_key] = 0.0
+                        else:
+                            imputed_metrics[metric_key] = 0.0  # Or could use None
+                        imputation_counts[f'{metric_key}_zero'] += 1
+
+            imputed_data[ticker] = imputed_metrics
+
+        # Print imputation statistics
+        print("\nImputation Statistics:")
+        print("-" * 60)
+        for key, count in sorted(imputation_counts.items()):
+            if count > 0:
+                print(f"  {key}: {count} imputations")
+
+        return imputed_data
+
+    def get_fundamental_metrics_as_tensor(self, normalize=True):
+        """
+        Get fundamental metrics as a tensor for model input.
+
+        Args:
+            normalize: Whether to normalize metrics (recommended)
+
+        Returns:
+            dict: {ticker: torch.Tensor of shape (27,)}
+        """
+        # Get fundamental metrics
+        fund_data = self.get_fundamental_metrics()
+
+        # Define metric order (must be consistent!)
+        METRIC_ORDER = [
+            'ebitdaMargins', 'grossMargins', 'operatingMargins', 'profitMargins',
+            'totalCash', 'totalDebt', 'currentRatio', 'quickRatio',
+            'priceToBook', 'priceToSalesTrailing12Months', 'enterpriseToRevenue',
+            'returnOnEquity', 'returnOnAssets',
+            'operatingCashflow', 'freeCashflow',
+            'beta', 'fiftyTwoWeekHigh', 'fiftyTwoWeekLow', 'marketCap',
+            'bookValue', 'revenuePerShare', 'trailingEps',
+            'revenueGrowth', 'payoutRatio',
+            'enterpriseToEbitda', 'forwardEps', 'debtToEquity',
+        ]
+
+        # Convert to tensors
+        tensor_data = {}
+
+        for ticker, metrics in fund_data.items():
+            values = [metrics.get(key, 0.0) for key in METRIC_ORDER]
+            tensor_data[ticker] = torch.tensor(values, dtype=torch.float32)
+
+        # Normalize if requested
+        if normalize:
+            tensor_data = self._normalize_fundamental_tensors(tensor_data, METRIC_ORDER)
+
+        return tensor_data
+
+    def _normalize_fundamental_tensors(self, tensor_data, metric_order):
+        """
+        Normalize fundamental metric tensors.
+
+        Uses robust scaling: (x - median) / IQR to handle outliers.
+        """
+        import numpy as np
+
+        # Stack all tensors
+        all_tensors = torch.stack([tensor_data[ticker] for ticker in tensor_data.keys()])
+
+        # Calculate median and IQR for each feature
+        all_numpy = all_tensors.numpy()
+        medians = np.median(all_numpy, axis=0)
+        q1 = np.percentile(all_numpy, 25, axis=0)
+        q3 = np.percentile(all_numpy, 75, axis=0)
+        iqr = q3 - q1
+
+        # Avoid division by zero
+        iqr[iqr == 0] = 1.0
+
+        # Normalize
+        normalized_data = {}
+        for ticker, tensor in tensor_data.items():
+            normalized = (tensor.numpy() - medians) / iqr
+            # Clip to reasonable range [-10, 10] to handle extreme outliers
+            normalized = np.clip(normalized, -10, 10)
+            normalized_data[ticker] = torch.tensor(normalized, dtype=torch.float32)
+
+        return normalized_data
 
     def get_news(self, start, end, num):
         # (year, month, day)
