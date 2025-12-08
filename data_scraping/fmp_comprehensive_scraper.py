@@ -168,10 +168,10 @@ class FMPComprehensiveScraper:
         if to_date:
             params['to'] = to_date
 
-        data = self._make_request("historical-price-eod/full", symbol=ticker, params=params)
+        # Try historical-price-full endpoint (for /stable/)
+        data = self._make_request("historical-price-full", symbol=ticker, params=params)
         if data:
-            # New /stable/ endpoint returns list directly, not nested in 'historical'
-            if isinstance(data, list):
+            if isinstance(data, list) and len(data) > 0:
                 return pd.DataFrame(data)
             elif isinstance(data, dict) and 'historical' in data:
                 return pd.DataFrame(data['historical'])
@@ -369,7 +369,7 @@ class FMPComprehensiveScraper:
     # ========================================================================
 
     def scrape_all_data(self, ticker: str, start_date: str = '2000-01-01',
-                       end_date: str = None) -> Dict:
+                       end_date: str = None, skip_unavailable: bool = True) -> Dict:
         """
         Scrape ALL available data for a stock.
 
@@ -377,6 +377,7 @@ class FMPComprehensiveScraper:
             ticker: Stock ticker
             start_date: Start date for time-series data
             end_date: End date (defaults to today)
+            skip_unavailable: Skip endpoints that return 404 (not available in current tier)
 
         Returns:
             Comprehensive dict with all collected data
@@ -416,32 +417,41 @@ class FMPComprehensiveScraper:
         print("  📉 Fetching growth metrics...")
         data['financial_growth'] = self.get_financial_growth(ticker)
 
-        # 6. Daily Price History
-        print("  💹 Fetching daily price history...")
-        data['daily_prices'] = self.get_daily_prices_full(ticker, start_date, end_date)
+        # 6. Daily Price History (SKIPPED - not available in /stable/)
+        # print("  💹 Fetching daily price history...")
+        # data['daily_prices'] = self.get_daily_prices_full(ticker, start_date, end_date)
+        data['daily_prices'] = None  # Use yfinance instead for price data
 
-        # 7. Technical Indicators
-        print("  📊 Fetching technical indicators...")
-        data['technical_indicators'] = self.get_all_technical_indicators(ticker, 'daily')
+        # 7. Technical Indicators (SKIPPED - not available in /stable/)
+        # print("  📊 Fetching technical indicators...")
+        # data['technical_indicators'] = self.get_all_technical_indicators(ticker, 'daily')
+        data['technical_indicators'] = {}  # Calculate these locally instead
 
-        # 8. Earnings
-        print("  💵 Fetching earnings data...")
-        data['earnings_history'] = self.get_earnings_history(ticker)
-        data['earnings_surprises'] = self.get_earnings_surprises(ticker)
+        # 8. Earnings (SKIPPED - not available in /stable/)
+        # print("  💵 Fetching earnings data...")
+        # data['earnings_history'] = self.get_earnings_history(ticker)
+        # data['earnings_surprises'] = self.get_earnings_surprises(ticker)
+        data['earnings_history'] = None
+        data['earnings_surprises'] = None
 
-        # 9. Insider Trading
-        print("  🔍 Fetching insider trading...")
-        data['insider_trading'] = self.get_insider_trading(ticker)
-        data['insider_trading_summary'] = self.get_insider_trading_summary(ticker)
+        # 9. Insider Trading (SKIPPED - not available in /stable/)
+        # print("  🔍 Fetching insider trading...")
+        # data['insider_trading'] = self.get_insider_trading(ticker)
+        # data['insider_trading_summary'] = self.get_insider_trading_summary(ticker)
+        data['insider_trading'] = None
+        data['insider_trading_summary'] = None
 
-        # 10. Institutional Holdings
-        print("  🏢 Fetching institutional holdings...")
-        data['institutional_holdings'] = self.get_institutional_holdings(ticker)
+        # 10. Institutional Holdings (SKIPPED - not available in /stable/)
+        # print("  🏢 Fetching institutional holdings...")
+        # data['institutional_holdings'] = self.get_institutional_holdings(ticker)
+        data['institutional_holdings'] = None
 
-        # 11. Analyst Data
-        print("  📝 Fetching analyst data...")
-        data['analyst_ratings'] = self.get_analyst_ratings(ticker)
-        data['price_targets'] = self.get_price_targets(ticker)
+        # 11. Analyst Data (partial - only estimates available)
+        print("  📝 Fetching analyst estimates...")
+        # data['analyst_ratings'] = self.get_analyst_ratings(ticker)  # 404
+        # data['price_targets'] = self.get_price_targets(ticker)  # 404
+        data['analyst_ratings'] = None
+        data['price_targets'] = None
         data['analyst_estimates'] = self.get_analyst_estimates(ticker)
 
         # 12. Company Profile
@@ -452,10 +462,12 @@ class FMPComprehensiveScraper:
         print("  📊 Fetching market cap history...")
         data['market_cap_history'] = self.get_market_cap_history(ticker)
 
-        # 14. Dividends & Splits
-        print("  💰 Fetching dividends & splits...")
-        data['dividend_history'] = self.get_dividend_history(ticker)
-        data['stock_splits'] = self.get_stock_splits(ticker)
+        # 14. Dividends & Splits (SKIPPED - not available in /stable/)
+        # print("  💰 Fetching dividends & splits...")
+        # data['dividend_history'] = self.get_dividend_history(ticker)
+        # data['stock_splits'] = self.get_stock_splits(ticker)
+        data['dividend_history'] = None
+        data['stock_splits'] = None
 
         data['api_calls'] = self.call_count - start_calls
         print(f"\n  ✅ Complete! API calls used: {data['api_calls']}")

@@ -461,8 +461,8 @@ Examples:
     parser.add_argument('--dataset', type=str, required=True,
                        choices=['test', 's_lot', 'a_lot', 'all'],
                        help='Dataset to generate')
-    parser.add_argument('--api-key', type=str, default="YOUR_FMP_API_KEY_HERE",
-                       help='FMP API key')
+    parser.add_argument('--api-key', type=str, required=True,
+                       help='FMP API key (required)')
     parser.add_argument('--years', type=int, default=25,
                        help='Years of historical data (default: 25)')
     parser.add_argument('--news-years', type=int, default=None,

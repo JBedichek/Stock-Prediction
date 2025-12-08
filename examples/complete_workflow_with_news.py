@@ -198,10 +198,17 @@ def quick_test_workflow():
 
     from data_scraping.Stock import test_stock_tickers
 
-    api_key = "YOUR_FMP_API_KEY_HERE"
+    # API key must be provided via command line argument
+    import sys
+    if len(sys.argv) < 2:
+        print("ERROR: API key required. Run with --api_key YOUR_KEY")
+        sys.exit(1)
+
+    # This will be set from command line args
+    api_key = None  # Set via argparse below
 
     complete_workflow(
-        api_key=api_key,
+        api_key=api_key or "YOUR_API_KEY_HERE",
         dataset_name='test',
         scrape_years=1,   # Just 1 year
         news_years=1      # Same 1 year of news
@@ -212,8 +219,8 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Complete workflow with news embeddings')
-    parser.add_argument('--api_key', type=str, default="YOUR_FMP_API_KEY_HERE",
-                       help='FMP API key')
+    parser.add_argument('--api_key', type=str, required=True,
+                       help='FMP API key (required)')
     parser.add_argument('--dataset', type=str, default='test',
                        choices=['test', 's_lot', 'a_lot'],
                        help='Dataset to process')
