@@ -36,15 +36,17 @@ class FMPDataProcessor:
     Processor for converting raw FMP data into time-series tensors.
     """
 
-    def __init__(self, raw_data: Dict):
+    def __init__(self, raw_data: Dict, price_data: Optional[pd.DataFrame] = None):
         """
         Initialize processor.
 
         Args:
             raw_data: Dict from fmp_comprehensive_scraper.scrape_all_data()
+            price_data: Optional DataFrame with daily price data from yfinance
         """
         self.raw_data = raw_data
         self.ticker = raw_data['ticker']
+        self.price_data = price_data
 
     def _safe_float(self, value, default=0.0) -> float:
         """Safely convert value to float."""
@@ -66,16 +68,44 @@ class FMPDataProcessor:
         if method == 'zscore':
             mean = series.mean()
             std = series.std()
-            if std == 0 or pd.isna(std):
+
+            # Ensure scalar values (handle case where .mean()/.std() return Series)
+            if isinstance(mean, pd.Series):
+                mean = mean.iloc[0] if len(mean) > 0 else 0.0
+            if isinstance(std, pd.Series):
+                std = std.iloc[0] if len(std) > 0 else 0.0
+
+            # Safe conversion to float
+            try:
+                mean_val = float(mean) if not pd.isna(mean) else 0.0
+                std_val = float(std) if not pd.isna(std) else 0.0
+            except (TypeError, ValueError):
                 return series * 0
-            return (series - mean) / std
+
+            if std_val == 0 or pd.isna(std_val):
+                return series * 0
+            return (series - mean_val) / std_val
 
         elif method == 'minmax':
             min_val = series.min()
             max_val = series.max()
-            if min_val == max_val or pd.isna(min_val) or pd.isna(max_val):
+
+            # Ensure scalar values
+            if isinstance(min_val, pd.Series):
+                min_val = min_val.iloc[0] if len(min_val) > 0 else 0.0
+            if isinstance(max_val, pd.Series):
+                max_val = max_val.iloc[0] if len(max_val) > 0 else 0.0
+
+            # Safe conversion to float
+            try:
+                min_scalar = float(min_val) if not pd.isna(min_val) else 0.0
+                max_scalar = float(max_val) if not pd.isna(max_val) else 0.0
+            except (TypeError, ValueError):
                 return series * 0
-            return (series - min_val) / (max_val - min_val)
+
+            if pd.isna(min_val) or pd.isna(max_val) or min_scalar == max_scalar:
+                return series * 0
+            return (series - min_scalar) / (max_scalar - min_scalar)
 
         elif method == 'log':
             return np.log1p(series.clip(lower=0))
@@ -150,7 +180,9 @@ class FMPDataProcessor:
 
     def process_daily_prices(self) -> pd.DataFrame:
         """Process daily price data."""
-        df = self.raw_data.get('daily_prices')
+        # Try external price data first (from yfinance), then fall back to FMP data
+        df = self.price_data if self.price_data is not None else self.raw_data.get('daily_prices')
+
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -339,11 +371,13 @@ class FMPDataProcessor:
 
         # Combine quarterly data (will be forward-filled)
         quarterly_data = [financial_stmt, key_metrics, ratios, earnings]
-        quarterly_combined = pd.concat([df for df in quarterly_data if not df.empty], axis=1)
+        quarterly_non_empty = [df for df in quarterly_data if not df.empty]
+        quarterly_combined = pd.concat(quarterly_non_empty, axis=1) if quarterly_non_empty else pd.DataFrame()
 
         # Combine daily data
         daily_data = [daily_prices, technical, insider, analyst]
-        daily_combined = pd.concat([df for df in daily_data if not df.empty], axis=1)
+        daily_non_empty = [df for df in daily_data if not df.empty]
+        daily_combined = pd.concat(daily_non_empty, axis=1) if daily_non_empty else pd.DataFrame()
 
         # Create daily date range
         date_range = pd.date_range(start=start_date, end=end_date, freq='D')

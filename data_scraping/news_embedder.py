@@ -291,7 +291,9 @@ class NewsAggregator:
     def create_daily_embeddings_dataset(self, all_news: Dict[str, List[Dict]],
                                        start_date: dt_date,
                                        end_date: dt_date,
-                                       fill_missing_with_zeros: bool = True) -> Dict[str, Dict[dt_date, torch.Tensor]]:
+                                       fill_missing_with_zeros: bool = True,
+                                       output_file: str = None,
+                                       save_every: int = 500) -> Dict[str, Dict[dt_date, torch.Tensor]]:
         """
         Create daily news embeddings for all stocks.
 
@@ -301,6 +303,8 @@ class NewsAggregator:
             end_date: End date
             fill_missing_with_zeros: If True, creates zero embeddings for stocks with no news
                                     If False, skips stocks with no news entirely
+            output_file: If provided, saves incrementally to this file
+            save_every: Save progress every N stocks (to avoid memory buildup)
 
         Returns:
             Dict of {ticker: {date: embedding_tensor}}
@@ -311,25 +315,40 @@ class NewsAggregator:
         print(f"Stocks: {len(all_news)}")
         print(f"Date range: {start_date} to {end_date}")
         print(f"Fill missing stocks with zeros: {fill_missing_with_zeros}")
+        if output_file:
+            print(f"Incremental saving: Every {save_every} stocks to {output_file}")
         print(f"{'='*80}\n")
 
+        # Check for existing progress
         daily_embeddings = {}
+        if output_file and save_pickle.__module__:  # Check if file exists
+            import os
+            if os.path.exists(output_file):
+                try:
+                    daily_embeddings = pic_load(output_file)
+                    print(f"📂 Found existing embeddings: {len(daily_embeddings)} stocks completed")
+                    print(f"   Resuming from next stock...\n")
+                except:
+                    pass
+
         date_range = pd.date_range(start=start_date, end=end_date, freq='D')
 
+        stock_count = 0
         for ticker, articles in tqdm(all_news.items(), desc="Processing stocks"):
+            # Skip already embedded stocks
+            if ticker in daily_embeddings:
+                print(f"\n{ticker}: ⏭️  Already embedded, skipping...")
+                continue
+
             print(f"\n{ticker}: {len(articles)} articles")
+            stock_count += 1
 
             # Handle stocks with no articles
             if not articles or len(articles) == 0:
                 if fill_missing_with_zeros:
-                    print(f"  ⚠️  No articles, filling with zeros")
-                    # Create zero embeddings for all dates
-                    ticker_daily = {}
-                    zero_embedding = np.zeros(768, dtype=np.float32)
-                    for date in date_range:
-                        date_obj = date.date()
-                        ticker_daily[date_obj] = torch.tensor(zero_embedding, dtype=torch.float32)
-                    daily_embeddings[ticker] = ticker_daily
+                    print(f"  ⚠️  No articles, will use zeros on-the-fly (sparse storage)")
+                    # Store empty dict - zeros will be computed on-the-fly when needed
+                    daily_embeddings[ticker] = {}
                 else:
                     print(f"  ⚠️  No articles, skipping ticker")
                 continue
@@ -339,61 +358,101 @@ class NewsAggregator:
                 date_embeddings = self.aggregate_by_date(articles, method='mean')
 
                 if not date_embeddings:
-                    print(f"  ⚠️  Failed to create embeddings, filling with zeros")
-                    # Create zero embeddings for all dates
-                    ticker_daily = {}
-                    zero_embedding = np.zeros(768, dtype=np.float32)
-                    for date in date_range:
-                        date_obj = date.date()
-                        ticker_daily[date_obj] = torch.tensor(zero_embedding, dtype=torch.float32)
-                    daily_embeddings[ticker] = ticker_daily
+                    print(f"  ⚠️  Failed to create embeddings, storing empty (sparse)")
+                    # Store empty dict - zeros will be computed on-the-fly
+                    daily_embeddings[ticker] = {}
                     continue
 
-                # Fill in daily embeddings (forward-fill for missing dates)
+                # Store only days with actual news (sparse storage)
                 ticker_daily = {}
-                last_embedding = None
-
-                for date in date_range:
-                    date_obj = date.date()
-
-                    if date_obj in date_embeddings:
-                        # Have news for this date
-                        embedding = date_embeddings[date_obj]
-                        last_embedding = embedding
-                    elif last_embedding is not None:
-                        # Forward-fill from last available
-                        embedding = last_embedding
-                    else:
-                        # No news yet, use zeros
-                        embedding = np.zeros(768, dtype=np.float32)
-
-                    # Convert to tensor
+                for date_obj, embedding in date_embeddings.items():
+                    # Convert to tensor and store
                     ticker_daily[date_obj] = torch.tensor(embedding, dtype=torch.float32)
 
                 daily_embeddings[ticker] = ticker_daily
-                print(f"  ✅ {len(date_embeddings)} unique dates with news")
+                print(f"  ✅ {len(date_embeddings)} unique dates with news (sparse storage)")
 
             except Exception as e:
                 print(f"  ❌ Error embedding {ticker}: {e}")
                 import traceback
                 traceback.print_exc()
 
-                # Even on error, create zero embeddings if requested
+                # Even on error, store empty dict if requested
                 if fill_missing_with_zeros:
-                    print(f"  Creating zero embeddings as fallback")
-                    ticker_daily = {}
-                    zero_embedding = np.zeros(768, dtype=np.float32)
-                    for date in date_range:
-                        date_obj = date.date()
-                        ticker_daily[date_obj] = torch.tensor(zero_embedding, dtype=torch.float32)
-                    daily_embeddings[ticker] = ticker_daily
+                    print(f"  Creating empty embeddings as fallback (sparse storage)")
+                    daily_embeddings[ticker] = {}
 
                 continue
 
+            # Save incrementally and clear memory
+            if output_file and stock_count % save_every == 0:
+                print(f"\n💾 Saving progress ({len(daily_embeddings)} stocks)...")
+                save_pickle(daily_embeddings, output_file)
+
+                # Clear GPU cache to prevent memory buildup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Force garbage collection
+                import gc
+                gc.collect()
+
+                print(f"   ✅ Saved, cleared GPU cache, and ran garbage collection")
+
+                # Show memory usage
+                try:
+                    import psutil
+                    import os as os_module
+                    process = psutil.Process(os_module.getpid())
+                    mem_gb = process.memory_info().rss / 1024**3
+                    print(f"   📊 Current RAM usage: {mem_gb:.2f} GB")
+                except:
+                    pass
+
+        # Final save
+        if output_file:
+            print(f"\n💾 Final save ({len(daily_embeddings)} stocks)...")
+            save_pickle(daily_embeddings, output_file)
+
         print(f"\n✅ Daily embeddings created for {len(daily_embeddings)} stocks")
-        print(f"   Stocks with actual news: {sum(1 for t, dates in daily_embeddings.items() if any((dates[d] != 0).any() for d in list(dates.keys())[:10]))}")
+
+        # Count stocks with actual embeddings
+        stocks_with_news = sum(1 for dates in daily_embeddings.values() if len(dates) > 0)
+        total_stored_days = sum(len(dates) for dates in daily_embeddings.values())
+
+        print(f"   Stocks with actual news: {stocks_with_news}/{len(daily_embeddings)}")
+        print(f"   Total days stored (sparse): {total_stored_days:,}")
+        print(f"   Avg days per stock: {total_stored_days / len(daily_embeddings):.1f}")
+        print(f"   💾 Sparse storage: Only days with news are stored (zeros computed on-the-fly)")
 
         return daily_embeddings
+
+
+def get_embedding_for_date(embeddings_dict: Dict[str, Dict[dt_date, torch.Tensor]],
+                          ticker: str,
+                          date: dt_date,
+                          default_dim: int = 768) -> torch.Tensor:
+    """
+    Get embedding for a specific ticker and date, returning zeros if not found.
+
+    Args:
+        embeddings_dict: Dict of {ticker: {date: embedding}}
+        ticker: Stock ticker
+        date: Date to lookup
+        default_dim: Dimension for zero vector (default: 768)
+
+    Returns:
+        Embedding tensor (768,) - either real embedding or zeros
+    """
+    if ticker not in embeddings_dict:
+        return torch.zeros(default_dim, dtype=torch.float32)
+
+    ticker_embeddings = embeddings_dict[ticker]
+
+    if date in ticker_embeddings:
+        return ticker_embeddings[date]
+    else:
+        return torch.zeros(default_dim, dtype=torch.float32)
 
 
 def create_news_embeddings(news_data_file: str,
@@ -431,13 +490,15 @@ def create_news_embeddings(news_data_file: str,
     # Create aggregator
     aggregator = NewsAggregator(embedder)
 
-    # Create daily embeddings
+    # Create daily embeddings (with incremental saving)
     daily_embeddings = aggregator.create_daily_embeddings_dataset(
-        all_news, start_dt, end_dt
+        all_news, start_dt, end_dt,
+        output_file=output_file,
+        save_every=500  # Save every 10 stocks to avoid memory buildup
     )
 
-    # Save
-    print(f"\n💾 Saving embeddings...")
+    # Already saved incrementally, but do final save just in case
+    print(f"\n💾 Ensuring final save...")
     save_pickle(daily_embeddings, output_file)
 
     print(f"\n{'='*80}")

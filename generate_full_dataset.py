@@ -25,12 +25,15 @@ import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 from tqdm import tqdm
+import pandas as pd
 
 sys.path.append('/home/james/Desktop/Stock-Prediction')
 
 from data_scraping.market_indices_scraper import scrape_market_data
 from data_scraping.fmp_comprehensive_scraper import scrape_dataset
-from data_scraping.news_scraper import scrape_news_dataset
+from data_scraping.yfinance_price_scraper import scrape_price_dataset
+from data_scraping.news_scraper import scrape_news_dataset as gnews_scrape
+from data_scraping.alphavantage_news_scraper import scrape_news_dataset as av_scrape
 from data_scraping.news_embedder import create_news_embeddings
 from data_scraping.fmp_enhanced_processor import process_enhanced_data
 from data_scraping.Stock import (
@@ -66,7 +69,9 @@ class DatasetGenerator:
     """
 
     def __init__(self, dataset_name: str, api_key: str, years: int = 25,
-                 news_years: int = None, output_dir: str = '.'):
+                 news_years: int = None, output_dir: str = '.',
+                 news_source: str = 'gnews', av_api_key: str = None,
+                 av_rate_limit: int = 75):
         """
         Initialize generator.
 
@@ -76,6 +81,9 @@ class DatasetGenerator:
             years: Years of historical data
             news_years: Years of news (defaults to same as years)
             output_dir: Directory for output files
+            news_source: 'gnews' or 'alphavantage'
+            av_api_key: Alpha Vantage API key (required if news_source='alphavantage')
+            av_rate_limit: Alpha Vantage rate limit (75 for Premium, 5 for Free)
         """
         self.dataset_name = dataset_name
         self.api_key = api_key
@@ -83,6 +91,9 @@ class DatasetGenerator:
         self.news_years = news_years if news_years else years
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.news_source = news_source
+        self.av_api_key = av_api_key
+        self.av_rate_limit = av_rate_limit
 
         # Select stock dictionary
         self.stock_dict = self._get_stock_dict()
@@ -95,6 +106,7 @@ class DatasetGenerator:
         # Output filenames
         self.market_indices_file = self.output_dir / 'market_indices_data.pkl'
         self.fundamentals_file = self.output_dir / f'{dataset_name}_fmp_comprehensive.pkl'
+        self.price_data_file = self.output_dir / f'{dataset_name}_price_data.pkl'
         self.news_data_file = self.output_dir / f'{dataset_name}_news_data.pkl'
         self.news_embeddings_file = self.output_dir / f'{dataset_name}_news_embeddings.pkl'
         self.sector_dict_file = self.output_dir / f'{dataset_name}_sector_dict'
@@ -200,34 +212,168 @@ class DatasetGenerator:
             traceback.print_exc()
             return False
 
+    def step2_5_prices(self, force_rescrape=False):
+        """
+        Step 2.5: Scrape daily price data using yfinance.
+
+        Time: ~5-15 minutes for most datasets
+        API Calls: 0 (yfinance is free)
+        """
+        print_banner("STEP 2.5/6: DAILY PRICE DATA (YFINANCE)")
+
+        if check_file_exists(self.price_data_file) and not force_rescrape:
+            response = input("  Use existing file? [Y/n]: ").strip().lower()
+            if response != 'n':
+                print("  ✅ Using existing price data")
+                return True
+
+        print(f"\nScraping price data for {len(self.stock_dict)} stocks...")
+        print(f"  Date range: {self.data_start_date} to {self.end_date}")
+        print(f"  Source: Yahoo Finance (via yfinance)")
+        print(f"  Estimated time: {len(self.stock_dict) * 0.5 / 60:.1f} minutes")
+
+        try:
+            scrape_price_dataset(
+                stock_dict=self.stock_dict,
+                start_date=self.data_start_date,
+                end_date=self.end_date,
+                output_file=str(self.price_data_file),
+                batch_size=100
+            )
+            print(f"\n✅ Step 2.5 Complete: {self.price_data_file}")
+            return True
+
+        except KeyboardInterrupt:
+            print("\n⚠️  Interrupted! Progress saved.")
+            raise
+
+        except Exception as e:
+            print(f"\n❌ Step 2.5 Failed: {e}")
+            print("  WARNING: Proceeding without price data (technical indicators will be missing)")
+            import traceback
+            traceback.print_exc()
+            # Create empty price dict as fallback
+            save_pickle({ticker: pd.DataFrame() for ticker in self.stock_dict}, str(self.price_data_file))
+            return True  # Continue even if price scraping fails
+
     def step3_news(self, force_rescrape=False):
         """
         Step 3: Scrape news articles.
 
-        Time: Variable (depends on news source availability)
-        API Calls: Minimal (mostly web scraping)
+        Time: Variable (depends on news source)
+        - Alpha Vantage: ~5-25 minutes (depending on rate limit and chunking)
+        - GNews: 30+ hours for 370 stocks with 25 years
         """
-        print_banner("STEP 3/5: NEWS ARTICLES")
+        print_banner("STEP 3/6: NEWS ARTICLES")
 
         if check_file_exists(self.news_data_file) and not force_rescrape:
-            response = input("  Use existing file? [Y/n]: ").strip().lower()
-            if response != 'n':
-                print("  ✅ Using existing news data")
-                return True
+            # Check if scraping is complete
+            try:
+                existing_news = pic_load(str(self.news_data_file))
+                total_stocks = len(self.stock_dict)
+
+                # Count stocks that are in the file
+                scraped_stocks = len(existing_news)
+
+                # Count stocks with actual articles (not just empty lists)
+                stocks_with_articles = sum(1 for articles in existing_news.values() if len(articles) > 0)
+
+                # Count missing stocks
+                missing_stocks = [ticker for ticker in self.stock_dict if ticker not in existing_news]
+                num_missing = len(missing_stocks)
+
+                # Count failed stocks (in file but 0 articles)
+                failed_stocks = [ticker for ticker, articles in existing_news.items() if len(articles) == 0]
+                num_failed = len(failed_stocks)
+
+                print(f"  Scraped: {scraped_stocks}/{total_stocks} stocks")
+                print(f"  With articles: {stocks_with_articles}/{total_stocks} stocks")
+                if num_failed > 0:
+                    print(f"  ⚠️  Failed (0 articles): {num_failed} stocks")
+                if num_missing > 0:
+                    print(f"  ⚠️  Not yet scraped: {num_missing} stocks")
+
+                if num_missing == 0:
+                    # All stocks attempted
+                    if num_failed == 0:
+                        # Perfect - all stocks have articles
+                        response = input("  Use existing file (complete)? [Y/n]: ").strip().lower()
+                        if response != 'n':
+                            print("  ✅ Using existing news data")
+                            return True
+                    else:
+                        # All attempted, but some have 0 articles
+                        print(f"  ⚠️  {num_failed} stocks have 0 articles (may not be in Alpha Vantage)")
+                        print(f"     First 5: {', '.join(failed_stocks[:5])}")
+                        print(f"\n  All stocks have been attempted.")
+                        response = input("  [P]roceed with existing data, [R]etry failed stocks, or [C]ancel? [P/r/c]: ").strip().lower()
+
+                        if response in ['', 'p']:
+                            print("  ✅ Proceeding with existing data (stocks with 0 articles will use zero embeddings)")
+                            return True
+                        elif response == 'r':
+                            print("  🔄 Retrying failed stocks...")
+                            # Continue to scraping logic below
+                        else:
+                            print("  ❌ User cancelled. Exiting...")
+                            return False
+                else:
+                    # Partial progress - not all stocks attempted
+                    print(f"  ⚠️  Incomplete: {num_missing} stocks not yet attempted")
+                    if num_failed > 0:
+                        print(f"  ⚠️  {num_failed} stocks failed (0 articles)")
+                        print(f"     First 5 failed: {', '.join(failed_stocks[:5])}")
+
+                    response = input("  Resume scraping (will retry failed + scrape missing)? [Y/n]: ").strip().lower()
+                    if response == 'n':
+                        print("  ❌ User chose not to resume. Exiting...")
+                        return False
+                    else:
+                        print("  ✅ Resuming scraping...")
+                        # Continue to scraping logic below
+            except Exception as e:
+                print(f"  ⚠️  Could not check progress: {e}")
+                response = input("  Use existing file? [Y/n]: ").strip().lower()
+                if response != 'n':
+                    print("  ✅ Using existing news data")
+                    return True
 
         print(f"\nScraping news for {len(self.stock_dict)} stocks...")
         print(f"  Date range: {self.news_start_date} to {self.end_date}")
-        print(f"  Sources: Google News, Yahoo RSS")
-        print(f"  Note: Some stocks may have no news (will use zeros)")
+        print(f"  News source: {self.news_source}")
 
         try:
-            scrape_news_dataset(
-                stock_dict=self.stock_dict,
-                start_date=self.news_start_date,
-                end_date=self.end_date,
-                output_file=str(self.news_data_file),
-                fmp_api_key=self.api_key
-            )
+            if self.news_source == 'alphavantage':
+                if not self.av_api_key:
+                    raise ValueError("Alpha Vantage API key required! Use --av-api-key")
+
+                print(f"  Alpha Vantage rate limit: {self.av_rate_limit} calls/min")
+                print(f"  Note: Alpha Vantage may have limited historical coverage (~3-4 years)")
+                print(f"  Estimated time: {len(self.stock_dict) * 6 * (60/self.av_rate_limit) / 60:.1f} minutes")
+
+                av_scrape(
+                    stock_dict=self.stock_dict,
+                    start_date=self.news_start_date,
+                    end_date=self.end_date,
+                    output_file=str(self.news_data_file),
+                    api_key=self.av_api_key,
+                    rate_limit=self.av_rate_limit,
+                    use_chunking=True,
+                    chunk_years=5
+                )
+
+            else:  # gnews
+                print(f"  Sources: Google News, Yahoo RSS")
+                print(f"  Note: Slow but comprehensive (30+ hours for 370 stocks)")
+
+                gnews_scrape(
+                    stock_dict=self.stock_dict,
+                    start_date=self.news_start_date,
+                    end_date=self.end_date,
+                    output_file=str(self.news_data_file),
+                    fmp_api_key=self.api_key
+                )
+
             print(f"\n✅ Step 3 Complete: {self.news_data_file}")
             return True
 
@@ -249,7 +395,7 @@ class DatasetGenerator:
         Time: ~5-20 minutes depending on GPU
         API Calls: 0 (local model)
         """
-        print_banner("STEP 4/5: NEWS EMBEDDINGS")
+        print_banner("STEP 4/6: NEWS EMBEDDINGS")
 
         if check_file_exists(self.news_embeddings_file) and not force_reembed:
             response = input("  Use existing file? [Y/n]: ").strip().lower()
@@ -287,22 +433,25 @@ class DatasetGenerator:
             traceback.print_exc()
             return True  # Continue even if embedding fails
 
-    def step5_process_enhanced_features(self, skip_cross_sectional=False):
+    def step5_process_enhanced_features(self, skip_cross_sectional=False,
+                                        use_cross_sectional_normalization=True):
         """
         Step 5: Process enhanced features.
 
         Time: ~10-30 minutes depending on dataset size
         API Calls: 0 (all processing)
         """
-        print_banner("STEP 5/5: ENHANCED FEATURES")
+        print_banner("STEP 5/6: ENHANCED FEATURES")
 
         print(f"\nProcessing enhanced features...")
         print(f"  Input files:")
         print(f"    - Fundamentals: {self.fundamentals_file.name}")
+        print(f"    - Price data: {self.price_data_file.name}")
         print(f"    - Market indices: {self.market_indices_file.name}")
         print(f"    - News embeddings: {self.news_embeddings_file.name}")
         print(f"    - Sector dict: {self.sector_dict_file.name}")
-        print(f"  Cross-sectional features: {not skip_cross_sectional}")
+        print(f"  Cross-sectional percentile features: {not skip_cross_sectional}")
+        print(f"  Cross-sectional normalization: {use_cross_sectional_normalization}")
         print(f"  Output: {self.final_output_file}")
 
         # Check required files
@@ -316,10 +465,12 @@ class DatasetGenerator:
                 market_indices_file=str(self.market_indices_file) if self.market_indices_file.exists() else None,
                 sector_dict_file=str(self.sector_dict_file) if self.sector_dict_file.exists() else None,
                 news_embeddings_file=str(self.news_embeddings_file) if self.news_embeddings_file.exists() else None,
+                price_data_file=str(self.price_data_file) if self.price_data_file.exists() else None,
                 output_file=str(self.final_output_file),
                 start_date=self.data_start_date,
                 end_date=self.end_date,
-                add_cross_sectional=not skip_cross_sectional
+                add_cross_sectional=not skip_cross_sectional,
+                use_cross_sectional_normalization=use_cross_sectional_normalization
             )
             print(f"\n✅ Step 5 Complete: {self.final_output_file}")
             return True
@@ -331,7 +482,8 @@ class DatasetGenerator:
             return False
 
     def run_all(self, skip_steps=None, force_rescrape=False, resume_from=None,
-                device='cuda', skip_cross_sectional=False):
+                device='cuda', skip_cross_sectional=False,
+                use_cross_sectional_normalization=True):
         """
         Run all steps in sequence.
 
@@ -340,7 +492,8 @@ class DatasetGenerator:
             force_rescrape: Force rescraping even if files exist
             resume_from: Ticker to resume from (for step 2)
             device: Device for embedding ('cuda' or 'cpu')
-            skip_cross_sectional: Skip cross-sectional features (faster)
+            skip_cross_sectional: Skip cross-sectional percentile features (faster, recommended)
+            use_cross_sectional_normalization: Use cross-sectional normalization for fundamentals (recommended!)
 
         Returns:
             True if all steps completed successfully
@@ -350,13 +503,15 @@ class DatasetGenerator:
 
         print_banner("STARTING COMPLETE DATASET GENERATION")
         print(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Cross-sectional normalization: {'ENABLED' if use_cross_sectional_normalization else 'DISABLED'}")
 
         steps = [
             (1, "Market Indices", lambda: self.step1_market_indices(force_rescrape)),
             (2, "Fundamentals", lambda: self.step2_fundamentals(force_rescrape, resume_from)),
+            (2.5, "Price Data", lambda: self.step2_5_prices(force_rescrape)),
             (3, "News Scraping", lambda: self.step3_news(force_rescrape)),
             (4, "News Embedding", lambda: self.step4_embed_news(force_rescrape, device)),
-            (5, "Enhanced Features", lambda: self.step5_process_enhanced_features(skip_cross_sectional)),
+            (5, "Enhanced Features", lambda: self.step5_process_enhanced_features(skip_cross_sectional, use_cross_sectional_normalization)),
         ]
 
         results = {}
@@ -407,6 +562,7 @@ class DatasetGenerator:
         print(f"\nOutput files:")
         print(f"  📊 Market indices: {self.market_indices_file}")
         print(f"  📈 Fundamentals: {self.fundamentals_file}")
+        print(f"  💹 Price data: {self.price_data_file}")
         print(f"  📰 News articles: {self.news_data_file}")
         print(f"  🤖 News embeddings: {self.news_embeddings_file}")
         print(f"  ✨ FINAL DATASET: {self.final_output_file}")
@@ -461,7 +617,7 @@ Examples:
     parser.add_argument('--dataset', type=str, required=True,
                        choices=['test', 's_lot', 'a_lot', 'all'],
                        help='Dataset to generate')
-    parser.add_argument('--api-key', type=str, required=True,
+    parser.add_argument('--api-key', type=str, required=False, default="placeholder",
                        help='FMP API key (required)')
     parser.add_argument('--years', type=int, default=25,
                        help='Years of historical data (default: 25)')
@@ -479,9 +635,22 @@ Examples:
                        choices=['cuda', 'cpu'],
                        help='Device for news embedding (default: cuda)')
     parser.add_argument('--skip-cross-sectional', action='store_true',
-                       help='Skip cross-sectional features (faster processing)')
+                       help='Skip cross-sectional percentile features (faster, recommended)')
+    parser.add_argument('--no-cross-sectional-norm', action='store_true',
+                       help='Disable cross-sectional normalization (NOT recommended!)')
+    parser.add_argument('--news-source', type=str, default='alphavantage',
+                       choices=['gnews', 'alphavantage'],
+                       help='News scraping source (default: alphavantage)')
+    parser.add_argument('--av-api-key', type=str, default="placeholder",
+                       help='Alpha Vantage API key (required if news-source=alphavantage)')
+    parser.add_argument('--av-rate-limit', type=int, default=75,
+                       help='Alpha Vantage rate limit (75 for Premium, 5 for Free, default: 75)')
 
     args = parser.parse_args()
+
+    # Validate Alpha Vantage settings
+    if args.news_source == 'alphavantage' and not args.av_api_key:
+        parser.error("--av-api-key is required when --news-source=alphavantage")
 
     # Create generator
     generator = DatasetGenerator(
@@ -489,7 +658,10 @@ Examples:
         api_key=args.api_key,
         years=args.years,
         news_years=args.news_years,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        news_source=args.news_source,
+        av_api_key=args.av_api_key,
+        av_rate_limit=args.av_rate_limit
     )
 
     # Run pipeline
@@ -499,7 +671,8 @@ Examples:
             force_rescrape=args.force_rescrape,
             resume_from=args.resume_from,
             device=args.device,
-            skip_cross_sectional=args.skip_cross_sectional
+            skip_cross_sectional=args.skip_cross_sectional,
+            use_cross_sectional_normalization=not args.no_cross_sectional_norm
         )
 
         if success:

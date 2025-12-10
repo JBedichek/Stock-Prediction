@@ -29,22 +29,27 @@ class NewsScraperMultiSource:
     Multi-source news scraper for stocks.
     """
 
-    def __init__(self, fmp_api_key: Optional[str] = None, rate_limit_delay: float = 1.0):
+    def __init__(self, fmp_api_key: Optional[str] = None, rate_limit_delay: float = 1.0,
+                 max_results_per_query: int = 100, fetch_full_articles: bool = True):
         """
         Initialize scraper.
 
         Args:
             fmp_api_key: Optional FMP API key
             rate_limit_delay: Delay between requests (seconds)
+            max_results_per_query: Max results per query (will chunk dates if needed)
+            fetch_full_articles: Whether to fetch full article text (SLOW - adds 25 hours per stock!)
         """
         self.fmp_api_key = fmp_api_key
         self.rate_limit_delay = rate_limit_delay
-        self.gnews_client = GNews(language='en', country='US', max_results=100)
+        self.max_results_per_query = max_results_per_query
+        self.fetch_full_articles = fetch_full_articles
+        self.gnews_client = GNews(language='en', country='US', max_results=max_results_per_query)
 
     def scrape_google_news(self, ticker: str, company_name: str,
                           start_date: datetime, end_date: datetime) -> List[Dict]:
         """
-        Scrape news from Google News.
+        Scrape news from Google News with date chunking for comprehensive coverage.
 
         Args:
             ticker: Stock ticker
@@ -58,43 +63,136 @@ class NewsScraperMultiSource:
         articles = []
 
         try:
-            # Set date range
-            self.gnews_client.start_date = start_date
-            self.gnews_client.end_date = end_date
+            # For long date ranges, chunk into monthly periods to get comprehensive coverage
+            total_days = (end_date - start_date).days
 
-            # Search by company name
-            search_query = f"{company_name} stock"
-            results = self.gnews_client.get_news(search_query)
+            if total_days > 90:  # More than 3 months - chunk into monthly periods
+                # Calculate total months for progress tracking
+                total_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month) + 1
+                month_count = 0
 
-            for article in results:
+                current_start = start_date
+                while current_start < end_date:
+                    month_count += 1
+
+                    # Get next month boundary
+                    if current_start.month == 12:
+                        next_month = datetime(current_start.year + 1, 1, 1)
+                    else:
+                        next_month = datetime(current_start.year, current_start.month + 1, 1)
+
+                    current_end = min(next_month - timedelta(days=1), end_date)
+
+                    # Query this month
+                    self.gnews_client.start_date = current_start
+                    self.gnews_client.end_date = current_end
+
+                    search_query = f"{company_name} stock"
+
+                    # Try to get news with timeout handling
+                    try:
+                        month_results = self.gnews_client.get_news(search_query)
+                    except (TimeoutError, ConnectionError, Exception) as query_error:
+                        # If query fails, skip this month and continue
+                        print(f"      ⚠️  Failed to query {current_start.strftime('%Y-%m')}: {type(query_error).__name__}")
+                        current_start = next_month
+                        continue
+
+                    if month_count % 12 == 0 or month_count == total_months:  # Print every year or at end
+                        print(f"      Queried {month_count}/{total_months} months, {len(articles)} articles so far")
+
+                    # Process articles from this month
+                    for article in month_results:
+                        try:
+                            # Get full article text (optional - SLOW!)
+                            if self.fetch_full_articles:
+                                full_text = ''
+                                try:
+                                    full_article = self.gnews_client.get_full_article(article['url'])
+                                    full_text = full_article.text if full_article else ''
+                                    time.sleep(self.rate_limit_delay)  # Only delay if fetching
+                                except (TimeoutError, ConnectionError, Exception) as article_error:
+                                    # If full article fetch fails, use description instead
+                                    full_text = article.get('description', '')
+                            else:
+                                # Fast mode: just use title + description (no HTTP requests)
+                                full_text = article.get('description', '')
+
+                            article_data = {
+                                'ticker': ticker,
+                                'title': article.get('title', ''),
+                                'description': article.get('description', ''),
+                                'url': article.get('url', ''),
+                                'published_date': article.get('published date', ''),
+                                'publisher': article.get('publisher', {}).get('title', ''),
+                                'full_text': full_text,
+                                'source': 'google_news'
+                            }
+
+                            articles.append(article_data)
+
+                        except Exception as e:
+                            # Skip articles that completely fail to process
+                            continue
+
+                    # Move to next month
+                    current_start = next_month
+
+            else:
+                # Short date range - single query
+                self.gnews_client.start_date = start_date
+                self.gnews_client.end_date = end_date
+
+                # Search by company name
+                search_query = f"{company_name} stock"
+
+                # Try to get news with timeout handling
                 try:
-                    # Get full article
-                    full_article = self.gnews_client.get_full_article(article['url'])
+                    results = self.gnews_client.get_news(search_query)
+                except (TimeoutError, ConnectionError, Exception) as query_error:
+                    # If query fails, return empty list
+                    print(f"      ⚠️  Failed to query: {type(query_error).__name__}")
+                    return articles
 
-                    article_data = {
-                        'ticker': ticker,
-                        'title': article.get('title', ''),
-                        'description': article.get('description', ''),
-                        'url': article.get('url', ''),
-                        'published_date': article.get('published date', ''),
-                        'publisher': article.get('publisher', {}).get('title', ''),
-                        'full_text': full_article.text if full_article else '',
-                        'source': 'google_news'
-                    }
+                for article in results:
+                    try:
+                        # Get full article text (optional - SLOW!)
+                        if self.fetch_full_articles:
+                            full_text = ''
+                            try:
+                                full_article = self.gnews_client.get_full_article(article['url'])
+                                full_text = full_article.text if full_article else ''
+                                time.sleep(self.rate_limit_delay)  # Only delay if fetching
+                            except (TimeoutError, ConnectionError, Exception) as article_error:
+                                # If full article fetch fails, use description instead
+                                full_text = article.get('description', '')
+                        else:
+                            # Fast mode: just use title + description (no HTTP requests)
+                            full_text = article.get('description', '')
 
-                    articles.append(article_data)
-                    time.sleep(self.rate_limit_delay)
+                        article_data = {
+                            'ticker': ticker,
+                            'title': article.get('title', ''),
+                            'description': article.get('description', ''),
+                            'url': article.get('url', ''),
+                            'published_date': article.get('published date', ''),
+                            'publisher': article.get('publisher', {}).get('title', ''),
+                            'full_text': full_text,
+                            'source': 'google_news'
+                        }
 
-                except Exception as e:
-                    # Skip articles that fail to fetch
-                    continue
+                        articles.append(article_data)
+
+                    except Exception as e:
+                        # Skip articles that completely fail to process
+                        continue
 
         except Exception as e:
             print(f"  ⚠️  Google News error for {ticker}: {e}")
 
         return articles
 
-    def scrape_fmp_news(self, ticker: str, limit: int = 100) -> List[Dict]:
+    def scrape_fmp_news(self, ticker: str, limit: int = 10000) -> List[Dict]:
         """
         Scrape news from FMP API (if available).
 
@@ -263,11 +361,38 @@ def scrape_news_dataset(stock_dict: Dict[str, str],
     print(f"{'='*80}\n")
 
     scraper = NewsScraperMultiSource(fmp_api_key=fmp_api_key, rate_limit_delay=1.0)
+
+    # Check for existing progress and auto-resume
+    import os
     all_news = {}
+    if os.path.exists(output_file):
+        try:
+            from utils.utils import pic_load
+            all_news = pic_load(output_file)
+            print(f"📂 Found existing progress: {len(all_news)}/{len(stock_dict)} stocks completed")
+
+            if len(all_news) > 0:
+                last_ticker = list(all_news.keys())[-1]
+                print(f"   Last completed: {last_ticker}")
+                print(f"   Resuming from next stock...")
+        except Exception as e:
+            print(f"⚠️  Could not load existing file: {e}")
+            print(f"   Starting fresh...")
+            all_news = {}
 
     from tqdm import tqdm
     for i, (ticker, company_name) in enumerate(tqdm(stock_dict.items(), desc="Scraping news")):
-        print(f"\n[{i+1}/{len(stock_dict)}] {ticker} - {company_name}")
+        # Skip already completed stocks (but retry if 0 articles)
+        if ticker in all_news and len(all_news[ticker]) > 0:
+            print(f"\n[{i+1}/{len(stock_dict)}] {ticker} - {company_name}")
+            print(f"  ⏭️  Already scraped ({len(all_news[ticker])} articles), skipping...")
+            continue
+
+        if ticker in all_news and len(all_news[ticker]) == 0:
+            print(f"\n[{i+1}/{len(stock_dict)}] {ticker} - {company_name}")
+            print(f"  🔄 Retrying (previous attempt: 0 articles)...")
+        else:
+            print(f"\n[{i+1}/{len(stock_dict)}] {ticker} - {company_name}")
 
         try:
             articles = scraper.scrape_all_sources(

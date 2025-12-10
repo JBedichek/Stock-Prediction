@@ -61,8 +61,8 @@ class DerivedFeaturesCalculator:
         features['dollar_volume_ma_20'] = (close * volume).rolling(20, min_periods=1).mean()
 
         # Volume spike detection
-        features['volume_spike_2x'] = (volume > 2 * volume_ma_20).astype(float)
-        features['volume_spike_3x'] = (volume > 3 * volume_ma_20).astype(float)
+        features['volume_spike_2x'] = volume.gt(2 * volume_ma_20).fillna(False).astype(float)
+        features['volume_spike_3x'] = volume.gt(3 * volume_ma_20).fillna(False).astype(float)
 
         # Volume trend
         features['volume_trend_5d'] = volume.rolling(5, min_periods=2).apply(
@@ -101,8 +101,8 @@ class DerivedFeaturesCalculator:
         # Gap analysis
         prev_close = close.shift(1)
         features['gap_pct'] = (open_price - prev_close) / (prev_close + 1e-8)
-        features['gap_up'] = (features['gap_pct'] > 0.01).astype(float)  # >1% gap up
-        features['gap_down'] = (features['gap_pct'] < -0.01).astype(float)  # >1% gap down
+        features['gap_up'] = features['gap_pct'].gt(0.01).fillna(False).astype(float)  # >1% gap up
+        features['gap_down'] = features['gap_pct'].lt(-0.01).fillna(False).astype(float)  # >1% gap down
 
         # Price ranges
         features['high_low_ratio'] = high / (low + 1e-8)
@@ -124,8 +124,8 @@ class DerivedFeaturesCalculator:
         features['dist_from_sma200'] = (close - sma_200) / (sma_200 + 1e-8)
 
         # Trend strength
-        features['sma20_above_sma50'] = (sma_20 > sma_50).astype(float)
-        features['sma50_above_sma200'] = (sma_50 > sma_200).astype(float)
+        features['sma20_above_sma50'] = sma_20.gt(sma_50).fillna(False).astype(float)
+        features['sma50_above_sma200'] = sma_50.gt(sma_200).fillna(False).astype(float)
 
         # Returns
         features['return_1d'] = close.pct_change(1)
@@ -171,11 +171,12 @@ class DerivedFeaturesCalculator:
         features['bb_position'] = (close - lower_band) / (upper_band - lower_band + 1e-8)  # 0-1
 
         # Bollinger squeeze
-        features['bb_squeeze'] = (features['bb_width'] < features['bb_width'].rolling(50, min_periods=1).quantile(0.25)).astype(float)
+        bb_width_threshold = features['bb_width'].rolling(50, min_periods=1).quantile(0.25)
+        features['bb_squeeze'] = features['bb_width'].lt(bb_width_threshold).fillna(False).astype(float)
 
         # Price touching bands
-        features['touching_upper_bb'] = (close >= upper_band * 0.99).astype(float)
-        features['touching_lower_bb'] = (close <= lower_band * 1.01).astype(float)
+        features['touching_upper_bb'] = close.ge(upper_band * 0.99).fillna(False).astype(float)
+        features['touching_lower_bb'] = close.le(lower_band * 1.01).fillna(False).astype(float)
 
         return features
 
@@ -287,26 +288,56 @@ class DerivedFeaturesCalculator:
         """
         all_features = pd.DataFrame(index=df.index)
 
-        print("  📊 Calculating volume features...")
-        volume_features = self.calculate_volume_features(df)
-        all_features = pd.concat([all_features, volume_features], axis=1)
+        try:
+            print("      📊 Calculating volume features...")
+            volume_features = self.calculate_volume_features(df)
+            all_features = pd.concat([all_features, volume_features], axis=1)
+        except Exception as e:
+            print(f"      ❌ Error in volume features: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
-        print("  📈 Calculating price features...")
-        price_features = self.calculate_price_features(df)
-        all_features = pd.concat([all_features, price_features], axis=1)
+        try:
+            print("      📈 Calculating price features...")
+            price_features = self.calculate_price_features(df)
+            all_features = pd.concat([all_features, price_features], axis=1)
+        except Exception as e:
+            print(f"      ❌ Error in price features: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
-        print("  📉 Calculating Bollinger Bands...")
-        bb_features = self.calculate_bollinger_bands(df)
-        all_features = pd.concat([all_features, bb_features], axis=1)
+        try:
+            print("      📉 Calculating Bollinger Bands...")
+            bb_features = self.calculate_bollinger_bands(df)
+            all_features = pd.concat([all_features, bb_features], axis=1)
+        except Exception as e:
+            print(f"      ❌ Error in Bollinger Bands: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
-        print("  🚀 Calculating momentum features...")
-        momentum_features = self.calculate_momentum_features(df)
-        all_features = pd.concat([all_features, momentum_features], axis=1)
+        try:
+            print("      🚀 Calculating momentum features...")
+            momentum_features = self.calculate_momentum_features(df)
+            all_features = pd.concat([all_features, momentum_features], axis=1)
+        except Exception as e:
+            print(f"      ❌ Error in momentum features: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
         if market_df is not None:
-            print("  📊 Calculating market-relative features...")
-            market_features = self.calculate_market_relative_features(df, market_df)
-            all_features = pd.concat([all_features, market_features], axis=1)
+            try:
+                print("      📊 Calculating market-relative features...")
+                market_features = self.calculate_market_relative_features(df, market_df)
+                all_features = pd.concat([all_features, market_features], axis=1)
+            except Exception as e:
+                print(f"      ❌ Error in market-relative features: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
         # Replace inf with NaN, then fill NaN with 0
         all_features = all_features.replace([np.inf, -np.inf], np.nan)
