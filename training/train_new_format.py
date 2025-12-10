@@ -309,13 +309,13 @@ def main():
                        help='Path to dataset pickle file')
     parser.add_argument('--seq-len', type=int, default=2000,
                        help='Sequence length (default: 60)')
-    parser.add_argument('--batch-size', type=int, default=8,
+    parser.add_argument('--batch-size', type=int, default=2,
                        help='Batch size (default: 32)')
     parser.add_argument('--num-workers', type=int, default=4,
                        help='Number of data workers (default: 4)')
 
     # Model args
-    parser.add_argument('--hidden-dim', type=int, default=1024,
+    parser.add_argument('--hidden-dim', type=int, default=2048,
                        help='Hidden dimension (default: 512)')
     parser.add_argument('--num-layers', type=int, default=24,
                        help='Number of transformer layers (default: 6)')
@@ -330,11 +330,11 @@ def main():
     # Training args
     parser.add_argument('--epochs', type=int, default=10,
                        help='Number of epochs (default: 100)')
-    parser.add_argument('--lr', type=float, default=1e-3,
+    parser.add_argument('--lr', type=float, default=1e-5,
                        help='Learning rate (default: 1e-4)')
-    parser.add_argument('--weight-decay', type=float, default=0.02,
+    parser.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay (default: 0.01)')
-    parser.add_argument('--optimizer', type=str, default='adamw',
+    parser.add_argument('--optimizer', type=str, default='lion',
                        choices=['adamw', 'lion'],
                        help='Optimizer (default: adamw)')
     parser.add_argument('--device', type=str, default='cuda',
