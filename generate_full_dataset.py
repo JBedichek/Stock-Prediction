@@ -15,6 +15,16 @@ Handles:
 - Error recovery
 - All edge cases (missing news, failed scrapes, etc.)
 - Multi-stock datasets (test, s_lot, a_lot, all_stocks)
+- Intermediate saves (can skip expensive concatenation step)
+
+Steps:
+1. Market indices scraping
+2. Stock fundamentals scraping
+2.5. Price data scraping (yfinance)
+3. News scraping
+4. News embedding
+5. Feature concatenation (saves intermediate DataFrames)
+6. Normalization & tensorization (uses intermediate DataFrames)
 
 Output: Complete feature tensors ready for training (1100-1200 features per day)
 """
@@ -110,6 +120,7 @@ class DatasetGenerator:
         self.news_data_file = self.output_dir / f'{dataset_name}_news_data.pkl'
         self.news_embeddings_file = self.output_dir / f'{dataset_name}_news_embeddings.pkl'
         self.sector_dict_file = self.output_dir / f'{dataset_name}_sector_dict'
+        self.intermediate_file = self.output_dir / f'{dataset_name}_intermediate_dataframes.pkl'
         self.final_output_file = self.output_dir / f'{dataset_name}_complete_dataset.pkl'
 
         print_banner("DATASET GENERATOR INITIALIZED")
@@ -388,14 +399,19 @@ class DatasetGenerator:
             save_pickle({ticker: [] for ticker in self.stock_dict}, str(self.news_data_file))
             return True
 
-    def step4_embed_news(self, force_reembed=False, device='cuda'):
+    def step4_embed_news(self, force_reembed=False, device='cuda', chunk_size=100):
         """
         Step 4: Embed news with Nomic AI.
 
         Time: ~5-20 minutes depending on GPU
         API Calls: 0 (local model)
+
+        Args:
+            force_reembed: Force re-embedding even if file exists
+            device: Device to use ('cuda' or 'cpu')
+            chunk_size: Number of stocks to process at once (100 recommended for 32GB GPU)
         """
-        print_banner("STEP 4/6: NEWS EMBEDDINGS")
+        print_banner("STEP 4/7: NEWS EMBEDDINGS")
 
         if check_file_exists(self.news_embeddings_file) and not force_reembed:
             response = input("  Use existing file? [Y/n]: ").strip().lower()
@@ -413,6 +429,8 @@ class DatasetGenerator:
         print(f"  Model: nomic-ai/nomic-embed-text-v1.5")
         print(f"  Device: {device}")
         print(f"  Embedding dimension: 768")
+        print(f"  Chunk size: {chunk_size} stocks per chunk")
+        print(f"  (Processing in chunks to avoid GPU OOM on large datasets)")
 
         try:
             create_news_embeddings(
@@ -420,7 +438,9 @@ class DatasetGenerator:
                 output_file=str(self.news_embeddings_file),
                 start_date=self.news_start_date,
                 end_date=self.end_date,
-                device=device
+                device=device,
+                chunk_size=chunk_size,
+                reload_model_between_chunks=True
             )
             print(f"\n✅ Step 4 Complete: {self.news_embeddings_file}")
             return True
@@ -433,26 +453,38 @@ class DatasetGenerator:
             traceback.print_exc()
             return True  # Continue even if embedding fails
 
-    def step5_process_enhanced_features(self, skip_cross_sectional=False,
-                                        use_cross_sectional_normalization=True):
+    def step5_concatenate_features(self, skip_cross_sectional=False,
+                                    use_cross_sectional_normalization=True,
+                                    force_reprocess=False):
         """
-        Step 5: Process enhanced features.
+        Step 5: Concatenate all features (without normalization).
 
         Time: ~10-30 minutes depending on dataset size
         API Calls: 0 (all processing)
-        """
-        print_banner("STEP 5/6: ENHANCED FEATURES")
 
-        print(f"\nProcessing enhanced features...")
+        This step combines:
+        - Fundamentals
+        - Market indices
+        - Price data
+        - Technical indicators
+
+        Output: Intermediate DataFrames (not normalized)
+        """
+        print_banner("STEP 5/7: FEATURE CONCATENATION")
+
+        if check_file_exists(self.intermediate_file) and not force_reprocess:
+            response = input("  Use existing intermediate file? [Y/n]: ").strip().lower()
+            if response != 'n':
+                print("  ✅ Using existing intermediate DataFrames")
+                return True
+
+        print(f"\nConcatenating features...")
         print(f"  Input files:")
         print(f"    - Fundamentals: {self.fundamentals_file.name}")
         print(f"    - Price data: {self.price_data_file.name}")
         print(f"    - Market indices: {self.market_indices_file.name}")
-        print(f"    - News embeddings: {self.news_embeddings_file.name}")
         print(f"    - Sector dict: {self.sector_dict_file.name}")
-        print(f"  Cross-sectional percentile features: {not skip_cross_sectional}")
-        print(f"  Cross-sectional normalization: {use_cross_sectional_normalization}")
-        print(f"  Output: {self.final_output_file}")
+        print(f"  Intermediate output: {self.intermediate_file}")
 
         # Check required files
         if not check_file_exists(self.fundamentals_file):
@@ -460,6 +492,63 @@ class DatasetGenerator:
             return False
 
         try:
+            # Run only Pass 1 (concatenation) - normalization happens in step 6
+            # This will save the intermediate file and skip Pass 2+3
+            process_enhanced_data(
+                raw_data_file=str(self.fundamentals_file),
+                market_indices_file=str(self.market_indices_file) if self.market_indices_file.exists() else None,
+                sector_dict_file=str(self.sector_dict_file) if self.sector_dict_file.exists() else None,
+                news_embeddings_file=None,  # Don't process news yet - happens in step 6
+                price_data_file=str(self.price_data_file) if self.price_data_file.exists() else None,
+                output_file=str(self.final_output_file),  # This won't be used yet
+                start_date=self.data_start_date,
+                end_date=self.end_date,
+                add_cross_sectional=not skip_cross_sectional,
+                use_cross_sectional_normalization=use_cross_sectional_normalization,
+                intermediate_output_file=str(self.intermediate_file)
+            )
+            print(f"\n✅ Step 5 Complete: {self.intermediate_file}")
+            return True
+
+        except Exception as e:
+            print(f"\n❌ Step 5 Failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def step6_normalize_and_tensorize(self, skip_cross_sectional=False,
+                                      use_cross_sectional_normalization=True):
+        """
+        Step 6: Apply normalization and convert to tensors.
+
+        Time: ~5-15 minutes depending on dataset size
+        API Calls: 0 (all processing)
+
+        This step:
+        - Loads intermediate DataFrames from step 5
+        - Applies cross-sectional normalization
+        - Adds news embeddings
+        - Converts to tensors
+
+        Output: Final dataset ready for training
+        """
+        print_banner("STEP 6/7: NORMALIZATION & TENSORIZATION")
+
+        print(f"\nNormalizing and converting to tensors...")
+        print(f"  Input files:")
+        print(f"    - Intermediate DataFrames: {self.intermediate_file.name}")
+        print(f"    - News embeddings: {self.news_embeddings_file.name}")
+        print(f"  Cross-sectional normalization: {use_cross_sectional_normalization}")
+        print(f"  Final output: {self.final_output_file}")
+
+        # Check required files
+        if not check_file_exists(self.intermediate_file):
+            print("\n❌ Missing intermediate file! Run step 5 first.")
+            return False
+
+        try:
+            # Run Pass 2+3 (normalization + tensorization)
+            # This will load the intermediate file and skip Pass 1
             process_enhanced_data(
                 raw_data_file=str(self.fundamentals_file),
                 market_indices_file=str(self.market_indices_file) if self.market_indices_file.exists() else None,
@@ -470,20 +559,21 @@ class DatasetGenerator:
                 start_date=self.data_start_date,
                 end_date=self.end_date,
                 add_cross_sectional=not skip_cross_sectional,
-                use_cross_sectional_normalization=use_cross_sectional_normalization
+                use_cross_sectional_normalization=use_cross_sectional_normalization,
+                intermediate_output_file=str(self.intermediate_file)  # Load from here
             )
-            print(f"\n✅ Step 5 Complete: {self.final_output_file}")
+            print(f"\n✅ Step 6 Complete: {self.final_output_file}")
             return True
 
         except Exception as e:
-            print(f"\n❌ Step 5 Failed: {e}")
+            print(f"\n❌ Step 6 Failed: {e}")
             import traceback
             traceback.print_exc()
             return False
 
     def run_all(self, skip_steps=None, force_rescrape=False, resume_from=None,
                 device='cuda', skip_cross_sectional=False,
-                use_cross_sectional_normalization=True):
+                use_cross_sectional_normalization=True, chunk_size=100):
         """
         Run all steps in sequence.
 
@@ -492,8 +582,10 @@ class DatasetGenerator:
             force_rescrape: Force rescraping even if files exist
             resume_from: Ticker to resume from (for step 2)
             device: Device for embedding ('cuda' or 'cpu')
-            skip_cross_sectional: Skip cross-sectional percentile features (faster, recommended)
+            skip_cross_sectional: Skip cross-sectional percentile features (default: False, features enabled)
             use_cross_sectional_normalization: Use cross-sectional normalization for fundamentals (recommended!)
+            chunk_size: Number of stocks to process per chunk in step 4 (news embedding).
+                       Lower values use less GPU memory. Recommended: 100 for 32GB GPU, 50 for 16GB GPU.
 
         Returns:
             True if all steps completed successfully
@@ -510,8 +602,9 @@ class DatasetGenerator:
             (2, "Fundamentals", lambda: self.step2_fundamentals(force_rescrape, resume_from)),
             (2.5, "Price Data", lambda: self.step2_5_prices(force_rescrape)),
             (3, "News Scraping", lambda: self.step3_news(force_rescrape)),
-            (4, "News Embedding", lambda: self.step4_embed_news(force_rescrape, device)),
-            (5, "Enhanced Features", lambda: self.step5_process_enhanced_features(skip_cross_sectional, use_cross_sectional_normalization)),
+            (4, "News Embedding", lambda: self.step4_embed_news(force_rescrape, device, chunk_size)),
+            (5, "Feature Concatenation", lambda: self.step5_concatenate_features(skip_cross_sectional, use_cross_sectional_normalization, force_rescrape)),
+            (6, "Normalization & Tensorization", lambda: self.step6_normalize_and_tensorize(skip_cross_sectional, use_cross_sectional_normalization)),
         ]
 
         results = {}
@@ -529,7 +622,7 @@ class DatasetGenerator:
                     continue
 
                 # Update progress bar description
-                pbar.set_description(f"Overall Progress (Step {step_num}/5: {step_name})")
+                pbar.set_description(f"Overall Progress (Step {step_num}/6: {step_name})")
 
                 try:
                     success = step_func()
@@ -565,6 +658,7 @@ class DatasetGenerator:
         print(f"  💹 Price data: {self.price_data_file}")
         print(f"  📰 News articles: {self.news_data_file}")
         print(f"  🤖 News embeddings: {self.news_embeddings_file}")
+        print(f"  🔗 Intermediate DataFrames: {self.intermediate_file}")
         print(f"  ✨ FINAL DATASET: {self.final_output_file}")
 
         # Load and show stats
@@ -611,6 +705,18 @@ Examples:
 
   # Force rescrape everything
   python generate_full_dataset.py --dataset s_lot --force-rescrape
+
+  # Re-run normalization only (using intermediate file from step 5)
+  python generate_full_dataset.py --dataset s_lot --skip-steps 1 2 3 4 5
+
+  # Re-run concatenation and normalization with different settings
+  python generate_full_dataset.py --dataset s_lot --skip-steps 1 2 3 4 --force-rescrape
+
+  # Process with smaller chunks to avoid GPU OOM (for 16GB GPU)
+  python generate_full_dataset.py --dataset s_lot --chunk-size 50
+
+  # Process all dataset with chunking (for 32GB GPU)
+  python generate_full_dataset.py --dataset all --years 25 --chunk-size 100
         """
     )
 
@@ -635,7 +741,7 @@ Examples:
                        choices=['cuda', 'cpu'],
                        help='Device for news embedding (default: cuda)')
     parser.add_argument('--skip-cross-sectional', action='store_true',
-                       help='Skip cross-sectional percentile features (faster, recommended)')
+                       help='Skip cross-sectional percentile features (default: enabled, use this flag to disable)')
     parser.add_argument('--no-cross-sectional-norm', action='store_true',
                        help='Disable cross-sectional normalization (NOT recommended!)')
     parser.add_argument('--news-source', type=str, default='alphavantage',
@@ -645,6 +751,8 @@ Examples:
                        help='Alpha Vantage API key (required if news-source=alphavantage)')
     parser.add_argument('--av-rate-limit', type=int, default=75,
                        help='Alpha Vantage rate limit (75 for Premium, 5 for Free, default: 75)')
+    parser.add_argument('--chunk-size', type=int, default=100,
+                       help='Number of stocks to process per chunk in step 4 (news embedding). Lower = less GPU memory. Recommended: 100 for 32GB GPU, 50 for 16GB GPU (default: 100)')
 
     args = parser.parse_args()
 
@@ -672,7 +780,8 @@ Examples:
             resume_from=args.resume_from,
             device=args.device,
             skip_cross_sectional=args.skip_cross_sectional,
-            use_cross_sectional_normalization=not args.no_cross_sectional_norm
+            use_cross_sectional_normalization=not args.no_cross_sectional_norm,
+            chunk_size=args.chunk_size
         )
 
         if success:

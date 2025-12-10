@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple
+from tqdm import tqdm
 import sys
 
 sys.path.append('/home/james/Desktop/Stock-Prediction')
@@ -331,7 +332,8 @@ def process_enhanced_data(raw_data_file: str,
                          start_date: str = '2000-01-01',
                          end_date: str = None,
                          add_cross_sectional: bool = True,
-                         use_cross_sectional_normalization: bool = True) -> Dict[str, Dict[date, torch.Tensor]]:
+                         use_cross_sectional_normalization: bool = True,
+                         intermediate_output_file: Optional[str] = None) -> Dict[str, Dict[date, torch.Tensor]]:
     """
     Process enhanced FMP data with all feature expansions including news embeddings and price data.
 
@@ -348,6 +350,7 @@ def process_enhanced_data(raw_data_file: str,
         end_date: End date
         add_cross_sectional: Whether to add cross-sectional features (Phase 4)
         use_cross_sectional_normalization: Whether to use cross-sectional normalization for fundamentals (recommended!)
+        intermediate_output_file: Optional path to save/load intermediate DataFrames (after concatenation, before normalization)
 
     Returns:
         Dict of {ticker: {date: tensor}}
@@ -415,12 +418,14 @@ def process_enhanced_data(raw_data_file: str,
             print(f"   Starting fresh...\n")
             completed_tickers = set()
 
-    # Disable cross-sectional percentile features to avoid memory issues
+    # Cross-sectional percentile features
     # (These are different from cross-sectional normalization!)
     if add_cross_sectional:
-        print("⚠️  Cross-sectional percentile features disabled to conserve memory")
+        print("✅ Cross-sectional percentile features: ENABLED")
+        print("   (Note: This is different from cross-sectional normalization)\n")
+    else:
+        print("⚠️  Cross-sectional percentile features: DISABLED")
         print("   (Cross-sectional normalization is still enabled for fundamentals)\n")
-        add_cross_sectional = False
 
     import gc
     import psutil
@@ -430,62 +435,94 @@ def process_enhanced_data(raw_data_file: str,
     # ========================================================================
 
     if use_cross_sectional_normalization:
-        print(f"\n{'='*80}")
-        print(f"PASS 1: GENERATING DATAFRAMES FOR ALL STOCKS")
-        print(f"{'='*80}\n")
-
-        # Pass 1: Generate DataFrames (no normalization yet)
+        # Check if intermediate file exists and load it
         all_dataframes = {}
-        failed_stocks = []
+        if intermediate_output_file and os.path.exists(intermediate_output_file):
+            print(f"\n{'='*80}")
+            print(f"LOADING INTERMEDIATE DATAFRAMES")
+            print(f"{'='*80}\n")
+            print(f"  📂 Loading from: {intermediate_output_file}")
+            all_dataframes = pic_load(intermediate_output_file)
+            print(f"  ✅ Loaded {len(all_dataframes)} DataFrames from intermediate file")
+            print(f"  ⏭️  Skipping Pass 1 (concatenation)\n")
+        else:
+            # Run Pass 1: Generate DataFrames
+            print(f"\n{'='*80}")
+            print(f"PASS 1: GENERATING DATAFRAMES FOR ALL STOCKS")
+            print(f"{'='*80}\n")
 
-        for i, (ticker, raw_data) in enumerate(raw_data_all.items(), 1):
-            # Skip already processed stocks
-            if ticker in completed_tickers:
-                print(f"  ⏭️  [{i}/{len(raw_data_all)}] {ticker}: Already processed")
-                continue
+            # Pass 1: Generate DataFrames (no normalization yet)
+            failed_stocks = []
 
-            if i % 50 == 0:
-                print(f"\n  Progress: {i}/{len(raw_data_all)} stocks")
+            for i, (ticker, raw_data) in enumerate(raw_data_all.items(), 1):
+                # Skip already processed stocks
+                if ticker in completed_tickers:
+                    print(f"  ⏭️  [{i}/{len(raw_data_all)}] {ticker}: Already processed")
+                    continue
 
-            try:
-                # Get news embeddings and price data for this ticker
-                ticker_news_embeddings = None
-                if news_embeddings_all and ticker in news_embeddings_all:
-                    ticker_news_embeddings = news_embeddings_all[ticker]
+                if i % 50 == 0:
+                    print(f"\n  Progress: {i}/{len(raw_data_all)} stocks")
 
-                ticker_price_data = None
-                if price_data_all and ticker in price_data_all:
-                    ticker_price_data = price_data_all[ticker]
+                try:
+                    # Get news embeddings and price data for this ticker
+                    ticker_news_embeddings = None
+                    if news_embeddings_all and ticker in news_embeddings_all:
+                        ticker_news_embeddings = news_embeddings_all[ticker]
 
-                processor = EnhancedFMPDataProcessor(
-                    raw_data, market_indices_data, sector_dict,
-                    ticker_news_embeddings, ticker_price_data
-                )
+                    ticker_price_data = None
+                    if price_data_all and ticker in price_data_all:
+                        ticker_price_data = price_data_all[ticker]
 
-                # Generate DataFrame WITHOUT normalization
-                df = processor.combine_all_features_enhanced(start_date, end_date)
+                    processor = EnhancedFMPDataProcessor(
+                        raw_data, market_indices_data, sector_dict,
+                        ticker_news_embeddings, ticker_price_data
+                    )
 
-                if not df.empty:
-                    all_dataframes[ticker] = df
-                    print(f"  ✅ [{i}/{len(raw_data_all)}] {ticker}: {len(df)} days, {len(df.columns)} features")
-                else:
-                    print(f"  ⚠️  [{i}/{len(raw_data_all)}] {ticker}: No data")
+                    # Generate DataFrame WITHOUT normalization
+                    df = processor.combine_all_features_enhanced(start_date, end_date)
+
+                    if not df.empty:
+                        all_dataframes[ticker] = df
+                        print(f"  ✅ [{i}/{len(raw_data_all)}] {ticker}: {len(df)} days, {len(df.columns)} features")
+                    else:
+                        print(f"  ⚠️  [{i}/{len(raw_data_all)}] {ticker}: No data")
+                        failed_stocks.append(ticker)
+
+                except Exception as e:
+                    print(f"  ❌ [{i}/{len(raw_data_all)}] {ticker}: {str(e)[:100]}")
                     failed_stocks.append(ticker)
+                    continue
 
-            except Exception as e:
-                print(f"  ❌ [{i}/{len(raw_data_all)}] {ticker}: {str(e)[:100]}")
-                failed_stocks.append(ticker)
-                continue
+                # Memory management
+                if i % 100 == 0:
+                    gc.collect()
+                    process = psutil.Process(os.getpid())
+                    mem_gb = process.memory_info().rss / 1024**3
+                    print(f"   📊 RAM usage: {mem_gb:.2f} GB\n")
 
-            # Memory management
-            if i % 100 == 0:
-                gc.collect()
-                process = psutil.Process(os.getpid())
-                mem_gb = process.memory_info().rss / 1024**3
-                print(f"   📊 RAM usage: {mem_gb:.2f} GB\n")
+            print(f"\n  ✅ Pass 1 complete: {len(all_dataframes)} stocks with DataFrames")
+            print(f"  ⚠️  Failed: {len(failed_stocks)} stocks\n")
 
-        print(f"\n  ✅ Pass 1 complete: {len(all_dataframes)} stocks with DataFrames")
-        print(f"  ⚠️  Failed: {len(failed_stocks)} stocks\n")
+            # Clean up raw data - we don't need it anymore
+            print(f"  🧹 Cleaning up raw data...")
+            del raw_data_all
+            gc.collect()
+
+            # Save intermediate DataFrames if requested
+            if intermediate_output_file:
+                print(f"  💾 Saving intermediate DataFrames to: {intermediate_output_file}")
+                save_pickle(all_dataframes, intermediate_output_file)
+                print(f"  ✅ Intermediate file saved ({len(all_dataframes)} stocks)\n")
+
+                # If news embeddings not provided, stop here (only concatenation step)
+                if not news_embeddings_file:
+                    print(f"  ⏭️  Skipping Pass 2 & 3 (no news embeddings provided)")
+                    print(f"  ℹ️  Run again with news embeddings to complete normalization & tensorization\n")
+
+                    # Clean up before returning
+                    del all_dataframes
+                    gc.collect()
+                    return {}
 
         # ========================================================================
         # PASS 2: APPLY CROSS-SECTIONAL NORMALIZATION
@@ -496,9 +533,108 @@ def process_enhanced_data(raw_data_file: str,
         print(f"{'='*80}\n")
 
         normalizer = CrossSectionalNormalizer()
-        all_dataframes = normalizer.normalize_dataframes(all_dataframes, verbose=True)
+        # Use CPU-based normalization (default) to avoid GPU OOM on large datasets
+        # Most systems have 64GB+ RAM but only 16-32GB VRAM
+        # Features are processed in batches of 50 to conserve memory
+        all_dataframes = normalizer.normalize_dataframes(
+            all_dataframes,
+            verbose=True,
+            use_gpu=False,  # CPU normalization to avoid OOM
+            feature_batch_size=50  # Process 50 features at a time
+        )
 
         print(f"\n  ✅ Pass 2 complete: All stocks normalized\n")
+
+        # Clean up after normalization
+        gc.collect()
+
+        # ========================================================================
+        # PASS 2.25: ALIGN ALL DATAFRAME COLUMNS (FIX VARIABLE DIMENSIONS)
+        # ========================================================================
+
+        print(f"\n{'='*80}")
+        print(f"PASS 2.25: ALIGNING DATAFRAME COLUMNS")
+        print(f"{'='*80}\n")
+
+        # Find all unique columns across all DataFrames
+        print(f"  🔍 Finding all unique columns...")
+        all_columns = set()
+        for ticker, df in all_dataframes.items():
+            all_columns.update(df.columns)
+
+        all_columns = sorted(list(all_columns))
+        print(f"  ✅ Found {len(all_columns)} unique columns")
+
+        # Align all DataFrames to have the same columns
+        print(f"  🔧 Aligning DataFrames...")
+        num_aligned = 0
+        for ticker, df in tqdm(all_dataframes.items(), desc="  Aligning", ncols=100):
+            missing_cols = set(all_columns) - set(df.columns)
+            if missing_cols:
+                # Add missing columns filled with zeros
+                for col in missing_cols:
+                    df[col] = 0.0
+                # Reindex to match column order
+                all_dataframes[ticker] = df[all_columns]
+                num_aligned += 1
+
+        print(f"  ✅ Aligned {num_aligned} DataFrames to {len(all_columns)} columns")
+        print(f"  ✅ All DataFrames now have the same feature dimensions\n")
+
+        gc.collect()
+
+        # ========================================================================
+        # PASS 2.5: ADD CROSS-SECTIONAL PERCENTILE FEATURES (OPTIONAL)
+        # ========================================================================
+
+        cross_sectional_features = {}
+        if add_cross_sectional:
+            print(f"\n{'='*80}")
+            print(f"PASS 2.5: ADDING CROSS-SECTIONAL PERCENTILE FEATURES")
+            print(f"{'='*80}\n")
+
+            # Get unique dates across all stocks
+            all_dates = set()
+            for df in all_dataframes.values():
+                all_dates.update(df.index)
+            all_dates = sorted(list(all_dates))
+
+            print(f"  Total unique dates: {len(all_dates)}")
+            print(f"  Calculating percentile rankings across stocks for each date...")
+
+            # Calculate cross-sectional features
+            calculator = CrossSectionalCalculator(sector_dict)
+
+            # Process dates in batches to manage memory
+            batch_size = 100
+            for batch_start in tqdm(range(0, len(all_dates), batch_size), desc="  Processing date batches", ncols=100):
+                batch_dates = all_dates[batch_start:batch_start + batch_size]
+
+                for date_obj in batch_dates:
+                    try:
+                        date_features = calculator.calculate_cross_sectional_features_for_date(
+                            all_dataframes, date_obj
+                        )
+
+                        # Store features for each ticker
+                        for ticker, features_dict in date_features.items():
+                            if ticker not in cross_sectional_features:
+                                cross_sectional_features[ticker] = {}
+
+                            # Store as dict for now, will convert to tensor later
+                            cross_sectional_features[ticker][date_obj] = features_dict
+
+                    except Exception as e:
+                        # Skip problematic dates
+                        continue
+
+                # Periodic cleanup
+                if batch_start % 1000 == 0:
+                    gc.collect()
+
+            print(f"\n  ✅ Cross-sectional percentile features calculated for {len(cross_sectional_features)} stocks")
+        else:
+            print(f"\n  ⏭️  Skipping cross-sectional percentile features\n")
 
         # ========================================================================
         # PASS 3: CONVERT TO TENSORS AND ADD NEWS EMBEDDINGS
@@ -509,16 +645,24 @@ def process_enhanced_data(raw_data_file: str,
         print(f"{'='*80}\n")
 
         processed_data = {}
-        save_every = 50
+        save_every = 500  # Save every 500 stocks to reduce I/O overhead
 
-        for i, (ticker, df) in enumerate(all_dataframes.items(), 1):
+        # Convert to list to allow deletion during iteration
+        all_dataframes_items = list(all_dataframes.items())
+
+        for i, (ticker, df) in enumerate(all_dataframes_items, 1):
             try:
                 # Get news embeddings for this ticker
                 ticker_news_embeddings = None
                 if news_embeddings_all and ticker in news_embeddings_all:
                     ticker_news_embeddings = news_embeddings_all[ticker]
 
-                # Convert to tensors with news embeddings
+                # Get cross-sectional features for this ticker
+                ticker_cross_sectional = None
+                if cross_sectional_features and ticker in cross_sectional_features:
+                    ticker_cross_sectional = cross_sectional_features[ticker]
+
+                # Convert to tensors with news embeddings and cross-sectional features
                 tensor_dict = {}
                 for date_idx, row in df.iterrows():
                     date_obj = date_idx.date() if isinstance(date_idx, pd.Timestamp) else date_idx
@@ -526,35 +670,67 @@ def process_enhanced_data(raw_data_file: str,
                     # Base features tensor
                     base_tensor = torch.tensor(row.values, dtype=torch.float32)
 
+                    # Add cross-sectional percentile features (if enabled)
+                    if ticker_cross_sectional and date_obj in ticker_cross_sectional:
+                        cs_features = ticker_cross_sectional[date_obj]
+                        cs_values = list(cs_features.values())
+                        cs_tensor = torch.tensor(cs_values, dtype=torch.float32)
+                    else:
+                        # If no cross-sectional features, use zeros (or skip if not enabled)
+                        cs_tensor = None if not add_cross_sectional else torch.tensor([], dtype=torch.float32)
+
                     # Add news embeddings
                     if ticker_news_embeddings and date_obj in ticker_news_embeddings:
                         news_tensor = ticker_news_embeddings[date_obj]
                     else:
                         news_tensor = torch.zeros(768, dtype=torch.float32)
 
-                    # Concatenate
-                    tensor_dict[date_obj] = torch.cat([base_tensor, news_tensor])
+                    # Concatenate all features
+                    if cs_tensor is not None and len(cs_tensor) > 0:
+                        tensor_dict[date_obj] = torch.cat([base_tensor, cs_tensor, news_tensor])
+                    else:
+                        tensor_dict[date_obj] = torch.cat([base_tensor, news_tensor])
 
                 if tensor_dict:
                     processed_data[ticker] = tensor_dict
                     completed_tickers.add(ticker)
 
+                # Delete the dataframe immediately after processing to free memory
+                del df
+                all_dataframes[ticker] = None  # Remove reference
+
                 if i % 10 == 0:
                     news_dim = 768
-                    total_features = len(df.columns) + news_dim
-                    print(f"  [{i}/{len(all_dataframes)}] {ticker}: {len(tensor_dict)} days, {total_features} features")
+                    total_features = len(all_dataframes_items[i-1][1].columns) + news_dim if i > 0 else 0
+                    print(f"  [{i}/{len(all_dataframes_items)}] {ticker}: {len(tensor_dict)} days, {total_features} features")
 
             except Exception as e:
-                print(f"  ❌ [{i}/{len(all_dataframes)}] {ticker}: {e}")
+                print(f"  ❌ [{i}/{len(all_dataframes_items)}] {ticker}: {e}")
+                # Still delete the dataframe even on error
+                if ticker in all_dataframes:
+                    all_dataframes[ticker] = None
                 continue
 
-            # Save incrementally
+            # Periodic garbage collection (every 50 stocks) without saving
+            if i % 50 == 0 and i % save_every != 0:
+                gc.collect()
+
+            # Save incrementally and clean up aggressively (every 500 stocks)
             if i % save_every == 0:
                 print(f"\n💾 Saving progress ({len(processed_data)} stocks)...")
                 save_pickle(processed_data, output_file)
 
-                # Memory cleanup
+                # Aggressive memory cleanup
+                # Delete processed DataFrames from dict
+                for j in range(max(0, i - save_every), i):
+                    if j < len(all_dataframes_items):
+                        ticker_to_delete = all_dataframes_items[j][0]
+                        if ticker_to_delete in all_dataframes:
+                            del all_dataframes[ticker_to_delete]
+
+                # Force garbage collection
                 gc.collect()
+                gc.collect()  # Run twice for better cleanup
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -567,9 +743,22 @@ def process_enhanced_data(raw_data_file: str,
             print(f"\n💾 Final save...")
             save_pickle(processed_data, output_file)
 
-        # Clear memory
+        # Aggressive final cleanup
+        print(f"\n🧹 Final memory cleanup...")
         del all_dataframes
+        del all_dataframes_items
+        if news_embeddings_all:
+            del news_embeddings_all
         gc.collect()
+        gc.collect()  # Run twice
+
+        # Show final memory usage
+        try:
+            process = psutil.Process(os.getpid())
+            mem_gb = process.memory_info().rss / 1024**3
+            print(f"  📊 Final RAM usage: {mem_gb:.2f} GB")
+        except:
+            pass
 
     else:
         # OLD APPROACH: Temporal normalization only (for backward compatibility)
@@ -586,58 +775,6 @@ def process_enhanced_data(raw_data_file: str,
     mem_gb = process.memory_info().rss / 1024**3
     print(f"   📊 Final RAM usage: {mem_gb:.2f} GB\n")
 
-    # Skip cross-sectional percentile features (disabled above)
-    # Note: This is different from cross-sectional normalization which is now handled above
-    if False:  # Never execute - cross-sectional percentile features disabled
-        print(f"\n{'='*80}")
-        print(f"ADDING CROSS-SECTIONAL FEATURES (PHASE 4)")
-        print(f"{'='*80}\n")
-
-        # Get unique dates
-        all_dates = set()
-        for df in stock_dataframes.values():
-            if 'date' in df.columns:
-                dates = pd.to_datetime(df['date']).dt.date.unique()
-                all_dates.update(dates)
-
-        all_dates = sorted(list(all_dates))
-
-        # Calculate cross-sectional features
-        calculator = CrossSectionalCalculator(sector_dict)
-
-        print(f"  Calculating for {len(all_dates)} dates...")
-
-        # Store cross-sectional tensors separately
-        cross_sectional_tensors = {}
-
-        from tqdm import tqdm
-        for date_obj in tqdm(all_dates[:100]):  # Process first 100 dates as sample
-            date_features = calculator.calculate_cross_sectional_features_for_date(
-                stock_dataframes, date_obj
-            )
-
-            for ticker, features_dict in date_features.items():
-                if ticker not in cross_sectional_tensors:
-                    cross_sectional_tensors[ticker] = {}
-
-                # Convert to tensor
-                feature_values = list(features_dict.values())
-                cross_sectional_tensors[ticker][date_obj] = torch.tensor(
-                    feature_values, dtype=torch.float32
-                )
-
-        # Merge cross-sectional features with main features
-        print(f"\n  Merging cross-sectional features with main features...")
-        for ticker in processed_data:
-            if ticker in cross_sectional_tensors:
-                for date_obj in processed_data[ticker]:
-                    if date_obj in cross_sectional_tensors[ticker]:
-                        # Concatenate tensors
-                        main_tensor = processed_data[ticker][date_obj]
-                        cross_tensor = cross_sectional_tensors[ticker][date_obj]
-                        processed_data[ticker][date_obj] = torch.cat([main_tensor, cross_tensor])
-
-        print(f"  ✅ Cross-sectional features added!")
 
     # Load final data for statistics
     print(f"\n📊 Loading final statistics...")

@@ -459,7 +459,9 @@ def create_news_embeddings(news_data_file: str,
                           output_file: str,
                           start_date: str,
                           end_date: str = None,
-                          device: str = None) -> Dict[str, Dict[dt_date, torch.Tensor]]:
+                          device: str = None,
+                          chunk_size: int = None,
+                          reload_model_between_chunks: bool = True) -> Dict[str, Dict[dt_date, torch.Tensor]]:
     """
     Create news embeddings from scraped news data.
 
@@ -469,6 +471,9 @@ def create_news_embeddings(news_data_file: str,
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (defaults to today)
         device: Device for embedding ('cuda' or 'cpu')
+        chunk_size: Process stocks in chunks of this size (default: all at once)
+                   Useful for large datasets to avoid GPU OOM. Recommended: 50-200 for 32GB GPU
+        reload_model_between_chunks: If True, unload and reload model between chunks to clear GPU memory
 
     Returns:
         Dict of {ticker: {date: embedding_tensor}}
@@ -482,29 +487,115 @@ def create_news_embeddings(news_data_file: str,
     # Load news data
     print("📂 Loading news data...")
     all_news = pic_load(news_data_file)
-    print(f"  ✅ Loaded news for {len(all_news)} stocks\n")
+    total_stocks = len(all_news)
+    print(f"  ✅ Loaded news for {total_stocks} stocks\n")
 
-    # Initialize embedder
-    embedder = NomicNewsEmbedder(device=device)
+    # Check for existing progress
+    import os
+    import gc
+    daily_embeddings = {}
+    if os.path.exists(output_file):
+        try:
+            daily_embeddings = pic_load(output_file)
+            print(f"📂 Found existing embeddings: {len(daily_embeddings)} stocks completed")
+            print(f"   Resuming from next stock...\n")
+        except:
+            pass
 
-    # Create aggregator
-    aggregator = NewsAggregator(embedder)
+    # Filter out already completed stocks
+    all_news_items = list(all_news.items())
+    pending_stocks = [(ticker, articles) for ticker, articles in all_news_items
+                     if ticker not in daily_embeddings]
 
-    # Create daily embeddings (with incremental saving)
-    daily_embeddings = aggregator.create_daily_embeddings_dataset(
-        all_news, start_dt, end_dt,
-        output_file=output_file,
-        save_every=500  # Save every 10 stocks to avoid memory buildup
-    )
+    if not pending_stocks:
+        print("✅ All stocks already embedded!")
+        return daily_embeddings
 
-    # Already saved incrementally, but do final save just in case
-    print(f"\n💾 Ensuring final save...")
+    print(f"📊 Stocks to process: {len(pending_stocks)}/{total_stocks}")
+    print(f"   Already completed: {len(daily_embeddings)}")
+    print(f"   Remaining: {len(pending_stocks)}\n")
+
+    # Determine chunking strategy
+    if chunk_size is None:
+        # Process all at once (may cause OOM on large datasets)
+        chunk_size = len(pending_stocks)
+        print(f"⚠️  Processing all {chunk_size} stocks at once (may cause OOM)")
+        print(f"   Consider using --chunk-size 100 for large datasets\n")
+    else:
+        num_chunks = (len(pending_stocks) + chunk_size - 1) // chunk_size
+        print(f"📦 Chunked processing: {num_chunks} chunks of ~{chunk_size} stocks")
+        print(f"   Model reload between chunks: {reload_model_between_chunks}\n")
+
+    # Process in chunks
+    for chunk_idx in range(0, len(pending_stocks), chunk_size):
+        chunk_stocks = dict(pending_stocks[chunk_idx:chunk_idx + chunk_size])
+        chunk_num = chunk_idx // chunk_size + 1
+        total_chunks = (len(pending_stocks) + chunk_size - 1) // chunk_size
+
+        print(f"\n{'='*80}")
+        print(f"CHUNK {chunk_num}/{total_chunks}: Processing {len(chunk_stocks)} stocks")
+        print(f"{'='*80}\n")
+
+        # Initialize embedder for this chunk
+        embedder = NomicNewsEmbedder(device=device)
+        aggregator = NewsAggregator(embedder)
+
+        # Process this chunk
+        chunk_embeddings = aggregator.create_daily_embeddings_dataset(
+            chunk_stocks, start_dt, end_dt,
+            output_file=output_file,
+            save_every=500  # Save every 500 stocks within chunk
+        )
+
+        # Merge chunk results
+        daily_embeddings.update(chunk_embeddings)
+
+        # Save after each chunk
+        print(f"\n💾 Saving after chunk {chunk_num}/{total_chunks}...")
+        save_pickle(daily_embeddings, output_file)
+        print(f"   ✅ Saved {len(daily_embeddings)}/{total_stocks} stocks")
+
+        # Clean up between chunks
+        if reload_model_between_chunks and chunk_num < total_chunks:
+            print(f"\n🧹 Cleaning up GPU memory...")
+
+            # Delete embedder and aggregator
+            del embedder
+            del aggregator
+            del chunk_embeddings
+
+            # Clear GPU cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+                # Show GPU memory usage
+                allocated_gb = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_gb = torch.cuda.memory_reserved(0) / 1024**3
+                print(f"   GPU memory: {allocated_gb:.2f}GB allocated, {reserved_gb:.2f}GB reserved")
+
+            # Force garbage collection
+            gc.collect()
+
+            # Show RAM usage
+            try:
+                import psutil
+                process = psutil.Process(os.getpid())
+                mem_gb = process.memory_info().rss / 1024**3
+                print(f"   RAM usage: {mem_gb:.2f}GB")
+            except:
+                pass
+
+            print(f"   ✅ Cleaned up, ready for next chunk\n")
+
+    # Final save
+    print(f"\n💾 Final save...")
     save_pickle(daily_embeddings, output_file)
 
     print(f"\n{'='*80}")
     print(f"✅ EMBEDDINGS COMPLETE!")
     print(f"{'='*80}")
     print(f"Output: {output_file}")
+    print(f"Stocks processed: {len(daily_embeddings)}")
     print(f"Embedding dimension: 768")
     print(f"{'='*80}\n")
 
