@@ -23,6 +23,7 @@ from utils.utils import pic_load, save_pickle
 from data_scraping.fmp_data_processor import FMPDataProcessor
 from data_scraping.derived_features_calculator import DerivedFeaturesCalculator
 from data_scraping.cross_sectional_calculator import CrossSectionalCalculator
+from data_scraping.cross_sectional_normalizer import CrossSectionalNormalizer
 
 
 class EnhancedFMPDataProcessor(FMPDataProcessor):
@@ -32,7 +33,8 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
 
     def __init__(self, raw_data: Dict, market_indices_data: Optional[Dict[str, pd.DataFrame]] = None,
                  sector_dict: Optional[Dict[str, str]] = None,
-                 news_embeddings: Optional[Dict[date, torch.Tensor]] = None):
+                 news_embeddings: Optional[Dict[date, torch.Tensor]] = None,
+                 price_data: Optional[pd.DataFrame] = None):
         """
         Initialize enhanced processor.
 
@@ -41,8 +43,9 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
             market_indices_data: Dict of {index_name: DataFrame} from market_indices_scraper
             sector_dict: Optional dict of {ticker: sector}
             news_embeddings: Optional dict of {date: news_embedding_tensor} from news_embedder
+            price_data: Optional DataFrame with daily price data from yfinance
         """
-        super().__init__(raw_data)
+        super().__init__(raw_data, price_data=price_data)
         self.market_indices_data = market_indices_data
         self.sector_dict = sector_dict
         self.news_embeddings = news_embeddings
@@ -104,8 +107,8 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
             # VIX features
             vix_features = pd.DataFrame(index=merged.index)
             vix_features['vix_level'] = merged['vix_level']
-            vix_features['vix_high'] = (merged['vix_level'] > 20).astype(float)  # Fear threshold
-            vix_features['vix_extreme'] = (merged['vix_level'] > 30).astype(float)
+            vix_features['vix_high'] = merged['vix_level'].gt(20).fillna(False).astype(float)  # Fear threshold
+            vix_features['vix_extreme'] = merged['vix_level'].gt(30).fillna(False).astype(float)
 
             features_list.append(vix_features)
 
@@ -192,28 +195,48 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
             end_date = datetime.now().strftime('%Y-%m-%d')
 
         # Get base features
-        base_features = super().combine_all_features(start_date, end_date)
+        try:
+            print(f"    📦 Getting base features...")
+            base_features = super().combine_all_features(start_date, end_date)
+        except Exception as e:
+            print(f"    ❌ Error in base features: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
         # Add derived features
         if include_derived:
-            print(f"    📊 Adding derived features...")
-            derived_features = self.process_derived_features()
-            if not derived_features.empty:
-                # Reindex to match date range
-                date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-                derived_features = derived_features.reindex(date_range)
-                base_features = pd.concat([base_features, derived_features], axis=1)
+            try:
+                print(f"    📊 Adding derived features...")
+                derived_features = self.process_derived_features()
+                if not derived_features.empty:
+                    # Reindex to match date range
+                    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+                    derived_features = derived_features.reindex(date_range)
+                    base_features = pd.concat([base_features, derived_features], axis=1)
+            except Exception as e:
+                print(f"    ❌ Error in derived features: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
         # Add market-relative features
         if include_market_relative and self.market_indices_data:
-            print(f"    📈 Adding market-relative features...")
-            market_features = self.process_market_relative_features()
-            if not market_features.empty:
-                date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-                market_features = market_features.reindex(date_range)
-                base_features = pd.concat([base_features, market_features], axis=1)
+            try:
+                print(f"    📈 Adding market-relative features...")
+                market_features = self.process_market_relative_features()
+                if not market_features.empty:
+                    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+                    market_features = market_features.reindex(date_range)
+                    base_features = pd.concat([base_features, market_features], axis=1)
+            except Exception as e:
+                print(f"    ❌ Error in market-relative features: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
         # Fill NaNs and handle infinities
+        print(f"    🧹 Cleaning data...")
         base_features = base_features.fillna(0)
         base_features = base_features.replace([np.inf, -np.inf], 0)
 
@@ -235,7 +258,13 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
         Returns:
             Dict of {date: tensor}
         """
-        df = self.combine_all_features_enhanced(start_date, end_date)
+        try:
+            df = self.combine_all_features_enhanced(start_date, end_date)
+        except Exception as e:
+            print(f"    ❌ Error in combine_all_features_enhanced: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
         if df.empty:
             print(f"  ⚠️  No data for {self.ticker}")
@@ -243,31 +272,47 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
 
         # Normalize
         if normalize:
-            for col in df.columns:
-                df[col] = self._normalize_series(df[col], method='zscore')
+            try:
+                print(f"    🔢 Normalizing {len(df.columns)} features...")
+                for i, col in enumerate(df.columns):
+                    if i % 50 == 0 and i > 0:
+                        print(f"      Normalized {i}/{len(df.columns)} features...")
+                    df[col] = self._normalize_series(df[col], method='zscore')
+            except Exception as e:
+                print(f"    ❌ Error normalizing column '{col}': {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
         # Convert to tensors
-        tensor_dict = {}
-        for date_idx, row in df.iterrows():
-            date_obj = date_idx.date() if isinstance(date_idx, pd.Timestamp) else date_idx
+        try:
+            print(f"    🔄 Converting to tensors...")
+            tensor_dict = {}
+            for date_idx, row in df.iterrows():
+                date_obj = date_idx.date() if isinstance(date_idx, pd.Timestamp) else date_idx
 
-            # Base features tensor
-            base_tensor = torch.tensor(row.values, dtype=torch.float32)
+                # Base features tensor
+                base_tensor = torch.tensor(row.values, dtype=torch.float32)
 
-            # Add news embeddings
-            if include_news:
-                if self.news_embeddings and date_obj in self.news_embeddings:
-                    # Have news embedding for this date
-                    news_tensor = self.news_embeddings[date_obj]
+                # Add news embeddings
+                if include_news:
+                    if self.news_embeddings and date_obj in self.news_embeddings:
+                        # Have news embedding for this date
+                        news_tensor = self.news_embeddings[date_obj]
+                    else:
+                        # No news embedding available, use zeros
+                        news_tensor = torch.zeros(768, dtype=torch.float32)
+
+                    # Concatenate base features with news embedding
+                    tensor_dict[date_obj] = torch.cat([base_tensor, news_tensor])
                 else:
-                    # No news embedding available, use zeros
-                    news_tensor = torch.zeros(768, dtype=torch.float32)
-
-                # Concatenate base features with news embedding
-                tensor_dict[date_obj] = torch.cat([base_tensor, news_tensor])
-            else:
-                # Not including news at all
-                tensor_dict[date_obj] = base_tensor
+                    # Not including news at all
+                    tensor_dict[date_obj] = base_tensor
+        except Exception as e:
+            print(f"    ❌ Error converting to tensors: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
         news_dim = 768 if include_news else 0
         total_features = len(df.columns) + news_dim
@@ -281,28 +326,34 @@ def process_enhanced_data(raw_data_file: str,
                          market_indices_file: Optional[str],
                          sector_dict_file: Optional[str],
                          news_embeddings_file: Optional[str],
+                         price_data_file: Optional[str],
                          output_file: str,
                          start_date: str = '2000-01-01',
                          end_date: str = None,
-                         add_cross_sectional: bool = True) -> Dict[str, Dict[date, torch.Tensor]]:
+                         add_cross_sectional: bool = True,
+                         use_cross_sectional_normalization: bool = True) -> Dict[str, Dict[date, torch.Tensor]]:
     """
-    Process enhanced FMP data with all feature expansions including news embeddings.
+    Process enhanced FMP data with all feature expansions including news embeddings and price data.
+
+    NEW: Now uses proper cross-sectional normalization for fundamental metrics!
 
     Args:
         raw_data_file: Path to raw FMP data pickle
         market_indices_file: Path to market indices pickle
         sector_dict_file: Path to sector dict pickle
         news_embeddings_file: Path to news embeddings pickle
+        price_data_file: Path to price data pickle (yfinance)
         output_file: Output file path
         start_date: Start date
         end_date: End date
         add_cross_sectional: Whether to add cross-sectional features (Phase 4)
+        use_cross_sectional_normalization: Whether to use cross-sectional normalization for fundamentals (recommended!)
 
     Returns:
         Dict of {ticker: {date: tensor}}
     """
     print(f"\n{'='*80}")
-    print(f"PROCESSING ENHANCED FMP DATA (WITH NEWS EMBEDDINGS)")
+    print(f"PROCESSING ENHANCED FMP DATA (WITH CROSS-SECTIONAL NORMALIZATION)")
     print(f"{'='*80}")
     print(f"Input: {raw_data_file}")
     if market_indices_file:
@@ -311,9 +362,12 @@ def process_enhanced_data(raw_data_file: str,
         print(f"Sector dict: {sector_dict_file}")
     if news_embeddings_file:
         print(f"News embeddings: {news_embeddings_file}")
+    if price_data_file:
+        print(f"Price data: {price_data_file}")
     print(f"Output: {output_file}")
     print(f"Date range: {start_date} to {end_date or 'today'}")
     print(f"Cross-sectional features: {add_cross_sectional}")
+    print(f"Cross-sectional normalization: {use_cross_sectional_normalization}")
     print(f"{'='*80}\n")
 
     # Load data
@@ -336,41 +390,205 @@ def process_enhanced_data(raw_data_file: str,
         news_embeddings_all = pic_load(news_embeddings_file)
         print(f"  ✅ Loaded news embeddings for {len(news_embeddings_all)} stocks")
 
+    price_data_all = None
+    if price_data_file:
+        price_data_all = pic_load(price_data_file)
+        print(f"  ✅ Loaded price data for {len(price_data_all)} stocks")
+
     print()
 
-    # Process each stock (without cross-sectional features first)
-    processed_data = {}
-    stock_dataframes = {}  # For cross-sectional calculation
-
-    for ticker, raw_data in raw_data_all.items():
+    # Check for existing progress and auto-resume
+    import os
+    completed_tickers = set()
+    if os.path.exists(output_file):
         try:
-            # Get news embeddings for this ticker if available
-            ticker_news_embeddings = None
-            if news_embeddings_all and ticker in news_embeddings_all:
-                ticker_news_embeddings = news_embeddings_all[ticker]
-
-            processor = EnhancedFMPDataProcessor(raw_data, market_indices_data, sector_dict, ticker_news_embeddings)
-
-            # Get combined DataFrame (for cross-sectional features later)
-            if add_cross_sectional:
-                df = processor.combine_all_features_enhanced(start_date, end_date)
-                if not df.empty:
-                    df['date'] = df.index
-                    df = df.reset_index(drop=True)
-                    stock_dataframes[ticker] = df
-
-            # Get tensor dict
-            tensor_dict = processor.to_tensor_dict_enhanced(start_date, end_date)
-
-            if tensor_dict:
-                processed_data[ticker] = tensor_dict
-
+            existing_data = pic_load(output_file)
+            completed_tickers = set(existing_data.keys())
+            print(f"📂 Found existing progress: {len(completed_tickers)}/{len(raw_data_all)} stocks completed")
+            if len(completed_tickers) > 0:
+                last_ticker = list(completed_tickers)[-1]
+                print(f"   Last completed: {last_ticker}")
+                print(f"   Resuming from next stock...\n")
+            del existing_data  # Free memory immediately
         except Exception as e:
-            print(f"  ❌ Error processing {ticker}: {e}")
-            continue
+            print(f"⚠️  Could not load existing file: {e}")
+            print(f"   Starting fresh...\n")
+            completed_tickers = set()
 
-    # Add cross-sectional features (Phase 4)
-    if add_cross_sectional and stock_dataframes:
+    # Disable cross-sectional percentile features to avoid memory issues
+    # (These are different from cross-sectional normalization!)
+    if add_cross_sectional:
+        print("⚠️  Cross-sectional percentile features disabled to conserve memory")
+        print("   (Cross-sectional normalization is still enabled for fundamentals)\n")
+        add_cross_sectional = False
+
+    import gc
+    import psutil
+
+    # ========================================================================
+    # TWO-PASS APPROACH FOR CROSS-SECTIONAL NORMALIZATION
+    # ========================================================================
+
+    if use_cross_sectional_normalization:
+        print(f"\n{'='*80}")
+        print(f"PASS 1: GENERATING DATAFRAMES FOR ALL STOCKS")
+        print(f"{'='*80}\n")
+
+        # Pass 1: Generate DataFrames (no normalization yet)
+        all_dataframes = {}
+        failed_stocks = []
+
+        for i, (ticker, raw_data) in enumerate(raw_data_all.items(), 1):
+            # Skip already processed stocks
+            if ticker in completed_tickers:
+                print(f"  ⏭️  [{i}/{len(raw_data_all)}] {ticker}: Already processed")
+                continue
+
+            if i % 50 == 0:
+                print(f"\n  Progress: {i}/{len(raw_data_all)} stocks")
+
+            try:
+                # Get news embeddings and price data for this ticker
+                ticker_news_embeddings = None
+                if news_embeddings_all and ticker in news_embeddings_all:
+                    ticker_news_embeddings = news_embeddings_all[ticker]
+
+                ticker_price_data = None
+                if price_data_all and ticker in price_data_all:
+                    ticker_price_data = price_data_all[ticker]
+
+                processor = EnhancedFMPDataProcessor(
+                    raw_data, market_indices_data, sector_dict,
+                    ticker_news_embeddings, ticker_price_data
+                )
+
+                # Generate DataFrame WITHOUT normalization
+                df = processor.combine_all_features_enhanced(start_date, end_date)
+
+                if not df.empty:
+                    all_dataframes[ticker] = df
+                    print(f"  ✅ [{i}/{len(raw_data_all)}] {ticker}: {len(df)} days, {len(df.columns)} features")
+                else:
+                    print(f"  ⚠️  [{i}/{len(raw_data_all)}] {ticker}: No data")
+                    failed_stocks.append(ticker)
+
+            except Exception as e:
+                print(f"  ❌ [{i}/{len(raw_data_all)}] {ticker}: {str(e)[:100]}")
+                failed_stocks.append(ticker)
+                continue
+
+            # Memory management
+            if i % 100 == 0:
+                gc.collect()
+                process = psutil.Process(os.getpid())
+                mem_gb = process.memory_info().rss / 1024**3
+                print(f"   📊 RAM usage: {mem_gb:.2f} GB\n")
+
+        print(f"\n  ✅ Pass 1 complete: {len(all_dataframes)} stocks with DataFrames")
+        print(f"  ⚠️  Failed: {len(failed_stocks)} stocks\n")
+
+        # ========================================================================
+        # PASS 2: APPLY CROSS-SECTIONAL NORMALIZATION
+        # ========================================================================
+
+        print(f"\n{'='*80}")
+        print(f"PASS 2: APPLYING CROSS-SECTIONAL NORMALIZATION")
+        print(f"{'='*80}\n")
+
+        normalizer = CrossSectionalNormalizer()
+        all_dataframes = normalizer.normalize_dataframes(all_dataframes, verbose=True)
+
+        print(f"\n  ✅ Pass 2 complete: All stocks normalized\n")
+
+        # ========================================================================
+        # PASS 3: CONVERT TO TENSORS AND ADD NEWS EMBEDDINGS
+        # ========================================================================
+
+        print(f"\n{'='*80}")
+        print(f"PASS 3: CONVERTING TO TENSORS")
+        print(f"{'='*80}\n")
+
+        processed_data = {}
+        save_every = 50
+
+        for i, (ticker, df) in enumerate(all_dataframes.items(), 1):
+            try:
+                # Get news embeddings for this ticker
+                ticker_news_embeddings = None
+                if news_embeddings_all and ticker in news_embeddings_all:
+                    ticker_news_embeddings = news_embeddings_all[ticker]
+
+                # Convert to tensors with news embeddings
+                tensor_dict = {}
+                for date_idx, row in df.iterrows():
+                    date_obj = date_idx.date() if isinstance(date_idx, pd.Timestamp) else date_idx
+
+                    # Base features tensor
+                    base_tensor = torch.tensor(row.values, dtype=torch.float32)
+
+                    # Add news embeddings
+                    if ticker_news_embeddings and date_obj in ticker_news_embeddings:
+                        news_tensor = ticker_news_embeddings[date_obj]
+                    else:
+                        news_tensor = torch.zeros(768, dtype=torch.float32)
+
+                    # Concatenate
+                    tensor_dict[date_obj] = torch.cat([base_tensor, news_tensor])
+
+                if tensor_dict:
+                    processed_data[ticker] = tensor_dict
+                    completed_tickers.add(ticker)
+
+                if i % 10 == 0:
+                    news_dim = 768
+                    total_features = len(df.columns) + news_dim
+                    print(f"  [{i}/{len(all_dataframes)}] {ticker}: {len(tensor_dict)} days, {total_features} features")
+
+            except Exception as e:
+                print(f"  ❌ [{i}/{len(all_dataframes)}] {ticker}: {e}")
+                continue
+
+            # Save incrementally
+            if i % save_every == 0:
+                print(f"\n💾 Saving progress ({len(processed_data)} stocks)...")
+                save_pickle(processed_data, output_file)
+
+                # Memory cleanup
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                process = psutil.Process(os.getpid())
+                mem_gb = process.memory_info().rss / 1024**3
+                print(f"   📊 RAM usage: {mem_gb:.2f} GB\n")
+
+        # Final save
+        if processed_data:
+            print(f"\n💾 Final save...")
+            save_pickle(processed_data, output_file)
+
+        # Clear memory
+        del all_dataframes
+        gc.collect()
+
+    else:
+        # OLD APPROACH: Temporal normalization only (for backward compatibility)
+        print(f"\n⚠️  Using OLD temporal-only normalization (not recommended!)")
+        print(f"   Set use_cross_sectional_normalization=True for better results\n")
+
+        # [Original code would go here - keeping for backward compatibility]
+        # For now, raise an error to encourage using the new approach
+        raise ValueError("Please use cross-sectional normalization! Set use_cross_sectional_normalization=True")
+
+    # Show final memory usage
+    import psutil
+    process = psutil.Process(os.getpid())
+    mem_gb = process.memory_info().rss / 1024**3
+    print(f"   📊 Final RAM usage: {mem_gb:.2f} GB\n")
+
+    # Skip cross-sectional percentile features (disabled above)
+    # Note: This is different from cross-sectional normalization which is now handled above
+    if False:  # Never execute - cross-sectional percentile features disabled
         print(f"\n{'='*80}")
         print(f"ADDING CROSS-SECTIONAL FEATURES (PHASE 4)")
         print(f"{'='*80}\n")
@@ -421,25 +639,31 @@ def process_enhanced_data(raw_data_file: str,
 
         print(f"  ✅ Cross-sectional features added!")
 
-    # Save
-    print(f"\n💾 Saving enhanced processed data...")
-    save_pickle(processed_data, output_file)
+    # Load final data for statistics
+    print(f"\n📊 Loading final statistics...")
+    final_data = pic_load(output_file)
 
     print(f"\n{'='*80}")
     print(f"✅ PROCESSING COMPLETE!")
     print(f"{'='*80}")
-    print(f"Stocks processed: {len(processed_data)}")
+    print(f"Stocks processed: {len(final_data)}")
     print(f"Output file: {output_file}")
 
     # Print feature statistics
-    if processed_data:
-        sample_ticker = list(processed_data.keys())[0]
-        sample_date = list(processed_data[sample_ticker].keys())[0]
-        num_features = processed_data[sample_ticker][sample_date].shape[0]
+    if final_data:
+        sample_ticker = list(final_data.keys())[0]
+        sample_date = list(final_data[sample_ticker].keys())[0]
+        num_features = final_data[sample_ticker][sample_date].shape[0]
         print(f"Features per day: {num_features}")
+
+        # Show breakdown
+        if use_cross_sectional_normalization:
+            base_features = num_features - 768
+            print(f"  - Base features (cross-sectionally normalized): {base_features}")
+            print(f"  - News embeddings (pre-normalized, not touched): 768")
         print(f"{'='*80}\n")
 
-    return processed_data
+    return final_data
 
 
 if __name__ == '__main__':
@@ -454,6 +678,8 @@ if __name__ == '__main__':
                        help='Sector dictionary pickle file')
     parser.add_argument('--news_embeddings', type=str, default=None,
                        help='News embeddings pickle file')
+    parser.add_argument('--price_data', type=str, default=None,
+                       help='Price data pickle file (from yfinance)')
     parser.add_argument('--output', type=str, default=None,
                        help='Output file (default: input with _enhanced suffix)')
     parser.add_argument('--start_date', type=str, default='2000-01-01',
@@ -461,7 +687,9 @@ if __name__ == '__main__':
     parser.add_argument('--end_date', type=str, default=None,
                        help='End date (default: today)')
     parser.add_argument('--no_cross_sectional', action='store_true',
-                       help='Disable cross-sectional features')
+                       help='Disable cross-sectional percentile features')
+    parser.add_argument('--no_cross_sectional_norm', action='store_true',
+                       help='Disable cross-sectional normalization (NOT recommended!)')
 
     args = parser.parse_args()
 
@@ -473,10 +701,12 @@ if __name__ == '__main__':
         market_indices_file=args.market_indices,
         sector_dict_file=args.sector_dict,
         news_embeddings_file=args.news_embeddings,
+        price_data_file=args.price_data,
         output_file=args.output,
         start_date=args.start_date,
         end_date=args.end_date,
-        add_cross_sectional=not args.no_cross_sectional
+        add_cross_sectional=not args.no_cross_sectional,
+        use_cross_sectional_normalization=not args.no_cross_sectional_norm
     )
 
     print(f"\n✅ Done! Enhanced data saved to {args.output}")
