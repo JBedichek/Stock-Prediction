@@ -49,20 +49,32 @@ class ClusterEncoder:
         # Handle both direct model saves and checkpoint dicts
         if isinstance(checkpoint, dict):
             # Checkpoint dict format - need to reconstruct model
-            # Try to get model from checkpoint
             if 'model' in checkpoint:
                 self.model = checkpoint['model']
             elif 'model_state_dict' in checkpoint:
-                # Need to reconstruct model architecture
-                from training.models import t_Dist_Pred
-                # Get hyperparameters from checkpoint if available
+                # SimpleTransformerPredictor from train_new_format.py
+                from training.train_new_format import SimpleTransformerPredictor
+
                 config = checkpoint.get('config', {})
-                self.model = t_Dist_Pred(
-                    seq_len=config.get('seq_len', 2000),
-                    num_bins=config.get('num_bins', 320),
+
+                # Get input_dim from model state dict
+                state_dict = checkpoint['model_state_dict']
+                # Find input_dim from first layer (input_proj.0.weight)
+                for key in state_dict.keys():
+                    if 'input_proj.0.weight' in key:
+                        input_dim = state_dict[key].shape[1]
+                        break
+                else:
+                    input_dim = 245  # Default from dataset (218 price + 27 summary)
+
+                self.model = SimpleTransformerPredictor(
+                    input_dim=input_dim,
                     hidden_dim=config.get('hidden_dim', 1024),
-                    num_layers=config.get('num_layers', 24),
-                    num_heads=config.get('num_heads', 8)
+                    num_layers=config.get('num_layers', 10),
+                    num_heads=config.get('num_heads', 16),
+                    dropout=config.get('dropout', 0.15),
+                    num_pred_days=4,  # [1, 5, 10, 20]
+                    pred_mode=config.get('pred_mode', 'classification')
                 )
                 self.model.load_state_dict(checkpoint['model_state_dict'])
             else:
@@ -159,14 +171,27 @@ class ClusterEncoder:
             seq_len = 2000  # Match model's seq_len
             batch_tensor = batch_tensor.unsqueeze(1).expand(-1, seq_len, -1)
 
-        # Split into price sequence and summary features
-        # Assuming first 218 dims are price sequence
-        price_seq = batch_tensor[:, :, :218]
-        summary = batch_tensor[:, :, 218:]
-
-        # Get transformer activations using forward_with_t_act
+        # Get transformer activations (SimpleTransformerPredictor)
+        # Extract mean-pooled transformer output using a forward hook
         with torch.no_grad():
-            _, t_act = self.model.forward_with_t_act(price_seq, summary)
+            activation = {}
+            def get_activation(name):
+                def hook(model, input, output):
+                    activation[name] = output
+                return hook
+
+            # Register hook on transformer output
+            handle = self.model.transformer.register_forward_hook(get_activation('transformer'))
+
+            # Forward pass
+            _ = self.model(batch_tensor)
+
+            # Remove hook
+            handle.remove()
+
+            # Get transformer output and mean pool
+            transformer_out = activation['transformer']  # (batch, seq_len, hidden_dim)
+            t_act = transformer_out.mean(dim=1)  # (batch, hidden_dim)
 
         # t_act shape: (batch, transformer_dim) - already mean pooled
         embeddings = t_act.cpu().numpy()
