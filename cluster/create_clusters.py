@@ -76,7 +76,13 @@ class ClusterEncoder:
                     num_pred_days=4,  # [1, 5, 10, 20]
                     pred_mode=config.get('pred_mode', 'classification')
                 )
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                # Use strict=False to allow missing keys (e.g., confidence_head if added later)
+                missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+                if missing_keys:
+                    print(f"   ⚠️  Missing keys (will use random init): {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+                if unexpected_keys:
+                    print(f"   ⚠️  Unexpected keys in checkpoint: {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
             else:
                 raise ValueError("Checkpoint does not contain 'model' or 'model_state_dict'")
         else:
