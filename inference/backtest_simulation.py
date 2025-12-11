@@ -10,7 +10,8 @@ Features:
 - Support for both pickle and HDF5 datasets
 - Configurable test period, stock selection, and strategy
 - Detailed performance reporting
-- Random subset testing
+- Dynamic daily subsampling: randomly select different stocks each trading day (more realistic)
+- Feature preloading for fast backtesting
 """
 
 import torch
@@ -55,7 +56,7 @@ class DatasetLoader:
         Args:
             dataset_path: Path to dataset (pickle or HDF5) with features
             num_test_stocks: Number of stocks from end of alphabet to use
-            subset_size: If set, randomly sample this many stocks from test set
+            subset_size: If set, randomly sample this many stocks each trading day (dynamic subsampling)
             prices_path: Optional path to HDF5 file with actual prices (if features are normalized)
         """
         print(f"\n{'='*80}")
@@ -91,12 +92,14 @@ class DatasetLoader:
             self.test_tickers = all_tickers[-num_test_stocks:]
             print(f"  📊 Selected last {num_test_stocks} tickers (alphabetically)")
 
-        # Optionally subsample
+        # Store subset_size for daily dynamic subsampling (if enabled)
+        self.subset_size = subset_size
         if subset_size is not None and subset_size < len(self.test_tickers):
-            self.test_tickers = random.sample(self.test_tickers, subset_size)
-            print(f"  🎲 Randomly sampled {subset_size} tickers for testing")
+            print(f"  🎲 Daily dynamic subsampling enabled: {subset_size} random stocks per day")
+            print(f"  ℹ️  Total pool: {len(self.test_tickers)} stocks (will cache all)")
+        else:
+            print(f"  📈 Using all {len(self.test_tickers)} test stocks")
 
-        print(f"  📈 Test set: {len(self.test_tickers)} stocks")
         print(f"  Range: {self.test_tickers[0]} to {self.test_tickers[-1]}")
 
         # Get available dates from first ticker
@@ -136,6 +139,23 @@ class DatasetLoader:
         # Feature cache for fast access
         self.feature_cache = {}  # {(ticker, date): (features, price)}
         self.cache_enabled = False
+
+    def get_daily_subset(self) -> List[str]:
+        """
+        Get a random subset of tickers for a single trading day.
+
+        If subset_size is set, returns a random sample (different each call).
+        Otherwise, returns all test_tickers.
+
+        Returns:
+            List of tickers to use for this trading day
+        """
+        if self.subset_size is not None and self.subset_size < len(self.test_tickers):
+            # Random sample WITHOUT seed - different every time
+            return random.sample(self.test_tickers, self.subset_size)
+        else:
+            # Use all tickers
+            return self.test_tickers
 
     def preload_features(self, date_range: List[str]):
         """
@@ -724,9 +744,12 @@ class TradingSimulator:
         Returns:
             List of (ticker, expected_return, confidence, current_price) sorted by confidence-weighted return
         """
+        # Get subset of tickers for this trading day (random each day if subsampling enabled)
+        daily_tickers = self.data_loader.get_daily_subset()
+
         # Collect all valid stocks and features for this date
         valid_data = []
-        for ticker in self.data_loader.test_tickers:
+        for ticker in daily_tickers:
             result = self.data_loader.get_features_and_price(ticker, date)
             if result is not None:
                 features, current_price = result
@@ -1309,7 +1332,7 @@ def main():
     parser.add_argument('--num-test-stocks', type=int, default=2000,
                        help='Number of stocks from end of alphabet to test on')
     parser.add_argument('--subset-size', type=int, default=1024,
-                       help='Randomly sample this many stocks from test set')
+                       help='Randomly sample this many stocks EACH DAY (dynamic subsampling - different stocks each trading day)')
 
     # Trading strategy args
     parser.add_argument('--top-k', type=int, default=5,
