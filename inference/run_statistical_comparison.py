@@ -16,11 +16,11 @@ def main():
         'inference/statistical_comparison.py',
         '--data', './data/all_complete_dataset.h5',
         '--prices', './data/actual_prices.h5',
-        '--model', './checkpoints/best_model.pt',
+        '--model', './checkpoints/best_model_outlier.pt',
         '--bin-edges', './data/adaptive_bin_edges.pt',
         '--num-trials', '30',
         '--num-random-per-trial', '30',
-        '--subset-size', '1024',
+        '--subset-size', '512',
         '--top-k', '5',
         '--horizon-idx', '0',  # 5-day
         '--confidence-percentile', '0.002',  # Keep top 20% by confidence

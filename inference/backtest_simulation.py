@@ -92,6 +92,9 @@ class DatasetLoader:
             self.test_tickers = all_tickers[-num_test_stocks:]
             print(f"  📊 Selected last {num_test_stocks} tickers (alphabetically)")
 
+        # Store full pool for daily subsampling (before any subsetting)
+        self.full_pool = self.test_tickers.copy()
+
         # Store subset_size for daily dynamic subsampling (if enabled)
         self.subset_size = subset_size
         if subset_size is not None and subset_size < len(self.test_tickers):
@@ -144,22 +147,25 @@ class DatasetLoader:
         """
         Get a random subset of tickers for a single trading day.
 
-        If subset_size is set, returns a random sample (different each call).
-        Otherwise, returns all test_tickers.
+        If subset_size is set, returns a random sample from the full pool (different each call).
+        Otherwise, returns current test_tickers (which may have been subset by external code).
 
         Returns:
             List of tickers to use for this trading day
         """
-        if self.subset_size is not None and self.subset_size < len(self.test_tickers):
+        if self.subset_size is not None and self.subset_size < len(self.full_pool):
             # Random sample WITHOUT seed - different every time
-            return random.sample(self.test_tickers, self.subset_size)
+            # Sample from full_pool, not test_tickers (which may be overridden by statistical_comparison)
+            return random.sample(self.full_pool, self.subset_size)
         else:
-            # Use all tickers
+            # Use current test_tickers (may be full pool or subset by external code)
             return self.test_tickers
 
     def preload_features(self, date_range: List[str]):
         """
         Preload all features for test tickers in the date range (eliminates I/O bottleneck).
+
+        When daily subsampling is enabled, caches the entire pool (not just test_tickers).
 
         Args:
             date_range: List of dates to preload
@@ -167,14 +173,21 @@ class DatasetLoader:
         print(f"\n{'='*80}")
         print("PRELOADING FEATURES (eliminates I/O bottleneck)")
         print(f"{'='*80}")
-        print(f"Loading {len(self.test_tickers)} tickers × {len(date_range)} dates...")
+
+        # If daily subsampling is enabled, cache the full pool
+        # Otherwise cache test_tickers (which may be subset by external code)
+        tickers_to_cache = self.full_pool if (self.subset_size is not None and self.subset_size < len(self.full_pool)) else self.test_tickers
+
+        print(f"Loading {len(tickers_to_cache)} tickers × {len(date_range)} dates...")
+        if tickers_to_cache == self.full_pool and self.subset_size is not None:
+            print(f"  (Caching full pool for daily subsampling)")
 
         self.feature_cache = {}
 
         if self.is_hdf5:
             # HDF5: Load all features at once for each ticker
             debug_counter = 0
-            for ticker in tqdm(self.test_tickers, desc="  Loading"):
+            for ticker in tqdm(tickers_to_cache, desc="  Loading"):
                 if ticker not in self.h5_file:
                     continue
 
@@ -206,7 +219,7 @@ class DatasetLoader:
                         continue
         else:
             # Pickle: Already in memory, just create index
-            for ticker in tqdm(self.test_tickers, desc="  Indexing"):
+            for ticker in tqdm(tickers_to_cache, desc="  Indexing"):
                 if ticker not in self.data:
                     continue
 

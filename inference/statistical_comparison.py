@@ -283,17 +283,11 @@ class StatisticalComparison:
         print(f"\n✅ Completed {self.num_trials} trials")
 
     def _run_single_trial(self, trial_idx: int, trading_dates: List[str]) -> Dict:
-        """Run a single trial: model vs random portfolios on random subset."""
-        # Sample random subset of stocks
-        trial_seed = self.seed + trial_idx
-        random.seed(trial_seed)
-
-        all_test_stocks = self.data_loader.test_tickers
-        subset_stocks = random.sample(all_test_stocks, min(self.subset_size, len(all_test_stocks)))
-
-        # Temporarily override test tickers
-        original_tickers = self.data_loader.test_tickers
-        self.data_loader.test_tickers = subset_stocks
+        """Run a single trial: model vs random portfolios with dynamic daily subsampling."""
+        # Set subset_size for daily dynamic subsampling (different stocks each day)
+        # This enables get_daily_subset() to sample randomly each trading day
+        original_subset_size = self.data_loader.subset_size
+        self.data_loader.subset_size = self.subset_size
 
         # Map horizon_idx to horizon_days
         horizon_map = {0: 1, 1: 5, 2: 10, 3: 20}
@@ -327,7 +321,7 @@ class StatisticalComparison:
             # Compute summary statistics
             trial_summary = {
                 'trial_idx': trial_idx,
-                'subset_stocks': subset_stocks,
+                'subset_size': self.subset_size,  # Size of daily subset (changes each day)
                 'model': self._extract_metrics(model_results),
                 'random': [self._extract_metrics(r) for r in random_results],
                 'random_mean': self._compute_random_mean(random_results),
@@ -337,8 +331,8 @@ class StatisticalComparison:
             return trial_summary
 
         finally:
-            # Restore original tickers
-            self.data_loader.test_tickers = original_tickers
+            # Restore original subset_size
+            self.data_loader.subset_size = original_subset_size
 
     def _extract_metrics(self, results: Dict) -> Dict:
         """Extract key metrics from simulation results."""
