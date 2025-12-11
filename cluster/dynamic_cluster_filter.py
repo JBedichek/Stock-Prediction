@@ -164,14 +164,48 @@ class DynamicClusterFilter:
         if len(features_dict) == 0:
             return {}
 
-        # Prepare batch
+        # Prepare batch - handle variable feature dimensions
         tickers = []
         features_list = []
+        max_feature_dim = 0
 
+        # First pass: find max feature dimension
         for ticker, features in features_dict.items():
             # Ensure features is a tensor
             if not isinstance(features, torch.Tensor):
                 features = torch.tensor(features, dtype=torch.float32)
+
+            # Get feature dimension
+            if len(features.shape) == 1:
+                feature_dim = features.shape[0]
+            else:
+                feature_dim = features.shape[-1]
+
+            max_feature_dim = max(max_feature_dim, feature_dim)
+
+        # Second pass: pad to consistent dimension
+        for ticker, features in features_dict.items():
+            # Ensure features is a tensor
+            if not isinstance(features, torch.Tensor):
+                features = torch.tensor(features, dtype=torch.float32)
+
+            # Pad if needed
+            if len(features.shape) == 1:
+                current_dim = features.shape[0]
+                if current_dim < max_feature_dim:
+                    padding = torch.zeros(max_feature_dim - current_dim, dtype=torch.float32)
+                    features = torch.cat([features, padding])
+                elif current_dim > max_feature_dim:
+                    features = features[:max_feature_dim]
+            else:
+                current_dim = features.shape[-1]
+                if current_dim < max_feature_dim:
+                    padding_shape = list(features.shape)
+                    padding_shape[-1] = max_feature_dim - current_dim
+                    padding = torch.zeros(padding_shape, dtype=torch.float32)
+                    features = torch.cat([features, padding], dim=-1)
+                elif current_dim > max_feature_dim:
+                    features = features[..., :max_feature_dim]
 
             tickers.append(ticker)
             features_list.append(features)
