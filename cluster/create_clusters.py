@@ -198,6 +198,29 @@ class ClusterEncoder:
         # Convert to tensor
         batch_tensor = torch.tensor(np.array(batch_features), dtype=torch.float32).to(self.device)
 
+        # Check if we need to pad/adjust features to match model input_dim
+        current_feature_dim = batch_tensor.shape[1]
+        model_input_dim = self.model.input_dim
+
+        if current_feature_dim != model_input_dim:
+            if not hasattr(self, '_dimension_warning_shown'):
+                print(f"\n⚠️  Feature dimension mismatch:")
+                print(f"   Dataset features: {current_feature_dim}")
+                print(f"   Model expects: {model_input_dim}")
+                if current_feature_dim < model_input_dim:
+                    print(f"   → Padding with {model_input_dim - current_feature_dim} zeros")
+                else:
+                    print(f"   → Truncating to {model_input_dim} features")
+                self._dimension_warning_shown = True
+
+            if current_feature_dim < model_input_dim:
+                # Pad with zeros to match model input dimension
+                padding = torch.zeros(batch_tensor.shape[0], model_input_dim - current_feature_dim, device=self.device)
+                batch_tensor = torch.cat([batch_tensor, padding], dim=1)
+            else:
+                # Truncate to match model input dimension
+                batch_tensor = batch_tensor[:, :model_input_dim]
+
         # Reshape to (batch, seq_len, feature_dim) if needed
         # Assuming features are (batch, feature_dim), we need to add seq dimension
         if len(batch_tensor.shape) == 2:
