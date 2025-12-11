@@ -90,14 +90,25 @@ class ClusterAnalyzer:
         print(f"\n📂 Opening prices file: {prices_path}")
         prices_file = h5py.File(prices_path, 'r')
 
+        # Get unique tickers (handle temporal sampling format)
+        unique_tickers = set()
+        for key in self.cluster_assignments.keys():
+            ticker = key.split('_t')[0] if '_t' in key else key
+            unique_tickers.add(ticker)
+
+        print(f"   ✓ {len(unique_tickers)} unique tickers to analyze")
+        print(f"   ✓ {len(list(prices_file.keys()))} tickers in prices file")
+
         # Compute returns for each stock
         stock_returns = defaultdict(lambda: {h: [] for h in horizons})
 
         print(f"\n📊 Computing returns for each stock...")
-        for ticker in tqdm(self.cluster_assignments.keys()):
+        tickers_with_prices = 0
+        for ticker in tqdm(unique_tickers):
             if ticker not in prices_file:
                 continue
 
+            tickers_with_prices += 1
             prices = prices_file[ticker]['close'][:]  # Assuming 'close' prices
 
             # Compute forward returns at each horizon
@@ -108,6 +119,13 @@ class ClusterAnalyzer:
                         stock_returns[ticker][horizon].append(ret)
 
         prices_file.close()
+
+        print(f"\n   ✓ Found prices for {tickers_with_prices}/{len(unique_tickers)} tickers ({tickers_with_prices/len(unique_tickers)*100:.1f}%)")
+
+        if tickers_with_prices == 0:
+            print(f"\n   ⚠️  WARNING: No tickers matched between cluster assignments and prices file!")
+            print(f"   This likely means the ticker names don't match between the two files.")
+            return {}
 
         # Aggregate by cluster
         print(f"\n📈 Aggregating returns by cluster...")
@@ -195,6 +213,11 @@ class ClusterAnalyzer:
             })
 
         df = pd.DataFrame(rows)
+
+        if df.empty:
+            print(f"\n   ⚠️  No data available for {horizon}-day horizon")
+            return df
+
         df = df.sort_values(metric, ascending=False).reset_index(drop=True)
 
         return df
@@ -380,6 +403,10 @@ def analyze_cluster_performance(cluster_dir: str, dataset_path: str, prices_path
         ranking_df = analyzer.rank_clusters(cluster_stats, horizon)
         results['rankings'][horizon] = ranking_df
 
+        if ranking_df.empty:
+            print(f"\n   ⚠️  Skipping {horizon}-day horizon (no data)")
+            continue
+
         # Print top 10
         print(f"\n🏆 Top 10 Clusters ({horizon}-day returns):")
         print(ranking_df.head(10).to_string(index=False))
@@ -434,9 +461,9 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze cluster performance')
 
     # Required
-    parser.add_argument('--cluster-dir', type=str, required=True, help='Directory with cluster results')
-    parser.add_argument('--dataset-path', type=str, required=True, help='Path to dataset')
-    parser.add_argument('--prices-path', type=str, required=True, help='Path to prices HDF5')
+    parser.add_argument('--cluster-dir', type=str, default="./cluster_results", help='Directory with cluster results')
+    parser.add_argument('--dataset-path', type=str, default="./data/all_complete_dataset.h5", help='Path to dataset')
+    parser.add_argument('--prices-path', type=str, default="./data/actual_prices.h5", help='Path to prices HDF5')
 
     # Analysis
     parser.add_argument('--horizons', type=int, nargs='+', default=[1, 5, 10, 20], help='Horizons to analyze')
@@ -446,7 +473,7 @@ def main():
     parser.add_argument('--min-return', type=float, default=0.005, help='Min mean return for best clusters')
     parser.add_argument('--min-win-rate', type=float, default=0.52, help='Min win rate for best clusters')
     parser.add_argument('--min-sharpe', type=float, default=0.1, help='Min Sharpe for best clusters')
-    parser.add_argument('--top-k', type=int, default=20, help='Top K clusters to select')
+    parser.add_argument('--top-k', type=int, default=5, help='Top K clusters to select')
 
     args = parser.parse_args()
 
