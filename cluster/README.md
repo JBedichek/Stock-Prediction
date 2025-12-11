@@ -20,6 +20,17 @@ This reduces search space and focuses on stocks the model has learned to predict
 - **Risk reduction**: Avoid stocks in unpredictable/unprofitable regimes
 - **Efficiency**: Smaller search space means faster inference
 
+### Temporal Sampling
+
+To build robust and unbiased clusters, the system samples multiple timesteps per stock rather than encoding just a single snapshot:
+
+- **Multiple market regimes**: Each stock is encoded at 10 different random timesteps (configurable)
+- **Temporal diversity**: Captures stock behavior across different market conditions
+- **Better clustering**: Clusters represent consistent patterns across time, not just single moments
+- **Unbiased performance**: Analysis uses full temporal distribution for each cluster
+
+**Example**: With 1,000 stocks and 10 samples per stock, you get 10,000 (stock, time) encodings. A stock might appear in multiple clusters at different times, but the analysis groups by base ticker to compute performance metrics.
+
 ### Quick Start
 
 ```bash
@@ -28,6 +39,7 @@ python -m cluster.create_clusters \
     --model-path checkpoints/best_model.pt \
     --dataset-path all_complete_dataset_temporal_split_d2c2e63d.h5 \
     --n-clusters 50 \
+    --samples-per-stock 10 \
     --output-dir cluster_results
 
 # Step 2: Analyze cluster performance
@@ -64,6 +76,7 @@ python -m cluster.create_clusters \
 - `--standardize`: Standardize embeddings before clustering
 - `--use-pca`: Use PCA for dimensionality reduction
 - `--max-stocks`: Limit number of stocks to encode
+- `--samples-per-stock`: Number of random timesteps to sample per stock (default: 10)
 
 **Output:**
 - `cluster_assignments.pkl`: Ticker → cluster_id mapping

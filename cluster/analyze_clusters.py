@@ -52,11 +52,24 @@ class ClusterAnalyzer:
         print(f"   ✓ Loaded {len(self.cluster_assignments)} stock assignments")
 
         # Group tickers by cluster
-        self.cluster_to_tickers = defaultdict(list)
-        for ticker, cluster_id in self.cluster_assignments.items():
-            self.cluster_to_tickers[cluster_id].append(ticker)
+        # Note: cluster_assignments keys may be "TICKER_t123" format (temporal sampling)
+        # We extract the base ticker for grouping
+        self.cluster_to_tickers = defaultdict(set)
+        for key, cluster_id in self.cluster_assignments.items():
+            # Extract base ticker (handles both "TICKER" and "TICKER_t123" formats)
+            ticker = key.split('_t')[0] if '_t' in key else key
+            self.cluster_to_tickers[cluster_id].add(ticker)
+
+        # Convert sets to lists
+        self.cluster_to_tickers = {k: list(v) for k, v in self.cluster_to_tickers.items()}
 
         print(f"   ✓ Found {len(self.cluster_to_tickers)} unique clusters")
+
+        # Count unique tickers
+        all_unique_tickers = set()
+        for tickers in self.cluster_to_tickers.values():
+            all_unique_tickers.update(tickers)
+        print(f"   ✓ {len(all_unique_tickers)} unique tickers across all clusters")
 
     def compute_returns(self, dataset_path: str, prices_path: str, horizons: List[int] = [1, 5, 10, 20]) -> Dict:
         """
@@ -403,7 +416,7 @@ def save_analysis_results(results: Dict, output_dir: str):
     print(f"\n💾 Saving analysis results...")
 
     # Save full results
-    with open(output_dir / 'cluster_analysis.pkl', 'rb') as f:
+    with open(output_dir / 'cluster_analysis.pkl', 'wb') as f:
         pickle.dump(results, f)
 
     # Save best clusters for each horizon

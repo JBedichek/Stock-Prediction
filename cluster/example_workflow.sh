@@ -26,6 +26,7 @@ OUTPUT_DIR="./cluster_results"
 # Clustering parameters
 N_CLUSTERS=50
 METHOD="kmeans"  # kmeans, dbscan, or agglomerative
+SAMPLES_PER_STOCK=10  # Number of random timesteps to sample per stock
 BATCH_SIZE=64
 MAX_STOCKS=""  # Leave empty for all stocks, or set limit like "1000"
 
@@ -59,6 +60,7 @@ CMD="python -m cluster.create_clusters \
     --dataset-path $DATASET_PATH \
     --n-clusters $N_CLUSTERS \
     --method $METHOD \
+    --samples-per-stock $SAMPLES_PER_STOCK \
     --batch-size $BATCH_SIZE \
     --standardize \
     --output-dir $OUTPUT_DIR \

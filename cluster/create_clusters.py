@@ -96,20 +96,25 @@ class ClusterEncoder:
 
     def encode_dataset(self, dataset_path: str,
                       max_stocks: Optional[int] = None,
+                      samples_per_stock: int = 10,
                       batch_size: int = 64) -> Dict[str, np.ndarray]:
         """
-        Encode entire dataset using transformer mean pooling.
+        Encode dataset using transformer mean pooling with temporal sampling.
+
+        For robust clustering, we sample multiple timesteps per stock to capture
+        different market regimes and conditions.
 
         Args:
             dataset_path: Path to HDF5 dataset
             max_stocks: Optional limit on number of stocks to encode
+            samples_per_stock: Number of random timesteps to sample per stock
             batch_size: Batch size for encoding
 
         Returns:
-            Dictionary mapping ticker -> embedding (mean pooled transformer activation)
+            Dictionary mapping (ticker, timestep_idx) -> embedding
         """
         print(f"\n{'='*80}")
-        print("ENCODING DATASET")
+        print("ENCODING DATASET WITH TEMPORAL SAMPLING")
         print(f"{'='*80}")
 
         print(f"\n📂 Opening dataset: {dataset_path}")
@@ -127,22 +132,154 @@ class ClusterEncoder:
             print(f"   Features shape: {sample_features.shape}")
             print(f"   Features dtype: {sample_features.dtype}")
 
-        print(f"\n📊 Encoding {len(tickers)} stocks...")
+        print(f"\n📊 Encoding {len(tickers)} stocks with {samples_per_stock} samples each...")
+        print(f"   Total samples: {len(tickers) * samples_per_stock:,}")
+
+        # Create all (ticker, timestep) pairs to encode
+        samples_to_encode = []
+        for ticker in tickers:
+            if ticker not in h5_file:
+                continue
+
+            features = h5_file[ticker]['features'][:]
+            if len(features.shape) != 2:
+                continue
+
+            num_timesteps = features.shape[0]
+            if num_timesteps < samples_per_stock:
+                # Use all available timesteps if fewer than requested
+                timestep_indices = list(range(num_timesteps))
+            else:
+                # Randomly sample timesteps
+                timestep_indices = np.random.choice(num_timesteps, samples_per_stock, replace=False)
+
+            for timestep_idx in timestep_indices:
+                samples_to_encode.append((ticker, int(timestep_idx)))
+
+        print(f"   Generated {len(samples_to_encode):,} samples to encode")
 
         embeddings = {}
 
         # Process in batches
-        for i in tqdm(range(0, len(tickers), batch_size), desc="Encoding"):
-            batch_tickers = tickers[i:i+batch_size]
-            batch_embeddings = self._encode_batch(h5_file, batch_tickers)
+        for i in tqdm(range(0, len(samples_to_encode), batch_size), desc="Encoding"):
+            batch_samples = samples_to_encode[i:i+batch_size]
+            batch_embeddings = self._encode_batch_with_timesteps(h5_file, batch_samples)
 
-            for ticker, emb in zip(batch_tickers, batch_embeddings):
-                embeddings[ticker] = emb
+            for (ticker, timestep_idx), emb in zip(batch_samples, batch_embeddings):
+                # Key format: "TICKER_timestep_123"
+                key = f"{ticker}_t{timestep_idx}"
+                embeddings[key] = emb
 
         h5_file.close()
 
-        print(f"\n✅ Encoded {len(embeddings)} stocks")
+        print(f"\n✅ Encoded {len(embeddings):,} (stock, time) samples")
         print(f"   Embedding dimension: {list(embeddings.values())[0].shape[0]}")
+
+        return embeddings
+
+    def _encode_batch_with_timesteps(self, h5_file: h5py.File, samples: List[Tuple[str, int]]) -> np.ndarray:
+        """
+        Encode a batch of (ticker, timestep) pairs.
+
+        Args:
+            h5_file: Open HDF5 file
+            samples: List of (ticker, timestep_idx) tuples
+
+        Returns:
+            Batch of embeddings (batch_size, embedding_dim)
+        """
+        batch_features = []
+        expected_feature_dim = None
+
+        for ticker, timestep_idx in samples:
+            if ticker not in h5_file:
+                continue
+
+            try:
+                # Get features for this specific timestep
+                features = h5_file[ticker]['features'][:]  # (num_dates, num_features)
+
+                if len(features.shape) != 2:
+                    continue
+
+                if timestep_idx >= features.shape[0]:
+                    continue
+
+                # Extract features for this specific timestep
+                features = features[timestep_idx]
+
+                # Check feature dimension consistency
+                if expected_feature_dim is None:
+                    expected_feature_dim = len(features)
+                elif len(features) != expected_feature_dim:
+                    # Skip stocks with different feature dimensions
+                    continue
+
+                batch_features.append(features)
+
+            except Exception as e:
+                # Skip stocks with errors
+                continue
+
+        if len(batch_features) == 0:
+            return np.array([])
+
+        # Convert to tensor
+        batch_tensor = torch.tensor(np.array(batch_features), dtype=torch.float32).to(self.device)
+
+        # Check if we need to pad/adjust features to match model input_dim
+        current_feature_dim = batch_tensor.shape[1]
+        model_input_dim = self.model.input_dim
+
+        if current_feature_dim != model_input_dim:
+            if not hasattr(self, '_dimension_warning_shown'):
+                print(f"\n⚠️  Feature dimension mismatch:")
+                print(f"   Dataset features: {current_feature_dim}")
+                print(f"   Model expects: {model_input_dim}")
+                if current_feature_dim < model_input_dim:
+                    print(f"   → Padding with {model_input_dim - current_feature_dim} zeros")
+                else:
+                    print(f"   → Truncating to {model_input_dim} features")
+                self._dimension_warning_shown = True
+
+            if current_feature_dim < model_input_dim:
+                # Pad with zeros to match model input dimension
+                padding = torch.zeros(batch_tensor.shape[0], model_input_dim - current_feature_dim, device=self.device)
+                batch_tensor = torch.cat([batch_tensor, padding], dim=1)
+            else:
+                # Truncate to match model input dimension
+                batch_tensor = batch_tensor[:, :model_input_dim]
+
+        # Reshape to (batch, seq_len, feature_dim)
+        if len(batch_tensor.shape) == 2:
+            # Expand to create sequence (use same features for all timesteps)
+            seq_len = 2000  # Match model's seq_len
+            batch_tensor = batch_tensor.unsqueeze(1).expand(-1, seq_len, -1)
+
+        # Get transformer activations (SimpleTransformerPredictor)
+        # Extract mean-pooled transformer output using a forward hook
+        with torch.no_grad():
+            activation = {}
+            def get_activation(name):
+                def hook(model, input, output):
+                    activation[name] = output
+                return hook
+
+            # Register hook on transformer output
+            handle = self.model.transformer.register_forward_hook(get_activation('transformer'))
+
+            # Forward pass
+            _ = self.model(batch_tensor)
+
+            # Remove hook
+            handle.remove()
+
+            # Get transformer output and mean pool
+            transformer_out = activation['transformer']  # (batch, seq_len, hidden_dim)
+            t_act = transformer_out.mean(dim=1)  # (batch, hidden_dim)
+
+        # t_act shape: (batch, transformer_dim) - already mean pooled
+        embeddings = t_act.cpu().numpy()
 
         return embeddings
 
@@ -448,6 +585,7 @@ def main():
 
     # Encoding
     parser.add_argument('--max-stocks', type=int, default=100000, help='Max stocks to encode')
+    parser.add_argument('--samples-per-stock', type=int, default=10, help='Number of random timesteps to sample per stock')
     parser.add_argument('--batch-size', type=int, default=256, help='Batch size for encoding')
 
     # Clustering
@@ -473,6 +611,7 @@ def main():
     embeddings = encoder.encode_dataset(
         args.dataset_path,
         max_stocks=args.max_stocks,
+        samples_per_stock=args.samples_per_stock,
         batch_size=args.batch_size
     )
 

@@ -84,8 +84,10 @@ class ClusterFilter:
         """Create set of allowed tickers based on cluster membership."""
         allowed = set()
 
-        for ticker, cluster_id in self.cluster_assignments.items():
+        for key, cluster_id in self.cluster_assignments.items():
             if cluster_id in self.best_cluster_ids:
+                # Extract base ticker (handles both "TICKER" and "TICKER_t123" formats)
+                ticker = key.split('_t')[0] if '_t' in key else key
                 allowed.add(ticker)
 
         return allowed
@@ -124,11 +126,27 @@ class ClusterFilter:
         Returns:
             Cluster ID or None if not found
         """
-        return self.cluster_assignments.get(ticker)
+        # First try direct lookup
+        if ticker in self.cluster_assignments:
+            return self.cluster_assignments[ticker]
+
+        # If temporal sampling was used, keys are "TICKER_t123" format
+        # Find any key that starts with this ticker
+        for key in self.cluster_assignments:
+            if key.startswith(f"{ticker}_t"):
+                return self.cluster_assignments[key]
+
+        return None
 
     def get_stats(self) -> Dict:
         """Get filter statistics."""
-        total_stocks = len(self.cluster_assignments)
+        # Count unique tickers (handle temporal sampling format)
+        unique_tickers = set()
+        for key in self.cluster_assignments:
+            ticker = key.split('_t')[0] if '_t' in key else key
+            unique_tickers.add(ticker)
+
+        total_stocks = len(unique_tickers)
         allowed_stocks = len(self.allowed_tickers)
 
         return {
