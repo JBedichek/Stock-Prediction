@@ -839,7 +839,8 @@ class TradingSimulator:
                  horizon_idx: int = 1,
                  initial_capital: float = 100000.0,
                  confidence_percentile: float = 0.6,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 dynamic_cluster_filter = None):
         """
         Args:
             data_loader: Dataset loader
@@ -850,6 +851,7 @@ class TradingSimulator:
             initial_capital: Starting capital
             confidence_percentile: Percentile for confidence filtering (0.6 = keep top 40%)
             verbose: Print detailed trade information (default: True)
+            dynamic_cluster_filter: Optional DynamicClusterFilter for daily filtering
         """
         self.data_loader = data_loader
         self.predictor = predictor
@@ -859,6 +861,14 @@ class TradingSimulator:
         self.initial_capital = initial_capital
         self.confidence_percentile = confidence_percentile
         self.verbose = verbose
+        self.dynamic_cluster_filter = dynamic_cluster_filter
+
+        # Track cluster filtering stats
+        self.cluster_filter_stats = {
+            'total_days': 0,
+            'total_candidates': 0,
+            'total_filtered': 0
+        }
 
         # Compute bin edges if needed
         if predictor.pred_mode == 'classification' and predictor.bin_edges is None:
@@ -920,6 +930,26 @@ class TradingSimulator:
 
         if len(valid_data) == 0:
             return []
+
+        # DYNAMIC CLUSTER FILTERING: Filter stocks based on today's cluster assignment
+        if self.dynamic_cluster_filter is not None:
+            # Create features dict for cluster encoding
+            features_dict = {ticker: features for ticker, features, _ in valid_data}
+
+            # Get allowed stocks for today
+            allowed_tickers = self.dynamic_cluster_filter.filter_stocks_for_date(features_dict)
+
+            # Track stats
+            self.cluster_filter_stats['total_days'] += 1
+            self.cluster_filter_stats['total_candidates'] += len(valid_data)
+            self.cluster_filter_stats['total_filtered'] += len(allowed_tickers)
+
+            # Filter valid_data to only allowed stocks
+            valid_data = [(ticker, features, price) for ticker, features, price in valid_data
+                         if ticker in allowed_tickers]
+
+            if len(valid_data) == 0:
+                return []
 
         # Separate into lists
         tickers = [item[0] for item in valid_data]
@@ -1510,9 +1540,9 @@ def main():
                        help='Number of months to backtest')
 
     # Cluster filtering args (optional)
-    parser.add_argument('--cluster-dir', type=str, default=None,
+    parser.add_argument('--cluster-dir', type=str, default="./cluster_results",
                        help='Directory with cluster results (enables cluster filtering)')
-    parser.add_argument('--best-clusters-file', type=str, default=None,
+    parser.add_argument('--best-clusters-file', type=str, default="./cluster_results/best_clusters_1d.txt",
                        help='File with best cluster IDs (required if --cluster-dir is set)')
 
     # Other args
@@ -1556,33 +1586,28 @@ def main():
         prices_path=args.prices
     )
 
-    # Apply cluster filtering if enabled
+    # Initialize dynamic cluster filter if enabled
+    dynamic_cluster_filter = None
     if args.cluster_dir is not None:
         if args.best_clusters_file is None:
             raise ValueError("--best-clusters-file must be provided when using --cluster-dir")
 
         print(f"\n{'='*80}")
-        print("APPLYING CLUSTER FILTERING")
+        print("INITIALIZING DYNAMIC CLUSTER FILTERING")
         print(f"{'='*80}")
+        print(f"\nℹ️  Dynamic filtering: stocks will be encoded and assigned to clusters EVERY DAY")
+        print(f"   Only stocks in best-performing clusters will be considered for trading")
 
-        # Import cluster filter
-        from cluster.cluster_filter import ClusterFilter
+        # Import dynamic cluster filter
+        from cluster.dynamic_cluster_filter import DynamicClusterFilter
 
         # Initialize filter
-        cluster_filter = ClusterFilter(
+        dynamic_cluster_filter = DynamicClusterFilter(
+            model_path=args.model if args.ensemble_models is None else args.ensemble_models[0],
             cluster_dir=args.cluster_dir,
-            best_clusters_file=args.best_clusters_file
+            best_clusters_file=args.best_clusters_file,
+            device=args.device
         )
-
-        # Apply filter to data loader
-        original_count = len(data_loader.test_tickers)
-        filtered_tickers = cluster_filter.filter_tickers(data_loader.test_tickers)
-
-        data_loader.test_tickers = filtered_tickers
-        data_loader.full_pool = filtered_tickers.copy()
-
-        print(f"\n  ✓ Filtered: {original_count} → {len(filtered_tickers)} stocks ({len(filtered_tickers)/original_count*100:.1f}%)")
-        print(f"  ✓ Using stocks from {len(cluster_filter.best_cluster_ids)} best-performing clusters")
 
     # Get trading period
     trading_dates = data_loader.get_trading_period(num_months=args.test_months)
@@ -1625,7 +1650,8 @@ def main():
             horizon_idx=args.horizon_idx,
             initial_capital=args.initial_capital,
             confidence_percentile=args.confidence_percentile,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            dynamic_cluster_filter=dynamic_cluster_filter
         )
 
         results = simulator.run_simulation(trading_dates)
@@ -1635,6 +1661,19 @@ def main():
         reporter.print_summary(results)
         reporter.print_recent_trades(results, n=10)
         reporter.save_detailed_results(results, args.output)
+
+        # Print cluster filtering stats if enabled
+        if dynamic_cluster_filter is not None:
+            stats = simulator.cluster_filter_stats
+            print(f"\n{'='*80}")
+            print("DYNAMIC CLUSTER FILTERING STATISTICS")
+            print(f"{'='*80}")
+            print(f"\n  Trading days:            {stats['total_days']:>6}")
+            print(f"  Total candidates:        {stats['total_candidates']:>6}")
+            print(f"  Passed filter:           {stats['total_filtered']:>6} ({stats['total_filtered']/stats['total_candidates']*100:.1f}%)")
+            print(f"  Avg candidates per day:  {stats['total_candidates']/stats['total_days']:>6.1f}")
+            print(f"  Avg filtered per day:    {stats['total_filtered']/stats['total_days']:>6.1f}")
+            print(f"\n  Good clusters used:      {len(dynamic_cluster_filter.best_cluster_ids)}")
 
         print(f"\n{'='*80}")
         print("✅ BACKTEST COMPLETE")
@@ -1676,7 +1715,8 @@ def main():
                 horizon_idx=args.horizon_idx,
                 initial_capital=args.initial_capital,
                 confidence_percentile=args.confidence_percentile,
-                verbose=False
+                verbose=False,
+                dynamic_cluster_filter=dynamic_cluster_filter
             )
 
             results = simulator.run_simulation(trading_dates)

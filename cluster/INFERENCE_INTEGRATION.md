@@ -4,10 +4,23 @@ This guide shows you how to use cluster-based stock filtering in your inference/
 
 ## Overview
 
-After creating clusters and identifying the best-performing ones, you can filter your inference to only consider stocks from those clusters. This improves:
-- **Win rate**: Focus on stocks the model predicts well
-- **Risk-adjusted returns**: Avoid unpredictable stocks
-- **Efficiency**: Smaller search space = faster inference
+After creating clusters and identifying the best-performing ones, you can use **dynamic cluster filtering** during backtesting and live trading.
+
+### How Dynamic Filtering Works
+
+**Every trading day:**
+1. Encode ALL candidate stocks using current features
+2. Assign each stock to the nearest cluster centroid
+3. Filter to only stocks in best-performing clusters
+4. Get predictions for filtered stocks only
+5. Select top-k stocks to trade
+
+This is **dynamic** because stocks can change clusters based on current market conditions - a stock might be in a good cluster today but a different cluster tomorrow.
+
+### Benefits
+- **Win rate**: Focus on stocks currently in predictable regimes
+- **Risk-adjusted returns**: Avoid stocks in unpredictable states
+- **Regime detection**: Stocks change clusters as market conditions change
 
 ## Quick Start
 
@@ -40,7 +53,7 @@ This generates:
 
 Now you can use these clusters to filter your backtests!
 
-## Method 1: Native Support in backtest_simulation.py
+## Method 1: Native Support in backtest_simulation.py (Recommended)
 
 The easiest way - just add two command-line arguments:
 
@@ -61,7 +74,26 @@ python -m inference.backtest_simulation \
 - `--cluster-dir`: Directory with cluster results
 - `--best-clusters-file`: Which clusters to use (e.g., best_clusters_5d.txt for 5-day horizon)
 
-The script will automatically filter the stocks before backtesting!
+**What happens:**
+- Every trading day, all candidate stocks are encoded using current features
+- Each stock is assigned to its nearest cluster
+- Only stocks in good clusters are considered for predictions
+- Top-k stocks are selected from the filtered set
+
+**Output:**
+You'll see dynamic cluster filtering statistics at the end:
+```
+DYNAMIC CLUSTER FILTERING STATISTICS
+================================================================================
+
+  Trading days:                 120
+  Total candidates:          12,000
+  Passed filter:              4,800 (40.0%)
+  Avg candidates per day:     100.0
+  Avg filtered per day:        40.0
+
+  Good clusters used:             5
+```
 
 ## Method 2: Standalone Script with Cluster Filtering
 
@@ -85,19 +117,21 @@ This script provides more detailed output about cluster filtering statistics.
 
 ## Method 3: Programmatic Integration (Python API)
 
-For custom inference scripts:
+For custom inference scripts with dynamic filtering:
 
 ```python
-from cluster.cluster_filter import ClusterFilter
-from inference.backtest_simulation import DatasetLoader, ModelPredictor, BacktestSimulator
+from cluster.dynamic_cluster_filter import DynamicClusterFilter
+from inference.backtest_simulation import DatasetLoader, ModelPredictor, TradingSimulator
 
-# Initialize cluster filter
-cluster_filter = ClusterFilter(
+# Initialize dynamic cluster filter
+dynamic_filter = DynamicClusterFilter(
+    model_path='checkpoints/best_model_100m_1.18.pt',
     cluster_dir='cluster_results',
-    best_clusters_file='cluster_results/best_clusters_5d.txt'
+    best_clusters_file='cluster_results/best_clusters_5d.txt',
+    device='cuda'
 )
 
-# Load your data
+# Load data
 data_loader = DatasetLoader(
     dataset_path='data/all_complete_dataset.h5',
     num_test_stocks=1000,
@@ -105,47 +139,69 @@ data_loader = DatasetLoader(
     prices_path='data/actual_prices.h5'
 )
 
-# Apply cluster filtering
-original_count = len(data_loader.test_tickers)
-filtered_tickers = cluster_filter.filter_tickers(data_loader.test_tickers)
+# Load predictor
+predictor = ModelPredictor(model_path='checkpoints/best_model_100m_1.18.pt')
 
-# Update data loader with filtered tickers
-data_loader.test_tickers = filtered_tickers
-data_loader.full_pool = filtered_tickers.copy()
+# Create simulator with dynamic filtering
+simulator = TradingSimulator(
+    data_loader=data_loader,
+    predictor=predictor,
+    top_k=5,
+    horizon_idx=1,  # 5-day horizon
+    dynamic_cluster_filter=dynamic_filter  # Enable dynamic filtering
+)
 
-print(f"Filtered: {original_count} → {len(filtered_tickers)} stocks")
+# Run simulation - filtering happens automatically each day
+trading_dates = data_loader.get_trading_period(num_months=6)
+results = simulator.run_simulation(trading_dates)
 
-# Now use data_loader as normal
-predictor = ModelPredictor(model_path='checkpoints/best_model.pt')
-simulator = BacktestSimulator(data_loader, predictor, top_k=5)
-results = simulator.run_backtest(start_date='2024-01-01', end_date='2024-06-30')
+# Check filtering stats
+print(f"Filtered {simulator.cluster_filter_stats['total_filtered']} / "
+      f"{simulator.cluster_filter_stats['total_candidates']} stocks total")
 ```
+
+**Key point:** When you pass `dynamic_cluster_filter` to `TradingSimulator`, it automatically:
+- Encodes all stocks each day
+- Assigns them to clusters
+- Filters to good clusters
+- Only gets predictions for filtered stocks
 
 ## Method 4: Filter Individual Stocks (Real-time Trading)
 
-For real-time trading where you check stocks one by one:
+For real-time trading, you need to encode stocks daily and check cluster membership:
 
 ```python
-from cluster.cluster_filter import ClusterFilter
+from cluster.dynamic_cluster_filter import DynamicClusterFilter
+import torch
 
 # Initialize filter once
-cluster_filter = ClusterFilter(
+dynamic_filter = DynamicClusterFilter(
+    model_path='checkpoints/best_model_100m_1.18.pt',
     cluster_dir='cluster_results',
     best_clusters_file='cluster_results/best_clusters_1d.txt'
 )
 
-# Check individual stocks
-for ticker in candidate_stocks:
-    if cluster_filter.is_allowed(ticker):
-        # This stock is in a good cluster - consider trading it
-        prediction = model.predict(ticker)
+# Every trading day, encode all candidates and filter
+candidate_stocks = ['AAPL', 'GOOGL', 'MSFT', ...]
 
-        if prediction > threshold:
-            buy(ticker)
-    else:
-        # This stock is NOT in a good cluster - skip it
-        continue
+# Get current features for all stocks
+features_dict = {}
+for ticker in candidate_stocks:
+    features = get_current_features(ticker)  # Your function to get current features
+    features_dict[ticker] = torch.tensor(features, dtype=torch.float32)
+
+# Filter to stocks in good clusters TODAY
+allowed_stocks = dynamic_filter.filter_stocks_for_date(features_dict)
+
+# Trade only allowed stocks
+for ticker in allowed_stocks:
+    prediction = model.predict(ticker)
+
+    if prediction > threshold:
+        buy(ticker)
 ```
+
+**Important:** You must re-encode and filter every day - a stock's cluster membership can change!
 
 ## Choosing the Right Cluster File
 
