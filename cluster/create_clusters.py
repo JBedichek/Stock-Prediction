@@ -44,7 +44,33 @@ class ClusterEncoder:
         print(f"{'='*80}")
 
         print(f"\n📦 Loading model from: {model_path}")
-        self.model = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device)
+
+        # Handle both direct model saves and checkpoint dicts
+        if isinstance(checkpoint, dict):
+            # Checkpoint dict format - need to reconstruct model
+            # Try to get model from checkpoint
+            if 'model' in checkpoint:
+                self.model = checkpoint['model']
+            elif 'model_state_dict' in checkpoint:
+                # Need to reconstruct model architecture
+                from training.models import t_Dist_Pred
+                # Get hyperparameters from checkpoint if available
+                config = checkpoint.get('config', {})
+                self.model = t_Dist_Pred(
+                    seq_len=config.get('seq_len', 2000),
+                    num_bins=config.get('num_bins', 320),
+                    hidden_dim=config.get('hidden_dim', 1024),
+                    num_layers=config.get('num_layers', 24),
+                    num_heads=config.get('num_heads', 8)
+                )
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                raise ValueError("Checkpoint does not contain 'model' or 'model_state_dict'")
+        else:
+            # Direct model save
+            self.model = checkpoint
+
         self.model.eval()
         self.model.to(device)
 
