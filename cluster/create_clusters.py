@@ -119,7 +119,15 @@ class ClusterEncoder:
         if max_stocks:
             tickers = tickers[:max_stocks]
 
-        print(f"📊 Encoding {len(tickers)} stocks...")
+        # Check first ticker to understand data structure
+        if len(tickers) > 0:
+            first_ticker = tickers[0]
+            sample_features = h5_file[first_ticker]['features'][:]
+            print(f"\n📋 Data structure (sample from {first_ticker}):")
+            print(f"   Features shape: {sample_features.shape}")
+            print(f"   Features dtype: {sample_features.dtype}")
+
+        print(f"\n📊 Encoding {len(tickers)} stocks...")
 
         embeddings = {}
 
@@ -150,19 +158,39 @@ class ClusterEncoder:
             Batch of embeddings (batch_size, embedding_dim)
         """
         batch_features = []
+        expected_feature_dim = None
 
         for ticker in tickers:
             if ticker not in h5_file:
                 continue
 
-            # Get features (take first timestep or average across time)
-            features = h5_file[ticker]['features'][:]  # (num_dates, num_features)
+            try:
+                # Get features
+                features = h5_file[ticker]['features'][:]  # (num_dates, num_features) or (num_features,)
 
-            # Use most recent timestep's features (or could average)
-            if len(features.shape) == 2:
-                features = features[-1]  # Take last timestep
+                # Handle different shapes
+                if len(features.shape) == 2:
+                    # Multiple timesteps - take the last one
+                    features = features[-1]
+                elif len(features.shape) == 1:
+                    # Single timestep already
+                    pass
+                else:
+                    # Skip malformed data
+                    continue
 
-            batch_features.append(features)
+                # Check feature dimension consistency
+                if expected_feature_dim is None:
+                    expected_feature_dim = len(features)
+                elif len(features) != expected_feature_dim:
+                    # Skip stocks with different feature dimensions
+                    continue
+
+                batch_features.append(features)
+
+            except Exception as e:
+                # Skip stocks with errors
+                continue
 
         if len(batch_features) == 0:
             return np.array([])
