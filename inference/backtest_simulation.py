@@ -1509,6 +1509,12 @@ def main():
     parser.add_argument('--test-months', type=int, default=4,
                        help='Number of months to backtest')
 
+    # Cluster filtering args (optional)
+    parser.add_argument('--cluster-dir', type=str, default=None,
+                       help='Directory with cluster results (enables cluster filtering)')
+    parser.add_argument('--best-clusters-file', type=str, default=None,
+                       help='File with best cluster IDs (required if --cluster-dir is set)')
+
     # Other args
     parser.add_argument('--initial-capital', type=float, default=100000.0,
                        help='Initial capital for simulation')
@@ -1549,6 +1555,34 @@ def main():
         subset_size=args.subset_size,
         prices_path=args.prices
     )
+
+    # Apply cluster filtering if enabled
+    if args.cluster_dir is not None:
+        if args.best_clusters_file is None:
+            raise ValueError("--best-clusters-file must be provided when using --cluster-dir")
+
+        print(f"\n{'='*80}")
+        print("APPLYING CLUSTER FILTERING")
+        print(f"{'='*80}")
+
+        # Import cluster filter
+        from cluster.cluster_filter import ClusterFilter
+
+        # Initialize filter
+        cluster_filter = ClusterFilter(
+            cluster_dir=args.cluster_dir,
+            best_clusters_file=args.best_clusters_file
+        )
+
+        # Apply filter to data loader
+        original_count = len(data_loader.test_tickers)
+        filtered_tickers = cluster_filter.filter_tickers(data_loader.test_tickers)
+
+        data_loader.test_tickers = filtered_tickers
+        data_loader.full_pool = filtered_tickers.copy()
+
+        print(f"\n  ✓ Filtered: {original_count} → {len(filtered_tickers)} stocks ({len(filtered_tickers)/original_count*100:.1f}%)")
+        print(f"  ✓ Using stocks from {len(cluster_filter.best_cluster_ids)} best-performing clusters")
 
     # Get trading period
     trading_dates = data_loader.get_trading_period(num_months=args.test_months)
