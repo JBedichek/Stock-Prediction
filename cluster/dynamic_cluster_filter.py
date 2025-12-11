@@ -52,7 +52,8 @@ class DynamicClusterFilter:
                  best_cluster_ids: Optional[List[int]] = None,
                  best_clusters_file: Optional[str] = None,
                  device: str = 'cuda',
-                 batch_size: int = 32):
+                 batch_size: int = 32,
+                 embeddings_cache_path: Optional[str] = None):
         """
         Initialize dynamic cluster filter.
 
@@ -63,13 +64,29 @@ class DynamicClusterFilter:
             best_clusters_file: File with good cluster IDs (alternative to list)
             device: Device for encoding
             batch_size: Batch size for encoding (default: 32)
+            embeddings_cache_path: Optional path to pre-computed embeddings cache (HDF5)
         """
         self.device = device
         self.batch_size = batch_size
+        self.embeddings_cache_path = embeddings_cache_path
+        self.embeddings_cache = None
 
         print(f"\n{'='*80}")
         print("INITIALIZING DYNAMIC CLUSTER FILTER")
         print(f"{'='*80}")
+
+        # Load embeddings cache if provided
+        if embeddings_cache_path:
+            print(f"\n📂 Loading embeddings cache: {embeddings_cache_path}")
+            try:
+                self.embeddings_cache = h5py.File(embeddings_cache_path, 'r')
+                num_tickers = len(list(self.embeddings_cache.keys()))
+                print(f"  ✅ Cache loaded ({num_tickers} tickers)")
+                print(f"  ⚡ Will use cached embeddings when available (much faster!)")
+            except Exception as e:
+                print(f"  ⚠️  Failed to load cache: {e}")
+                print(f"  ℹ️  Will fall back to on-the-fly encoding")
+                self.embeddings_cache = None
 
         # Load model for encoding
         print(f"\n📦 Loading model from: {model_path}")
@@ -300,8 +317,31 @@ class DynamicClusterFilter:
 
         return assignments
 
+    def get_embeddings_from_cache(self, tickers: List[str], date: str) -> Dict[str, np.ndarray]:
+        """
+        Get embeddings from cache for given tickers and date.
+
+        Args:
+            tickers: List of tickers
+            date: Date string (YYYY-MM-DD)
+
+        Returns:
+            Dictionary of {ticker: embedding} for tickers found in cache
+        """
+        if self.embeddings_cache is None:
+            return {}
+
+        embeddings = {}
+        for ticker in tickers:
+            if ticker in self.embeddings_cache:
+                if date in self.embeddings_cache[ticker]:
+                    embeddings[ticker] = self.embeddings_cache[ticker][date][:]
+
+        return embeddings
+
     def filter_stocks_for_date(self,
                                features_dict: Dict[str, torch.Tensor],
+                               date: Optional[str] = None,
                                return_assignments: bool = False) -> List[str]:
         """
         Filter stocks to only those in good clusters for this specific day.
@@ -310,13 +350,34 @@ class DynamicClusterFilter:
 
         Args:
             features_dict: {ticker: features} for all candidate stocks on this day
+            date: Optional date string (YYYY-MM-DD) for cache lookup
             return_assignments: If True, also return cluster assignments
 
         Returns:
             List of tickers in good clusters (or tuple if return_assignments=True)
         """
-        # Step 1: Encode all stocks (batched for memory efficiency)
-        embeddings = self.encode_features(features_dict, batch_size=self.batch_size)
+        # Step 1: Try to get embeddings from cache first
+        embeddings = {}
+        if date and self.embeddings_cache is not None:
+            tickers = list(features_dict.keys())
+            cached_embeddings = self.get_embeddings_from_cache(tickers, date)
+            embeddings.update(cached_embeddings)
+
+            # Remove cached tickers from features_dict
+            features_to_encode = {k: v for k, v in features_dict.items() if k not in embeddings}
+
+            if len(cached_embeddings) > 0:
+                cache_hit_rate = len(cached_embeddings) / len(features_dict) * 100
+                if len(features_to_encode) == 0:
+                    # All from cache
+                    pass  # Silent for speed
+                else:
+                    # Partial cache hit - encode remaining
+                    encoded_embeddings = self.encode_features(features_to_encode, batch_size=self.batch_size)
+                    embeddings.update(encoded_embeddings)
+        else:
+            # No cache - encode all
+            embeddings = self.encode_features(features_dict, batch_size=self.batch_size)
 
         # Step 2: Assign to clusters
         assignments = self.assign_to_clusters(embeddings)

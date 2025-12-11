@@ -936,8 +936,8 @@ class TradingSimulator:
             # Create features dict for cluster encoding
             features_dict = {ticker: features for ticker, features, _ in valid_data}
 
-            # Get allowed stocks for today
-            allowed_tickers = self.dynamic_cluster_filter.filter_stocks_for_date(features_dict)
+            # Get allowed stocks for today (pass date for cache lookup)
+            allowed_tickers = self.dynamic_cluster_filter.filter_stocks_for_date(features_dict, date=date)
 
             # Track stats
             self.cluster_filter_stats['total_days'] += 1
@@ -1546,6 +1546,8 @@ def main():
                        help='File with best cluster IDs (required if --cluster-dir is set)')
     parser.add_argument('--cluster-batch-size', type=int, default=32,
                        help='Batch size for cluster encoding (default: 32, reduce if OOM)')
+    parser.add_argument('--embeddings-cache', type=str, default=None,
+                       help='Path to pre-computed embeddings cache (HDF5) for fast filtering')
 
     # Other args
     parser.add_argument('--initial-capital', type=float, default=100000.0,
@@ -1609,9 +1611,13 @@ def main():
             cluster_dir=args.cluster_dir,
             best_clusters_file=args.best_clusters_file,
             device=args.device,
-            batch_size=args.cluster_batch_size
+            batch_size=args.cluster_batch_size,
+            embeddings_cache_path=args.embeddings_cache
         )
-        print(f"  ℹ️  Cluster encoding batch size: {args.cluster_batch_size} (use --cluster-batch-size to adjust)")
+        if args.embeddings_cache is None:
+            print(f"  ℹ️  Cluster encoding batch size: {args.cluster_batch_size} (use --cluster-batch-size to adjust)")
+            print(f"  💡 Tip: Pre-compute embeddings cache for faster filtering:")
+            print(f"     python -m cluster.cache_embeddings --output-path data/embeddings_cache.h5")
 
     # Get trading period
     trading_dates = data_loader.get_trading_period(num_months=args.test_months)
