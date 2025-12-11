@@ -289,6 +289,9 @@ class StatisticalComparison:
         original_subset_size = self.data_loader.subset_size
         self.data_loader.subset_size = self.subset_size
 
+        # Create trial seed for random baseline portfolios
+        trial_seed = self.seed + trial_idx
+
         # Map horizon_idx to horizon_days
         horizon_map = {0: 1, 1: 5, 2: 10, 3: 20}
         horizon_days = horizon_map.get(self.horizon_idx, 1)
