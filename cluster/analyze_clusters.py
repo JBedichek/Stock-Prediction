@@ -109,7 +109,13 @@ class ClusterAnalyzer:
                 continue
 
             tickers_with_prices += 1
-            prices = prices_file[ticker]['close'][:]  # Assuming 'close' prices
+            # Try 'prices' first, then 'close' for compatibility
+            if 'prices' in prices_file[ticker]:
+                prices = prices_file[ticker]['prices'][:]
+            elif 'close' in prices_file[ticker]:
+                prices = prices_file[ticker]['close'][:]
+            else:
+                continue
 
             # Compute forward returns at each horizon
             for horizon in horizons:
