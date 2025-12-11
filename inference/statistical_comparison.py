@@ -34,7 +34,7 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from inference.backtest_simulation import DatasetLoader, ModelPredictor, TradingSimulator
+from inference.backtest_simulation import DatasetLoader, ModelPredictor, EnsemblePredictor, TradingSimulator
 
 
 class BatchedRandomSimulator:
@@ -787,7 +787,9 @@ def main():
     parser.add_argument('--prices', type=str, default="data/actual_prices.h5",
                        help='Path to prices HDF5')
     parser.add_argument('--model', type=str, default="checkpoints/best_model.pt",
-                       help='Path to model checkpoint')
+                       help='Path to model checkpoint (or first model if using --ensemble-models)')
+    parser.add_argument('--ensemble-models', type=str, nargs='+', default=None,
+                       help='Paths to multiple model checkpoints for ensemble prediction (overrides --model)')
     parser.add_argument('--bin-edges', type=str, default='data/adaptive_bin_edges.pt',
                        help='Path to bin edges')
 
@@ -832,13 +834,24 @@ def main():
         prices_path=args.prices
     )
 
-    # Load model
-    predictor = ModelPredictor(
-        args.model,
-        args.bin_edges,
-        device=args.device,
-        batch_size=args.batch_size
-    )
+    # Load model (single or ensemble)
+    if args.ensemble_models is not None:
+        # Ensemble mode: use multiple models
+        print(f"\n🎯 Ensemble mode: using {len(args.ensemble_models)} models")
+        predictor = EnsemblePredictor(
+            model_paths=args.ensemble_models,
+            bin_edges_path=args.bin_edges,
+            device=args.device,
+            batch_size=args.batch_size
+        )
+    else:
+        # Single model mode
+        predictor = ModelPredictor(
+            args.model,
+            args.bin_edges,
+            device=args.device,
+            batch_size=args.batch_size
+        )
 
     # Run comparison
     comparison = StatisticalComparison(

@@ -678,6 +678,156 @@ class ModelPredictor:
         return expected_returns, horizon_confidence
 
 
+class EnsemblePredictor:
+    """Ensemble predictor that averages predictions from multiple models."""
+
+    def __init__(self, model_paths: List[str], bin_edges_path: str, device: str = 'cuda', batch_size: int = 64, compile_model: bool = False):
+        """
+        Args:
+            model_paths: List of paths to model checkpoints
+            bin_edges_path: Path to cached bin edges
+            device: Device to run inference on
+            batch_size: Batch size for inference (default: 64)
+            compile_model: Use torch.compile for faster inference (default: False)
+        """
+        if len(model_paths) == 0:
+            raise ValueError("Must provide at least one model path for ensemble")
+
+        self.batch_size = batch_size
+        self.device = device
+        self.bin_edges_path = bin_edges_path
+
+        print(f"\n{'='*80}")
+        print(f"LOADING ENSEMBLE ({len(model_paths)} models)")
+        print(f"{'='*80}")
+
+        # Load all models
+        self.predictors = []
+        for i, model_path in enumerate(model_paths, 1):
+            print(f"\n--- Model {i}/{len(model_paths)} ---")
+            predictor = ModelPredictor(
+                model_path=model_path,
+                bin_edges_path=bin_edges_path,
+                device=device,
+                batch_size=batch_size,
+                compile_model=compile_model
+            )
+            self.predictors.append(predictor)
+
+        # All models should have same pred_mode and bin_edges
+        self.pred_mode = self.predictors[0].pred_mode
+        self.bin_edges = self.predictors[0].bin_edges
+
+        # Verify all models use same mode
+        for i, predictor in enumerate(self.predictors[1:], 2):
+            if predictor.pred_mode != self.pred_mode:
+                raise ValueError(f"Model {i} has pred_mode={predictor.pred_mode}, expected {self.pred_mode}")
+
+        print(f"\n{'='*80}")
+        print(f"✅ ENSEMBLE LOADED: {len(self.predictors)} models in {self.pred_mode} mode")
+        print(f"{'='*80}")
+
+    @torch.no_grad()
+    def predict_expected_return(self, features: torch.Tensor, horizon_idx: int = 0) -> Tuple[float, float]:
+        """
+        Predict expected return for a single stock using ensemble averaging.
+
+        Args:
+            features: Feature tensor (feature_dim,)
+            horizon_idx: Index of prediction horizon (0=1day, 1=5day, 2=10day, 3=20day)
+
+        Returns:
+            Tuple of (expected_return, confidence)
+        """
+        # Use batch prediction with batch_size=1
+        expected_returns, confidences = self.predict_expected_return_batch([features], horizon_idx)
+        return expected_returns[0], confidences[0]
+
+    @torch.no_grad()
+    def predict_expected_return_batch(self, features_list: List[torch.Tensor], horizon_idx: int = 0) -> Tuple[List[float], List[float]]:
+        """
+        Predict expected returns for a batch of stocks using ensemble averaging.
+
+        For classification mode: averages probability distributions before computing expected value
+        For regression mode: averages direct predictions
+
+        Args:
+            features_list: List of feature tensors, each (feature_dim,)
+            horizon_idx: Index of prediction horizon (0=1day, 1=5day, 2=10day, 3=20day)
+
+        Returns:
+            Tuple of (expected_returns, confidences)
+        """
+        if len(features_list) == 0:
+            return [], []
+
+        batch_size = len(features_list)
+
+        if self.pred_mode == 'classification':
+            # For classification: average probability distributions
+            # Collect predictions from all models
+            all_probs = []
+            all_confidences = []
+
+            for predictor in self.predictors:
+                # Stack into batch and add sequence dimension
+                features_batch = torch.stack(features_list).unsqueeze(1).to(self.device)  # (batch, 1, feature_dim)
+
+                # Forward pass
+                pred, confidence = predictor.model(features_batch)
+
+                # Get logits for this horizon and convert to probabilities
+                logits = pred[:, :, horizon_idx]  # (batch, num_bins)
+                probs = F.softmax(logits, dim=1)  # (batch, num_bins)
+
+                all_probs.append(probs)
+                all_confidences.append(confidence[:, horizon_idx])  # (batch,)
+
+            # Average probability distributions across models
+            avg_probs = torch.stack(all_probs).mean(dim=0)  # (batch, num_bins)
+
+            # Average confidences across models
+            avg_confidence = torch.stack(all_confidences).mean(dim=0)  # (batch,)
+
+            # Calculate expected value using bin midpoints
+            bin_midpoints = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2  # (num_bins,)
+            expected_ratios = torch.sum(avg_probs * bin_midpoints.unsqueeze(0), dim=1)  # (batch,)
+
+            # Convert from price ratio to multiplicative return
+            expected_returns = (1.0 + expected_ratios).cpu().tolist()
+            confidences = avg_confidence.cpu().tolist()
+
+        else:
+            # For regression: average direct predictions
+            all_predictions = []
+            all_confidences = []
+
+            for predictor in self.predictors:
+                # Stack into batch and add sequence dimension
+                features_batch = torch.stack(features_list).unsqueeze(1).to(self.device)  # (batch, 1, feature_dim)
+
+                # Forward pass
+                pred, confidence = predictor.model(features_batch)
+
+                # Get predictions for this horizon
+                predictions = pred[:, horizon_idx]  # (batch,)
+
+                all_predictions.append(predictions)
+                all_confidences.append(confidence[:, horizon_idx])  # (batch,)
+
+            # Average predictions across models
+            avg_predictions = torch.stack(all_predictions).mean(dim=0)  # (batch,)
+
+            # Average confidences across models
+            avg_confidence = torch.stack(all_confidences).mean(dim=0)  # (batch,)
+
+            # Convert from price ratio to multiplicative return
+            expected_returns = (1.0 + avg_predictions).cpu().tolist()
+            confidences = avg_confidence.cpu().tolist()
+
+        return expected_returns, confidences
+
+
 class TradingSimulator:
     """Simulate trading strategy based on model predictions."""
 
@@ -1337,7 +1487,9 @@ def main():
     parser.add_argument('--prices', type=str, default="data/actual_prices.h5",
                        help='Path to HDF5 file with actual prices (optional, for normalized features)')
     parser.add_argument('--model', type=str, default="checkpoints/best_model_100m_1.18.pt",
-                       help='Path to model checkpoint')
+                       help='Path to model checkpoint (or first model if using --ensemble-models)')
+    parser.add_argument('--ensemble-models', type=str, nargs='+', default=None,
+                       help='Paths to multiple model checkpoints for ensemble prediction (overrides --model)')
     parser.add_argument('--bin-edges', type=str, default='data/adaptive_bin_edges.pt',
                        help='Path to bin edges cache')
 
@@ -1407,14 +1559,26 @@ def main():
     else:
         print(f"\n⚠️  Preloading disabled - expect slower performance")
 
-    # Load model
-    predictor = ModelPredictor(
-        model_path=args.model,
-        bin_edges_path=args.bin_edges,
-        device=args.device,
-        batch_size=args.batch_size,
-        compile_model=args.compile
-    )
+    # Load model (single or ensemble)
+    if args.ensemble_models is not None:
+        # Ensemble mode: use multiple models
+        print(f"\n🎯 Ensemble mode: using {len(args.ensemble_models)} models")
+        predictor = EnsemblePredictor(
+            model_paths=args.ensemble_models,
+            bin_edges_path=args.bin_edges,
+            device=args.device,
+            batch_size=args.batch_size,
+            compile_model=args.compile
+        )
+    else:
+        # Single model mode
+        predictor = ModelPredictor(
+            model_path=args.model,
+            bin_edges_path=args.bin_edges,
+            device=args.device,
+            batch_size=args.batch_size,
+            compile_model=args.compile
+        )
 
     if args.num_trials == 1:
         # Single trial mode (original behavior)

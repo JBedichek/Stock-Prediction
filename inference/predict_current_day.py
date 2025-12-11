@@ -37,6 +37,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from training.train_new_format import SimpleTransformerPredictor
+from inference.backtest_simulation import ModelPredictor, EnsemblePredictor
 
 # ===== CPU Optimizations =====
 torch.set_num_threads(torch.get_num_threads())
@@ -55,7 +56,7 @@ class CurrentDayPredictor:
     def __init__(self,
                  dataset_path: str,
                  prices_path: str,
-                 model_path: str,
+                 model_paths,  # str or List[str]
                  bin_edges_path: str,
                  device: str = 'cuda',
                  batch_size: int = 256,
@@ -64,7 +65,7 @@ class CurrentDayPredictor:
         Args:
             dataset_path: Path to HDF5 dataset with features
             prices_path: Path to HDF5 file with actual prices
-            model_path: Path to model checkpoint
+            model_paths: Path to model checkpoint (str) or list of paths for ensemble (List[str])
             bin_edges_path: Path to cached bin edges
             device: Device to run inference on
             batch_size: Batch size for inference
@@ -101,87 +102,30 @@ class CurrentDayPredictor:
             print(f"\n⚠️  No prices file provided - will use features[0]")
             self.prices_file = None
 
-        # Load model
-        print(f"\n{'='*80}")
-        print("LOADING MODEL")
-        print(f"{'='*80}")
-        self._load_model(model_path, bin_edges_path, compile_model)
-
-    def _load_model(self, model_path: str, bin_edges_path: str, compile_model: bool):
-        """Load model and bin edges."""
-        print(f"📦 Loading checkpoint: {model_path}")
-        checkpoint = torch.load(model_path, map_location=self.device)
-
-        # Get model config
-        config = checkpoint['config']
-        state_dict = checkpoint['model_state_dict']
-
-        # Infer input_dim from state_dict
-        if '_orig_mod.input_proj.0.weight' in state_dict:
-            input_dim = state_dict['_orig_mod.input_proj.0.weight'].shape[1]
-            pred_head_keys = [k for k in state_dict.keys() if 'pred_head' in k and 'weight' in k and '_orig_mod' in k]
-            final_pred_key = sorted(pred_head_keys)[-1]
-            final_output_size = state_dict[final_pred_key].shape[0]
-        elif 'input_proj.0.weight' in state_dict:
-            input_dim = state_dict['input_proj.0.weight'].shape[1]
-            pred_head_keys = [k for k in state_dict.keys() if 'pred_head' in k and 'weight' in k]
-            final_pred_key = sorted(pred_head_keys)[-1]
-            final_output_size = state_dict[final_pred_key].shape[0]
+        # Load model (single or ensemble)
+        if isinstance(model_paths, list):
+            # Ensemble mode
+            print(f"\n🎯 Ensemble mode: using {len(model_paths)} models")
+            self.predictor = EnsemblePredictor(
+                model_paths=model_paths,
+                bin_edges_path=bin_edges_path,
+                device=device,
+                batch_size=batch_size,
+                compile_model=compile_model
+            )
         else:
-            raise KeyError(f"Could not find input_proj layer in state_dict")
+            # Single model mode
+            self.predictor = ModelPredictor(
+                model_path=model_paths,
+                bin_edges_path=bin_edges_path,
+                device=device,
+                batch_size=batch_size,
+                compile_model=compile_model
+            )
 
-        # Infer pred_mode
-        if 'pred_mode' in config:
-            pred_mode = config['pred_mode']
-        elif final_output_size == 400:
-            pred_mode = 'classification'
-        elif final_output_size == 4:
-            pred_mode = 'regression'
-        else:
-            raise ValueError(f"Cannot infer pred_mode from output size {final_output_size}")
-
-        print(f"  Input dimension: {input_dim}")
-        print(f"  Prediction mode: {pred_mode}")
-
-        # Create model
-        self.model = SimpleTransformerPredictor(
-            input_dim=input_dim,
-            hidden_dim=config['hidden_dim'],
-            num_layers=config['num_layers'],
-            num_heads=config['num_heads'],
-            dropout=config['dropout'],
-            num_pred_days=4,
-            pred_mode=pred_mode
-        )
-
-        # Strip '_orig_mod.' prefix if present
-        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
-            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-
-        # Load weights
-        missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
-
-        self.model = self.model.to(self.device)
-        self.model.eval()
-
-        # Compile if requested
-        if compile_model:
-            print(f"  🔧 Compiling model with torch.compile...")
-            self.model = torch.compile(self.model, mode='max-autotune')
-
-        print(f"  ✅ Model loaded successfully")
-
-        # Load bin edges
-        self.pred_mode = pred_mode
-        if pred_mode == 'classification':
-            if os.path.exists(bin_edges_path):
-                print(f"📊 Loading bin edges: {bin_edges_path}")
-                self.bin_edges = torch.load(bin_edges_path).to(self.device)
-                print(f"  ✅ Loaded {len(self.bin_edges)} bin edges")
-            else:
-                raise FileNotFoundError(f"Bin edges file not found: {bin_edges_path}")
-        else:
-            self.bin_edges = None
+        # Store pred_mode and bin_edges from predictor
+        self.pred_mode = self.predictor.pred_mode
+        self.bin_edges = self.predictor.bin_edges
 
     def get_latest_date(self) -> str:
         """Get the most recent date available in the dataset with REAL data."""
@@ -267,7 +211,7 @@ class CurrentDayPredictor:
     @torch.no_grad()
     def predict_batch(self, features_list: List[torch.Tensor], horizon_idx: int) -> Tuple[List[float], List[float]]:
         """
-        Run batch inference on a list of features.
+        Run batch inference on a list of features using the predictor.
 
         Args:
             features_list: List of feature tensors
@@ -276,54 +220,8 @@ class CurrentDayPredictor:
         Returns:
             Tuple of (expected_returns, confidences)
         """
-        if len(features_list) == 0:
-            return [], []
-
-        # Check if all tensors have the same size
-        feature_sizes = [f.shape[0] for f in features_list]
-        max_size = max(feature_sizes)
-        min_size = min(feature_sizes)
-
-        if max_size != min_size:
-            # Pad tensors to same size
-            print(f"  ⚠️  Feature dimension mismatch detected: {min_size} to {max_size}")
-            print(f"     Padding all tensors to {max_size} dimensions")
-
-            padded_features = []
-            for f in features_list:
-                if f.shape[0] < max_size:
-                    # Pad with zeros
-                    padding = torch.zeros(max_size - f.shape[0], dtype=f.dtype, device=f.device)
-                    f_padded = torch.cat([f, padding])
-                    padded_features.append(f_padded)
-                else:
-                    padded_features.append(f)
-            features_list = padded_features
-
-        # Stack into batch
-        features_batch = torch.stack(features_list).unsqueeze(1).to(self.device)  # (batch, 1, features)
-
-        # Forward pass
-        pred, confidence = self.model(features_batch)
-
-        if self.pred_mode == 'classification':
-            # Get distribution for horizon
-            logits = pred[:, :, horizon_idx]  # (batch, num_bins)
-            probs = F.softmax(logits, dim=1)
-
-            # Calculate expected value
-            bin_midpoints = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2
-            expected_ratios = torch.sum(probs * bin_midpoints.unsqueeze(0), dim=1)
-            expected_returns = (1.0 + expected_ratios).cpu().tolist()
-        else:
-            # Regression mode
-            expected_ratios = pred[:, horizon_idx]
-            expected_returns = (1.0 + expected_ratios).cpu().tolist()
-
-        # Extract confidence
-        horizon_confidence = confidence[:, horizon_idx].cpu().tolist()
-
-        return expected_returns, horizon_confidence
+        # Delegate to the predictor (ModelPredictor or EnsemblePredictor)
+        return self.predictor.predict_expected_return_batch(features_list, horizon_idx)
 
     def predict_all_stocks(self,
                           date: str,
@@ -483,7 +381,9 @@ def main():
     parser.add_argument('--prices', type=str, default=None,
                        help='Path to HDF5 file with actual prices (optional)')
     parser.add_argument('--model', type=str, required=True,
-                       help='Path to model checkpoint')
+                       help='Path to model checkpoint (or first model if using --ensemble-models)')
+    parser.add_argument('--ensemble-models', type=str, nargs='+', default=None,
+                       help='Paths to multiple model checkpoints for ensemble prediction (overrides --model)')
     parser.add_argument('--bin-edges', type=str, required=True,
                        help='Path to bin edges cache')
 
@@ -523,11 +423,15 @@ def main():
     print(f"  Confidence percentile: {args.confidence_percentile}")
     print()
 
-    # Create predictor
+    # Create predictor (single model or ensemble)
+    model_paths = args.ensemble_models if args.ensemble_models is not None else args.model
+    if args.ensemble_models is not None:
+        print(f"🎯 Ensemble mode: using {len(args.ensemble_models)} models")
+
     predictor = CurrentDayPredictor(
         dataset_path=args.data,
         prices_path=args.prices,
-        model_path=args.model,
+        model_paths=model_paths,
         bin_edges_path=args.bin_edges,
         device=args.device,
         batch_size=args.batch_size,
