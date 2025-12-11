@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 import pickle
 
 import sys
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from .Stock import a_lot_of_stocks, s_lot_of_stocks
 from utils.utils import save_pickle
 

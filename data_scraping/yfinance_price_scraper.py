@@ -21,12 +21,14 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import sys
+import os
 import time
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.utils import save_pickle, pic_load
 
 
@@ -211,6 +213,93 @@ def scrape_price_dataset(stock_dict: Dict[str, str],
     print(f"{'='*80}\n")
 
     return all_prices
+
+
+def fetch_date_range_prices(start_date: str, end_date: str,
+                            tickers: Optional[List[str]] = None,
+                            batch_size: int = 50) -> pd.DataFrame:
+    """
+    Fetch price data for multiple tickers over a date range.
+
+    Args:
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        tickers: List of ticker symbols (if None, loads from default stock list)
+        batch_size: Number of tickers to process in parallel
+
+    Returns:
+        DataFrame with dates as index and tickers as columns.
+        Each cell contains a dict with OHLCV data.
+    """
+    # Load default tickers if not provided
+    if tickers is None:
+        try:
+            # Try to load from existing dataset
+            import h5py
+            dataset_path = 'data/all_complete_dataset.h5'
+            if os.path.exists(dataset_path):
+                with h5py.File(dataset_path, 'r') as h5f:
+                    tickers = list(h5f.keys())
+                print(f"  Loaded {len(tickers)} tickers from existing dataset")
+            else:
+                # Fallback to Stock.py
+                from data_scraping.Stock import all_stocks
+                tickers = list(all_stocks().keys())
+                print(f"  Loaded {len(tickers)} tickers from Stock.py")
+        except Exception as e:
+            print(f"  ⚠️  Failed to load tickers: {e}")
+            return pd.DataFrame()
+
+    print(f"  Fetching prices for {len(tickers)} tickers from {start_date} to {end_date}")
+
+    # Fetch data for all tickers
+    all_data = {}
+    failed_count = 0
+
+    for i in tqdm(range(0, len(tickers), batch_size), desc="  Batches"):
+        batch = tickers[i:i+batch_size]
+
+        for ticker in batch:
+            try:
+                df = fetch_price_data(ticker, start_date, end_date)
+                if df is not None and not df.empty:
+                    all_data[ticker] = df
+                else:
+                    failed_count += 1
+            except Exception as e:
+                failed_count += 1
+                continue
+
+    if not all_data:
+        print(f"  ⚠️  No price data fetched (all {len(tickers)} tickers failed)")
+        return pd.DataFrame()
+
+    print(f"  ✅ Fetched data for {len(all_data)} tickers ({failed_count} failed)")
+
+    # Build result DataFrame with dates as index, tickers as columns
+    # Each cell contains a dict with OHLCV data
+    all_dates = set()
+    for df in all_data.values():
+        all_dates.update(df['date'].values)
+
+    all_dates = sorted(list(all_dates))
+    result = pd.DataFrame(index=all_dates, columns=list(all_data.keys()))
+
+    # Fill in the data
+    for ticker, df in all_data.items():
+        for _, row in df.iterrows():
+            date_str = row['date']
+            result.loc[date_str, ticker] = {
+                'Open': row['open'],
+                'High': row['high'],
+                'Low': row['low'],
+                'Close': row['close'],
+                'Volume': row['volume']
+            }
+
+    print(f"  📊 Result: {len(result)} dates × {len(result.columns)} tickers")
+
+    return result
 
 
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:

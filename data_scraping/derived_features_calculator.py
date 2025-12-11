@@ -349,7 +349,9 @@ class DerivedFeaturesCalculator:
 if __name__ == '__main__':
     # Example usage
     import sys
-    sys.path.append('/home/james/Desktop/Stock-Prediction')
+    import os
+    # Add parent directory to path for imports
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from utils.utils import pic_load
 
     # Load sample data

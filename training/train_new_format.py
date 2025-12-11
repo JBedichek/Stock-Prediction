@@ -22,9 +22,121 @@ import wandb
 import argparse
 from tqdm import tqdm
 import os
+import sys
 from datetime import datetime
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from utils.utils import set_nan_inf
+
+# Vectorized bin conversion for fast classification (no GPU-CPU sync)
+def convert_price_ratios_to_bins_vectorized(ratios: torch.Tensor, bin_edges: torch.Tensor) -> torch.Tensor:
+    """
+    Vectorized conversion of price ratios to bin indices (GPU-only, no CPU sync).
+
+    Args:
+        ratios: (batch_size, num_days) tensor of price ratios
+        bin_edges: (num_bins+1,) tensor with bin edges
+
+    Returns:
+        bin_indices: (batch_size, num_days) long tensor with bin indices
+    """
+    # Move bin_edges to same device as ratios
+    bin_edges = bin_edges.to(ratios.device)
+
+    # Use searchsorted to find bins (vectorized, GPU-only)
+    # ratios: (batch, days) -> flatten -> (batch*days,)
+    flat_ratios = ratios.reshape(-1)
+    flat_bins = torch.searchsorted(bin_edges, flat_ratios, right=False) - 1
+
+    # Clip to valid range [0, num_bins-1]
+    num_bins = len(bin_edges) - 1
+    flat_bins = torch.clamp(flat_bins, 0, num_bins - 1)
+
+    # Reshape back to (batch, days)
+    bin_indices = flat_bins.reshape(ratios.shape)
+
+    return bin_indices
+
+
+def compute_confidence_targets(pred_logits: torch.Tensor,
+                               bin_indices: torch.Tensor) -> torch.Tensor:
+    """
+    Compute confidence targets from per-sample cross-entropy loss.
+
+    Uses exponential mapping: confidence = exp(-CE_loss)
+    This provides dense signal (not sparse like accuracy) and naturally maps to [0, 1].
+
+    Low CE (good prediction) → high confidence (near 1.0)
+    High CE (bad prediction) → low confidence (near 0.0)
+
+    Args:
+        pred_logits: (batch, num_bins, num_pred_days) - model output logits
+        bin_indices: (batch, num_pred_days) - ground truth bin indices
+
+    Returns:
+        confidence_targets: (batch, num_pred_days) - values in [0, 1]
+    """
+    batch_size = pred_logits.shape[0]
+    num_pred_days = pred_logits.shape[2]
+
+    confidence_targets = torch.zeros(batch_size, num_pred_days, device=pred_logits.device)
+
+    for day_idx in range(num_pred_days):
+        targets = bin_indices[:, day_idx]  # (batch,)
+
+        # Compute per-sample cross-entropy loss (no reduction)
+        per_sample_ce = F.cross_entropy(
+            pred_logits[:, :, day_idx],
+            targets,
+            reduction='none'
+        )  # (batch,)
+
+        # Map to confidence: exp(-CE)
+        # When CE=0 (perfect), confidence=1.0
+        # When CE=large, confidence→0
+        confidence_targets[:, day_idx] = torch.exp(-per_sample_ce)
+
+    return confidence_targets  # (batch, num_pred_days) in [0, 1]
+
+
+def compute_expected_value(pred_logits: torch.Tensor, bin_edges: torch.Tensor) -> torch.Tensor:
+    """
+    Compute expected value (mean) of the predicted distribution.
+
+    Expected value = sum(probability * bin_center) for each bin.
+
+    This provides a point estimate from the distribution that can be compared
+    to the actual price ratio for regularization.
+
+    Args:
+        pred_logits: (batch, num_bins, num_pred_days) - model output logits
+        bin_edges: (num_bins+1,) - bin edges defining the bins
+
+    Returns:
+        expected_values: (batch, num_pred_days) - expected price ratio for each sample
+    """
+    # Move bin_edges to same device
+    bin_edges = bin_edges.to(pred_logits.device)
+
+    # Compute bin centers from edges
+    # bin_edges: [e0, e1, e2, ..., en] -> centers: [(e0+e1)/2, (e1+e2)/2, ..., (e(n-1)+en)/2]
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0  # (num_bins,)
+
+    # Convert logits to probabilities
+    probs = F.softmax(pred_logits, dim=1)  # (batch, num_bins, num_pred_days)
+
+    # Compute expected value for each day
+    # probs: (batch, num_bins, num_pred_days)
+    # bin_centers: (num_bins,) -> reshape to (1, num_bins, 1)
+    bin_centers = bin_centers.reshape(1, -1, 1)
+
+    # Expected value = sum over bins (prob * center)
+    expected_values = (probs * bin_centers).sum(dim=1)  # (batch, num_pred_days)
+
+    return expected_values
+
 
 # Auto-detect data loader based on file extension
 def get_data_module(dataset_path: str):
@@ -84,7 +196,7 @@ class SimpleTransformerPredictor(nn.Module):
         )
 
         # Positional encoding
-        self.pos_encoding = nn.Parameter(torch.randn(1, 2000, hidden_dim) * 0.02)
+        self.pos_encoding = nn.Parameter(torch.randn(1, 3000, hidden_dim) * 0.02)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -118,6 +230,15 @@ class SimpleTransformerPredictor(nn.Module):
                 nn.Linear(hidden_dim * 2, num_bins * num_pred_days)
             )
 
+        # Confidence head (predicts uncertainty for each horizon)
+        self.confidence_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_pred_days),
+            nn.Sigmoid()  # Output in [0, 1]
+        )
+
         print(f"\n📊 Model Architecture:")
         print(f"  Input dim: {input_dim}")
         print(f"  Hidden dim: {hidden_dim}")
@@ -126,6 +247,7 @@ class SimpleTransformerPredictor(nn.Module):
         print(f"  Pooling: mean")
         print(f"  Prediction mode: {pred_mode}")
         print(f"  Predicting {num_pred_days} future days")
+        print(f"  Confidence output: {num_pred_days} values [0, 1]")
         print(f"  Total parameters: {sum(p.numel() for p in self.parameters()):,}")
 
     def forward(self, x):
@@ -138,6 +260,7 @@ class SimpleTransformerPredictor(nn.Module):
         Returns:
             predictions: (batch, num_pred_days) for regression
                         or (batch, num_bins, num_pred_days) for classification
+            confidence: (batch, num_pred_days) confidence values in [0, 1]
         """
         batch_size, seq_len, _ = x.shape
 
@@ -163,12 +286,17 @@ class SimpleTransformerPredictor(nn.Module):
             # Reshape to (batch, num_bins, num_pred_days)
             pred = pred.reshape(batch_size, self.num_bins, self.num_pred_days)
 
-        return pred
+        # Confidence head
+        confidence = self.confidence_head(x)  # (batch, num_pred_days)
+
+        return pred, confidence
 
 
 def train_epoch(model, dataloader, optimizer, device, pred_mode='regression', convert_fn=None, scaler=None, use_amp=False,
-                test_loader=None, eval_every=1000, global_step=0, ema_loss=None, ema_alpha=0.98, bin_edges=None):
-    """Train for one epoch with optional mixed precision and step-based evaluation."""
+                val_loader=None, eval_every=1000, global_step=0, ema_loss=None, ema_alpha=0.98, bin_edges=None,
+                grad_accum_steps=1, best_val_loss=float('inf'), save_dir='./checkpoints', epoch=0, args=None,
+                confidence_weight=0.5, expected_value_weight=0.3):
+    """Train for one epoch with optional mixed precision, gradient accumulation, and step-based validation."""
     model.train()
     total_loss = 0
     num_batches = 0
@@ -176,6 +304,9 @@ def train_epoch(model, dataloader, optimizer, device, pred_mode='regression', co
     # Initialize EMA if not provided
     if ema_loss is None:
         ema_loss = 0.0
+
+    # Track accumulated batches
+    accum_iter = 0
 
     pbar = tqdm(dataloader, desc="Training")
     for features, prices, _, _ in pbar:
@@ -185,45 +316,72 @@ def train_epoch(model, dataloader, optimizer, device, pred_mode='regression', co
         # Mixed precision forward pass
         with autocast(enabled=use_amp):
             # Forward
-            pred = model(features)
+            pred, confidence = model(features)
 
             # Loss
             if pred_mode == 'regression':
                 loss = F.mse_loss(pred, prices)
+                main_loss = loss
+                confidence_loss = torch.tensor(0.0)
+                expected_value_loss = torch.tensor(0.0)
             else:
-                # Classification: convert prices to bins using adaptive binning
-                batch_size = prices.shape[0]
-                loss = 0
-                for day_idx in range(prices.shape[1]):
-                    targets = []
-                    for batch_idx in range(batch_size):
-                        ratio = prices[batch_idx, day_idx].item()
-                        # Pass bin_edges for adaptive binning
-                        target = convert_fn(ratio, num_bins=model.num_bins, bin_edges=bin_edges)
-                        targets.append(target)
-                    targets = torch.stack(targets).to(device)
+                # Classification: vectorized bin conversion (fast, GPU-only)
+                # prices: (batch, num_days), bin_edges: (num_bins+1,)
+                bin_indices = convert_price_ratios_to_bins_vectorized(prices, bin_edges)  # (batch, num_days)
 
-                    # Cross-entropy loss for this day
-                    loss += F.cross_entropy(pred[:, :, day_idx], targets)
+                # Main classification loss
+                main_loss = 0
+                for day_idx in range(prices.shape[1]):
+                    targets = bin_indices[:, day_idx]  # (batch,) long tensor
+                    main_loss += F.cross_entropy(pred[:, :, day_idx], targets)
+
+                # Confidence loss: train confidence to match exp(-CE)
+                with torch.no_grad():
+                    confidence_targets = compute_confidence_targets(pred, bin_indices)
+
+                confidence_loss = F.mse_loss(confidence, confidence_targets)
+
+                # Expected Value Regularization: penalize difference between
+                # expected value from distribution and actual price movement
+                expected_values = compute_expected_value(pred, bin_edges)  # (batch, num_pred_days)
+                expected_value_loss = F.mse_loss(expected_values, prices)
+
+                # Combined loss (using configurable weights)
+                loss = main_loss + confidence_weight * confidence_loss + expected_value_weight * expected_value_loss
+
+        # Store unscaled losses for logging
+        unscaled_loss = loss.item()
+        unscaled_main_loss = main_loss.item() if isinstance(main_loss, torch.Tensor) else main_loss
+        unscaled_confidence_loss = confidence_loss.item() if isinstance(confidence_loss, torch.Tensor) else confidence_loss
+        unscaled_expected_value_loss = expected_value_loss.item() if isinstance(expected_value_loss, torch.Tensor) else expected_value_loss
+
+        # Scale loss for gradient accumulation
+        loss = loss / grad_accum_steps
 
         # Backward with gradient scaling for mixed precision
-        optimizer.zero_grad()
-
         if use_amp and scaler is not None:
             # Mixed precision backward
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             # Standard backward
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
 
-        # Update EMA loss
-        batch_loss = loss.item()
+        # Only step optimizer every grad_accum_steps
+        accum_iter += 1
+        if accum_iter % grad_accum_steps == 0:
+            if use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            optimizer.zero_grad()
+
+        # Update EMA loss (use unscaled loss)
+        batch_loss = unscaled_loss
         if num_batches == 0:
             ema_loss = batch_loss
         else:
@@ -238,62 +396,100 @@ def train_epoch(model, dataloader, optimizer, device, pred_mode='regression', co
 
         # Log to wandb every step
         if wandb.run is not None:
-            wandb.log({
+            log_dict = {
                 'train/loss': batch_loss,
                 'train/ema_loss': ema_loss,
+                'train/main_loss': unscaled_main_loss,
+                'train/confidence_loss': unscaled_confidence_loss,
+                'train/expected_value_loss': unscaled_expected_value_loss,
                 'global_step': global_step
-            }, step=global_step)
+            }
 
-        # Evaluate on test set every eval_every steps
-        if test_loader is not None and global_step % eval_every == 0:
-            test_loss = validate(model, test_loader, device, pred_mode, convert_fn, use_amp, bin_edges)
+            # Add confidence statistics if in classification mode
+            if pred_mode == 'classification':
+                log_dict['train/mean_confidence'] = confidence.mean().item()
+                if 'confidence_targets' in locals():
+                    log_dict['train/mean_confidence_target'] = confidence_targets.mean().item()
+                if 'expected_values' in locals():
+                    log_dict['train/mean_expected_value'] = expected_values.mean().item()
+                    log_dict['train/mean_actual_value'] = prices.mean().item()
 
-            # Log test metrics to wandb
+            wandb.log(log_dict, step=global_step)
+
+        # Evaluate on validation set every eval_every steps
+        if val_loader is not None and global_step % eval_every == 0:
+            val_loss = validate(model, val_loader, device, pred_mode, convert_fn, use_amp, bin_edges, show_progress=False)
+
+            # Log validation metrics to wandb
             if wandb.run is not None:
                 wandb.log({
-                    'test/loss': test_loss,
+                    'val/loss_step': val_loss,
                     'global_step': global_step
                 }, step=global_step)
 
-            print(f"\n  📊 Step {global_step}: Test loss = {test_loss:.6f}")
+            print(f"\n  📊 Step {global_step}: Val loss = {val_loss:.6f}")
+
+            # Save checkpoint if validation improved
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_path = os.path.join(save_dir, 'best_model.pt')
+                checkpoint = {
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': val_loss,
+                    'train_ema_loss': ema_loss,
+                    'config': vars(args) if args is not None else {}
+                }
+                if scaler is not None:
+                    checkpoint['scaler_state_dict'] = scaler.state_dict()
+                torch.save(checkpoint, save_path)
+                print(f"  ✅ Saved best model (val_loss: {val_loss:.6f})")
 
             # Back to training mode
             model.train()
 
-    return total_loss / num_batches, global_step, ema_loss
+    return total_loss / num_batches, global_step, ema_loss, best_val_loss
 
 
 @torch.no_grad()
-def validate(model, dataloader, device, pred_mode='regression', convert_fn=None, use_amp=False, bin_edges=None):
+def validate(model, dataloader, device, pred_mode='regression', convert_fn=None, use_amp=False, bin_edges=None, show_progress=True):
     """Validate the model with optional mixed precision."""
     model.eval()
     total_loss = 0
     num_batches = 0
 
-    for features, prices, _, _ in tqdm(dataloader, desc="Validating"):
+    iterator = tqdm(dataloader, desc="Validating") if show_progress else dataloader
+    for features, prices, _, _ in iterator:
         features = features.to(device)
         prices = prices.to(device)
 
         # Mixed precision forward pass
         with autocast(enabled=use_amp):
             # Forward
-            pred = model(features)
+            pred, confidence = model(features)
 
             # Loss
             if pred_mode == 'regression':
                 loss = F.mse_loss(pred, prices)
             else:
-                batch_size = prices.shape[0]
-                loss = 0
+                # Classification: vectorized bin conversion (fast, GPU-only)
+                bin_indices = convert_price_ratios_to_bins_vectorized(prices, bin_edges)  # (batch, num_days)
+
+                # Main classification loss
+                main_loss = 0
                 for day_idx in range(prices.shape[1]):
-                    targets = []
-                    for batch_idx in range(batch_size):
-                        ratio = prices[batch_idx, day_idx].item()
-                        # Pass bin_edges for adaptive binning
-                        target = convert_fn(ratio, num_bins=model.num_bins, bin_edges=bin_edges)
-                        targets.append(target)
-                    targets = torch.stack(targets).to(device)
-                    loss += F.cross_entropy(pred[:, :, day_idx], targets)
+                    targets = bin_indices[:, day_idx]  # (batch,) long tensor
+                    main_loss += F.cross_entropy(pred[:, :, day_idx], targets)
+
+                # Confidence loss
+                confidence_targets = compute_confidence_targets(pred, bin_indices)
+                confidence_loss = F.mse_loss(confidence, confidence_targets)
+
+                # Combined loss
+                confidence_weight = 0.5  # Hyperparameter (should match training)
+                loss = main_loss + confidence_weight * confidence_loss
 
         total_loss += loss.item()
         num_batches += 1
@@ -305,19 +501,19 @@ def main():
     parser = argparse.ArgumentParser(description='Train stock predictor with new data format')
 
     # Data args
-    parser.add_argument('--data', type=str, default='all_complete_dataset.pkl',
+    parser.add_argument('--data', type=str, default='data/outliers_full_dataset.h5',
                        help='Path to dataset pickle file')
-    parser.add_argument('--seq-len', type=int, default=2000,
+    parser.add_argument('--seq-len', type=int, default=3000,
                        help='Sequence length (default: 60)')
-    parser.add_argument('--batch-size', type=int, default=2,
+    parser.add_argument('--batch-size', type=int, default=12,
                        help='Batch size (default: 32)')
-    parser.add_argument('--num-workers', type=int, default=4,
+    parser.add_argument('--num-workers', type=int, default=6,
                        help='Number of data workers (default: 4)')
 
     # Model args
-    parser.add_argument('--hidden-dim', type=int, default=2048,
+    parser.add_argument('--hidden-dim', type=int, default=1024,
                        help='Hidden dimension (default: 512)')
-    parser.add_argument('--num-layers', type=int, default=24,
+    parser.add_argument('--num-layers', type=int, default=10,
                        help='Number of transformer layers (default: 6)')
     parser.add_argument('--num-heads', type=int, default=16,
                        help='Number of attention heads (default: 8)')
@@ -327,22 +523,32 @@ def main():
                        choices=['regression', 'classification'],
                        help='Prediction mode (default: regression)')
 
+    # Loss weights
+    parser.add_argument('--confidence-weight', type=float, default=0.5,
+                       help='Weight for confidence loss (default: 0.5)')
+    parser.add_argument('--expected-value-weight', type=float, default=0.3,
+                       help='Weight for expected value regularization (default: 0.3)')
+
     # Training args
     parser.add_argument('--epochs', type=int, default=10,
                        help='Number of epochs (default: 100)')
-    parser.add_argument('--lr', type=float, default=1e-5,
+    parser.add_argument('--lr', type=float, default=4e-5,
                        help='Learning rate (default: 1e-4)')
-    parser.add_argument('--weight-decay', type=float, default=0.01,
+    parser.add_argument('--weight-decay', type=float, default=0.8,
                        help='Weight decay (default: 0.01)')
-    parser.add_argument('--optimizer', type=str, default='lion',
+    parser.add_argument('--optimizer', type=str, default='adamw',
                        choices=['adamw', 'lion'],
                        help='Optimizer (default: adamw)')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device (default: cuda)')
     parser.add_argument('--use-amp', action='store_true', default=True,
                        help='Use automatic mixed precision (fp16) training for 2x speedup and memory savings')
-    parser.add_argument('--compile', action='store_true', default=False,
+    parser.add_argument('--compile', action='store_true', default=True,
                        help='Use torch.compile with max-autotune for additional speedup (requires PyTorch 2.0+)')
+    parser.add_argument('--grad-accum-steps', type=int, default=1,
+                       help='Gradient accumulation steps (default: 1, use >1 for larger effective batch size)')
+    parser.add_argument('--resume-from-checkpoint', type=str, default=None,
+                       help='Path to checkpoint file to resume training from (default: None)')
 
     # Logging
     parser.add_argument('--use-wandb', action='store_true', default=True,
@@ -361,7 +567,9 @@ def main():
 
     # Initialize wandb
     if args.use_wandb:
-        wandb.init(project='stock-prediction', config=vars(args))
+        config = vars(args).copy()
+        config['effective_batch_size'] = args.batch_size * args.grad_accum_steps
+        wandb.init(project='stock-prediction', config=config)
 
     print("\n" + "="*80)
     print("STOCK PREDICTION TRAINING")
@@ -376,8 +584,8 @@ def main():
         num_workers=args.num_workers,
         seq_len=args.seq_len,
         pred_days=[1, 5, 10, 20],
-        val_max_size=5000,  # Limit validation to 5k sequences for faster eval
-        test_max_size=5000  # Limit test to 5k sequences
+        val_max_size=1000,  # Limit validation to 5k sequences for faster eval
+        test_max_size=1000  # Limit test to 5k sequences
     )
 
     # Create dataloaders
@@ -424,6 +632,14 @@ def main():
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Model size: ~{total_params * 4 / 1e6:.1f} MB (fp32)")
 
+    # Print loss configuration
+    if args.pred_mode == 'classification':
+        print(f"\n⚖️  Loss Configuration:")
+        print(f"  Main loss: Cross-Entropy (classification)")
+        print(f"  Confidence loss weight: {args.confidence_weight}")
+        print(f"  Expected value regularization weight: {args.expected_value_weight}")
+        print(f"  Total loss = CE + {args.confidence_weight}*conf_loss + {args.expected_value_weight}*ev_loss")
+
     # Compile model with torch.compile for speedup
     if args.compile:
         try:
@@ -453,34 +669,96 @@ def main():
         print(f"\n⚠️  Mixed precision requested but device is {args.device}, using FP32")
         args.use_amp = False
 
+    # Initialize training state
+    best_val_loss = float('inf')
+    global_step = 0
+    ema_loss = None
+    start_epoch = 0
+
+    # Resume from checkpoint if specified
+    if args.resume_from_checkpoint is not None:
+        if os.path.exists(args.resume_from_checkpoint):
+            print(f"\n📂 Loading checkpoint from: {args.resume_from_checkpoint}")
+            checkpoint = torch.load(args.resume_from_checkpoint, map_location=args.device)
+
+            # Load model state (strict=False allows new confidence head)
+            missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+            if missing_keys:
+                print(f"  ⚠️  Missing keys (will be randomly initialized): {missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''}")
+            if unexpected_keys:
+                print(f"  ⚠️  Unexpected keys in checkpoint: {unexpected_keys[:3]}{'...' if len(unexpected_keys) > 3 else ''}")
+
+            print(f"  ✅ Loaded model weights")
+
+            # Only load optimizer if architecture matches (no missing keys)
+            if not missing_keys:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"  ✅ Loaded optimizer state")
+
+                # Load scaler state if available
+                if scaler is not None and 'scaler_state_dict' in checkpoint:
+                    scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                    print(f"  ✅ Loaded gradient scaler state")
+            else:
+                print(f"  ℹ️  Skipping optimizer/scaler state (architecture changed)")
+
+            # Load training state
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch']
+                print(f"  ✅ Resuming from epoch {start_epoch}")
+
+            if 'global_step' in checkpoint:
+                global_step = checkpoint['global_step']
+                print(f"  ✅ Resuming from global step {global_step}")
+
+            if 'val_loss' in checkpoint:
+                best_val_loss = checkpoint['val_loss']
+                print(f"  ✅ Best val loss: {best_val_loss:.6f}")
+
+            if 'train_ema_loss' in checkpoint:
+                ema_loss = checkpoint['train_ema_loss']
+                print(f"  ✅ Train EMA loss: {ema_loss:.6f}")
+
+            print(f"\n  🎯 Checkpoint loaded successfully!")
+        else:
+            print(f"\n⚠️  WARNING: Checkpoint file not found: {args.resume_from_checkpoint}")
+            print(f"  Starting training from scratch...")
+
+    # Calculate effective batch size
+    effective_batch_size = args.batch_size * args.grad_accum_steps
+
     print(f"\n🚀 Starting training...")
-    print(f"  Epochs: {args.epochs}")
+    print(f"  Epochs: {args.epochs} (starting from epoch {start_epoch + 1})")
     print(f"  Optimizer: {args.optimizer}")
     print(f"  Learning rate: {args.lr}")
     print(f"  Weight decay: {args.weight_decay}")
     print(f"  Device: {args.device}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Gradient accumulation steps: {args.grad_accum_steps}")
+    print(f"  Effective batch size: {effective_batch_size} ({args.batch_size} × {args.grad_accum_steps})")
     print(f"  Mixed precision (FP16): {'✅ Enabled' if args.use_amp else '❌ Disabled'}")
     print(f"  torch.compile: {'✅ Enabled (max-autotune)' if args.compile else '❌ Disabled'}")
     print(f"  Eval every: {args.eval_every} steps")
     print(f"  EMA alpha: {args.ema_alpha}")
+    if args.resume_from_checkpoint:
+        print(f"  Resumed from: {args.resume_from_checkpoint}")
 
-    best_val_loss = float('inf')
-    global_step = 0
-    ema_loss = None
-
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\n{'='*80}")
         print(f"Epoch {epoch + 1}/{args.epochs}")
         print(f"{'='*80}")
 
         # Train
-        train_loss, global_step, ema_loss = train_epoch(
+        train_loss, global_step, ema_loss, best_val_loss = train_epoch(
             model, train_loader, optimizer, args.device,
             args.pred_mode, convert_price_ratio_to_one_hot,
             scaler=scaler, use_amp=args.use_amp,
-            test_loader=test_loader, eval_every=args.eval_every,
+            val_loader=val_loader, eval_every=args.eval_every,
             global_step=global_step, ema_loss=ema_loss, ema_alpha=args.ema_alpha,
-            bin_edges=bin_edges
+            bin_edges=bin_edges, grad_accum_steps=args.grad_accum_steps,
+            best_val_loss=best_val_loss, save_dir=args.save_dir, epoch=epoch + 1, args=args,
+            confidence_weight=args.confidence_weight, expected_value_weight=args.expected_value_weight
         )
 
         # Validate
@@ -507,7 +785,7 @@ def main():
                 'global_step': global_step
             }, step=global_step)
 
-        # Save best model
+        # Save best model (overwrites previous best)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_path = os.path.join(args.save_dir, 'best_model.pt')
@@ -524,23 +802,6 @@ def main():
                 checkpoint['scaler_state_dict'] = scaler.state_dict()
             torch.save(checkpoint, save_path)
             print(f"  ✅ Saved best model (val_loss: {val_loss:.6f})")
-
-        # Save checkpoint
-        if (epoch + 1) % 10 == 0:
-            save_path = os.path.join(args.save_dir, f'checkpoint_epoch_{epoch + 1}.pt')
-            checkpoint = {
-                'epoch': epoch + 1,
-                'global_step': global_step,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'train_ema_loss': ema_loss,
-                'config': vars(args)
-            }
-            if scaler is not None:
-                checkpoint['scaler_state_dict'] = scaler.state_dict()
-            torch.save(checkpoint, save_path)
-            print(f"  💾 Saved checkpoint")
 
     print(f"\n{'='*80}")
     print("✅ TRAINING COMPLETE!")

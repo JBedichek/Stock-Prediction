@@ -1,6 +1,17 @@
 # Data files - too large for GitHub
 *.pkl
 *.pickle
+*.h5
+*.hdf5
+
+# Data and output directories
+data/
+output/
+
+# Prediction output files
+daily_predictions/*.pt
+daily_predictions/*.txt
+*.txt
 
 # Python cache
 __pycache__/

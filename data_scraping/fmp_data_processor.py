@@ -26,8 +26,10 @@ import torch
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple
 import sys
+import os
 
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.utils import pic_load, save_pickle
 
 

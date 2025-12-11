@@ -20,7 +20,8 @@ from gnews import GNews
 import warnings
 warnings.filterwarnings('ignore')
 
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.utils import save_pickle, pic_load
 
 

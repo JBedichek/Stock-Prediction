@@ -1,10 +1,10 @@
 import torch
-from .models import *
+from ..training.models import *
 import datetime
 import random
 import pickle
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from .contrastive_pretraining import gauss_normalize, prepare_ae_data
+from ..training.contrastive_pretraining import gauss_normalize, prepare_ae_data
 from tqdm import tqdm
 import os
 import wandb

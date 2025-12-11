@@ -15,6 +15,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import random
 from tqdm import tqdm
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.utils import pic_load
 

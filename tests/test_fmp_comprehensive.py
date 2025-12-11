@@ -5,7 +5,8 @@ This tests the FMP API connection and scrapes a small dataset to verify everythi
 """
 
 import sys
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from data_scraping.fmp_comprehensive_scraper import FMPComprehensiveScraper, scrape_dataset
 from data_scraping.fmp_data_processor import FMPDataProcessor, process_comprehensive_data

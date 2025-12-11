@@ -19,9 +19,11 @@ import numpy as np
 from datetime import datetime, timedelta, date as dt_date
 from typing import Dict, List, Optional, Tuple
 import sys
+import os
 from tqdm import tqdm
 
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.utils import save_pickle, pic_load
 
 
@@ -600,6 +602,35 @@ def create_news_embeddings(news_data_file: str,
     print(f"{'='*80}\n")
 
     return daily_embeddings
+
+
+def fetch_date_range_news(date_range: List[dt_date]) -> Dict[dt_date, torch.Tensor]:
+    """
+    Fetch and embed news for a range of dates.
+
+    NOTE: This is a stub implementation that returns zero embeddings.
+    Full implementation would require:
+    1. Fetching news articles from API (AlphaVantage, GNews, etc.)
+    2. Embedding them with Nomic model
+    3. Aggregating per day
+
+    For now, we return zero-filled embeddings to avoid blocking dataset updates.
+
+    Args:
+        date_range: List of dates to fetch news for
+
+    Returns:
+        Dict mapping dates to news embedding tensors (768-dim)
+    """
+    print(f"  ⚠️  News fetching not yet implemented")
+    print(f"     Using zero embeddings (news features will be neutral)")
+
+    # Return zero embeddings for each date (768 dimensions)
+    news_by_date = {}
+    for date in date_range:
+        news_by_date[date] = torch.zeros(768, dtype=torch.float32)
+
+    return news_by_date
 
 
 if __name__ == '__main__':

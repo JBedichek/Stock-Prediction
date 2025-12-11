@@ -7,7 +7,8 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import sys
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Your API key
 API_KEY = "YOUR_FMP_API_KEY_HERE"

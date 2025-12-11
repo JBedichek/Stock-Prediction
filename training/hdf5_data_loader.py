@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import random
 from tqdm import tqdm
+import os
+import hashlib
 
 
 class HDF5StockDataset(Dataset):
@@ -102,37 +104,147 @@ class HDF5StockDataset(Dataset):
         print(f"\n  📦 Building sequence index...")
         self.sequences = self._build_sequence_index()
 
-        # Train/val/test split
-        random.seed(seed)
-        random.shuffle(self.sequences)
+        # ============================================================================
+        # TEMPORAL SPLIT (prevents future leakage)
+        # ============================================================================
+        # Check if temporal split is cached
+        cache_path = self._get_cache_path(dataset_path, seq_len, min_future_days, train_ratio, val_ratio)
 
-        train_idx = int(len(self.sequences) * train_ratio)
+        if os.path.exists(cache_path):
+            print(f"\n  💾 Loading cached temporal split from: {cache_path}")
+            with h5py.File(cache_path, 'r') as cache_f:
+                # Load sorted dates
+                sorted_dates = [d.decode('utf-8') for d in cache_f['sorted_dates'][:]]
 
-        # Calculate val size (either from ratio or max_size)
+                # Load sequences_by_date
+                sequences_by_date = {}
+                for date in sorted_dates:
+                    # Store as tuples of (ticker_bytes, end_idx)
+                    date_group = cache_f['sequences_by_date'][date]
+                    tickers_bytes = date_group['tickers'][:]
+                    end_indices = date_group['end_indices'][:]
+                    sequences_by_date[date] = [(t.decode('utf-8'), int(idx))
+                                               for t, idx in zip(tickers_bytes, end_indices)]
+
+            print(f"  ✅ Loaded {len(sorted_dates)} dates from cache")
+        else:
+            print(f"\n  📅 Grouping sequences by date for temporal split...")
+            print(f"  ⚠️  This will take a few minutes (only computed once)...")
+            sequences_by_date = {}
+            for ticker, end_idx in tqdm(self.sequences, desc="  Grouping"):
+                group = self.h5f[ticker]
+                date = group['dates'][end_idx - 1].decode('utf-8')
+                if date not in sequences_by_date:
+                    sequences_by_date[date] = []
+                sequences_by_date[date].append((ticker, end_idx))
+
+            # Sort dates chronologically (CRITICAL for preventing leakage)
+            sorted_dates = sorted(sequences_by_date.keys())
+            print(f"  ✅ Found {len(sorted_dates)} unique dates")
+
+            # Save to cache
+            print(f"\n  💾 Saving temporal split to cache: {cache_path}")
+            with h5py.File(cache_path, 'w') as cache_f:
+                # Save sorted dates
+                sorted_dates_bytes = np.array([d.encode('utf-8') for d in sorted_dates])
+                cache_f.create_dataset('sorted_dates', data=sorted_dates_bytes, compression='gzip')
+
+                # Save sequences_by_date
+                seq_group = cache_f.create_group('sequences_by_date')
+                for date, sequences in tqdm(sequences_by_date.items(), desc="  Saving"):
+                    date_group = seq_group.create_group(date)
+                    tickers = [ticker.encode('utf-8') for ticker, _ in sequences]
+                    end_indices = [end_idx for _, end_idx in sequences]
+                    date_group.create_dataset('tickers', data=np.array(tickers), compression='gzip')
+                    date_group.create_dataset('end_indices', data=np.array(end_indices, dtype=np.int32), compression='gzip')
+
+            print(f"  ✅ Cache saved successfully!")
+
+        print(f"  📊 Date range: {sorted_dates[0]} to {sorted_dates[-1]}")
+
+        # Split dates temporally (not sequences!)
+        train_date_idx = int(len(sorted_dates) * train_ratio)
+
+        # Calculate val size
         if val_max_size is not None:
-            val_size = min(val_max_size, int(len(self.sequences) * val_ratio))
-            val_idx = train_idx + val_size
+            # Estimate dates needed for val_max_size sequences
+            avg_seqs_per_date = len(self.sequences) / len(sorted_dates)
+            val_size_dates = int(val_max_size / avg_seqs_per_date) + 1
+            val_size_dates = min(val_size_dates, int(len(sorted_dates) * val_ratio))
+            val_date_idx = train_date_idx + val_size_dates
         else:
-            val_idx = int(len(self.sequences) * (train_ratio + val_ratio))
+            val_date_idx = int(len(sorted_dates) * (train_ratio + val_ratio))
 
-        # Calculate test size (either from max_size or remaining)
+        # Calculate test size
         if test_max_size is not None:
-            test_size = min(test_max_size, len(self.sequences) - val_idx)
-            test_end_idx = val_idx + test_size
+            # Estimate dates needed for test_max_size sequences
+            avg_seqs_per_date = len(self.sequences) / len(sorted_dates)
+            test_size_dates = int(test_max_size / avg_seqs_per_date) + 1
+            test_size_dates = min(test_size_dates, len(sorted_dates) - val_date_idx)
+            test_date_end_idx = val_date_idx + test_size_dates
         else:
-            test_end_idx = len(self.sequences)
+            test_date_end_idx = len(sorted_dates)
 
+        # Extract date ranges for each split
+        train_dates = sorted_dates[:train_date_idx]
+        val_dates = sorted_dates[train_date_idx:val_date_idx]
+        test_dates = sorted_dates[val_date_idx:test_date_end_idx]
+
+        # Collect sequences from appropriate date range
         if split == 'train':
-            self.sequences = self.sequences[:train_idx]
+            self.sequences = [seq for date in train_dates
+                              for seq in sequences_by_date[date]]
+            date_range_str = f"{train_dates[0]} to {train_dates[-1]}"
         elif split == 'val':
-            self.sequences = self.sequences[train_idx:val_idx]
+            self.sequences = [seq for date in val_dates
+                              for seq in sequences_by_date[date]]
+            date_range_str = f"{val_dates[0]} to {val_dates[-1]}"
         elif split == 'test':
-            self.sequences = self.sequences[val_idx:test_end_idx]
+            self.sequences = [seq for date in test_dates
+                              for seq in sequences_by_date[date]]
+            date_range_str = f"{test_dates[0]} to {test_dates[-1]}"
         else:
             raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'")
 
-        print(f"\n  ✅ {split.upper()} split: {len(self.sequences)} sequences")
+        # NOW it's safe to shuffle (only within temporal range - doesn't break ordering)
+        random.seed(seed)
+        random.shuffle(self.sequences)
+
+        # Verify temporal split
+        print(f"\n  🔍 TEMPORAL SPLIT VERIFICATION:")
+        print(f"    Train dates: {train_dates[0]} to {train_dates[-1]} ({len(train_dates)} dates)")
+        print(f"    Val dates:   {val_dates[0]} to {val_dates[-1]} ({len(val_dates)} dates)")
+        print(f"    Test dates:  {test_dates[0]} to {test_dates[-1]} ({len(test_dates)} dates)")
+
+        # Critical check: ensure no temporal overlap
+        if train_dates[-1] >= val_dates[0]:
+            raise ValueError(f"❌ TEMPORAL LEAKAGE DETECTED: Train overlaps with val!")
+        if val_dates[-1] >= test_dates[0]:
+            raise ValueError(f"❌ TEMPORAL LEAKAGE DETECTED: Val overlaps with test!")
+
+        print(f"    ✅ VERIFIED: max(train) < min(val) < min(test)")
+        print(f"    ✅ NO TEMPORAL LEAKAGE\n")
+
+        print(f"  ✅ {split.upper()} split: {len(self.sequences)} sequences")
+        print(f"    Date range: {date_range_str}")
         print(f"{'='*80}\n")
+
+    def _get_cache_path(self, dataset_path: str, seq_len: int, min_future_days: int,
+                        train_ratio: float, val_ratio: float) -> str:
+        """
+        Generate cache file path based on dataset and parameters.
+
+        Returns path like: 'all_complete_dataset_temporal_split_abc123.h5'
+        """
+        # Create hash of parameters to detect changes
+        param_str = f"{seq_len}_{min_future_days}_{train_ratio}_{val_ratio}"
+        param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
+
+        # Generate cache filename
+        dataset_base = os.path.splitext(dataset_path)[0]
+        cache_path = f"{dataset_base}_temporal_split_{param_hash}.h5"
+
+        return cache_path
 
     def _build_sequence_index(self):
         """

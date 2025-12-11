@@ -18,7 +18,8 @@ Final output: Daily feature tensors with 1000-1200+ features per stock
 """
 
 import sys
-sys.path.append('/home/james/Desktop/Stock-Prediction')
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from data_scraping.market_indices_scraper import scrape_market_data
 from data_scraping.fmp_comprehensive_scraper import scrape_dataset
