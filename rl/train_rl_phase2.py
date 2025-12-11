@@ -498,8 +498,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train RL trading agent (Phase 2)')
 
     # Data
-    parser.add_argument('--dataset-path', type=str, required=True, help='Path to dataset (HDF5 or pickle)')
-    parser.add_argument('--prices-path', type=str, help='Path to prices HDF5 (if features are normalized)')
+    parser.add_argument('--dataset-path', type=str, default="data/all_complete_dataset.h5", help='Path to dataset (HDF5 or pickle)')
+    parser.add_argument('--prices-path', type=str, default="data/actual_prices.h5", help='Path to prices HDF5 (if features are normalized)')
     parser.add_argument('--num-test-stocks', type=int, default=1000, help='Number of test stocks')
     parser.add_argument('--predictor-checkpoint', type=str, required=True, help='Path to predictor checkpoint')
 
@@ -539,7 +539,7 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, default='./rl_checkpoints_phase2', help='Checkpoint directory')
 
     # W&B
-    parser.add_argument('--use-wandb', action='store_true', help='Use Weights & Biases logging')
+    parser.add_argument('--use-wandb', action='store_true', default=True, help='Use Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='rl-trading-phase2', help='W&B project name')
     parser.add_argument('--run-name', type=str, default=None, help='W&B run name')
 
