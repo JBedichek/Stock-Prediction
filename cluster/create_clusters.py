@@ -585,7 +585,7 @@ def main():
 
     # Encoding
     parser.add_argument('--max-stocks', type=int, default=100000, help='Max stocks to encode')
-    parser.add_argument('--samples-per-stock', type=int, default=10, help='Number of random timesteps to sample per stock')
+    parser.add_argument('--samples-per-stock', type=int, default=100, help='Number of random timesteps to sample per stock')
     parser.add_argument('--batch-size', type=int, default=256, help='Batch size for encoding')
 
     # Clustering
@@ -597,7 +597,7 @@ def main():
 
     # Output
     parser.add_argument('--output-dir', type=str, default='./cluster_results', help='Output directory')
-    parser.add_argument('--visualize', action='store_true', default=True, help='Create visualization')
+    parser.add_argument('--visualize', action='store_true', default=False, help='Create visualization')
 
     # System
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')

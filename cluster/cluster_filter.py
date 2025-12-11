@@ -280,8 +280,8 @@ def main():
     parser = argparse.ArgumentParser(description='Filter stocks using clusters')
 
     # Required
-    parser.add_argument('--cluster-dir', type=str, required=True, help='Directory with cluster results')
-    parser.add_argument('--best-clusters-file', type=str, required=True, help='File with best cluster IDs')
+    parser.add_argument('--cluster-dir', type=str, default="./cluster_results", help='Directory with cluster results')
+    parser.add_argument('--best-clusters-file', type=str, default="./cluster_results/best_clusters_1d.txt", help='File with best cluster IDs')
 
     # Optional: Filter ticker list
     parser.add_argument('--input-tickers', type=str, help='Input ticker list to filter')

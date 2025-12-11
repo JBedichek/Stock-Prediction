@@ -421,9 +421,9 @@ def analyze_cluster_performance(cluster_dir: str, dataset_path: str, prices_path
         best_clusters = analyzer.identify_best_clusters(
             cluster_stats,
             horizon=horizon,
-            min_return=0.005,  # 0.5% min return
-            min_win_rate=0.52,  # 52% win rate
-            min_sharpe=0.1,
+            min_return=0.01,  # 0.5% min return
+            min_win_rate=0.4,  # 52% win rate
+            min_sharpe=0.0005,
             top_k=20  # Top 20 clusters
         )
         results['best_clusters'][horizon] = best_clusters
@@ -477,8 +477,8 @@ def main():
 
     # Filtering
     parser.add_argument('--min-return', type=float, default=0.005, help='Min mean return for best clusters')
-    parser.add_argument('--min-win-rate', type=float, default=0.52, help='Min win rate for best clusters')
-    parser.add_argument('--min-sharpe', type=float, default=0.1, help='Min Sharpe for best clusters')
+    parser.add_argument('--min-win-rate', type=float, default=0.4, help='Min win rate for best clusters')
+    parser.add_argument('--min-sharpe', type=float, default=0.05, help='Min Sharpe for best clusters')
     parser.add_argument('--top-k', type=int, default=5, help='Top K clusters to select')
 
     args = parser.parse_args()

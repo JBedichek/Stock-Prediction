@@ -72,6 +72,7 @@ class EmbeddingCacheBuilder:
 
         self.model.eval()
         self.model.to(device)
+        self.model = torch.compile(self.model, mode='max-autotune')
         print(f"  ✅ Model loaded")
 
     def encode_batch(self, features_batch: List[torch.Tensor]) -> np.ndarray:

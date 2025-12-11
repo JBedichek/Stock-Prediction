@@ -1145,6 +1145,7 @@ class TradingSimulator:
             new_capital, trade_info = self.simulate_trade(date, capital, debug=debug)
 
             if trade_info.get('skipped'):
+                print(f"Skipping {date}")
                 continue
 
             trade_num += 1

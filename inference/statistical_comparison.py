@@ -800,17 +800,17 @@ def main():
     # Comparison args
     parser.add_argument('--num-trials', type=int, default=30,
                        help='Number of independent trials')
-    parser.add_argument('--num-random-per-trial', type=int, default=100,
+    parser.add_argument('--num-random-per-trial', type=int, default=50,
                        help='Number of random portfolios per trial')
-    parser.add_argument('--subset-size', type=int, default=200,
+    parser.add_argument('--subset-size', type=int, default=512,
                        help='Size of random stock subset per trial')
     parser.add_argument('--top-k', type=int, default=5,
                        help='Number of stocks to select')
     parser.add_argument('--horizon-idx', type=int, default=0,
                        help='Prediction horizon (0=1d, 1=5d, 2=10d, 3=20d)')
-    parser.add_argument('--confidence-percentile', type=float, default=0.8,
+    parser.add_argument('--confidence-percentile', type=float, default=0.05,
                        help='Confidence percentile for filtering (default: 0.8 = keep top 20%%)')
-    parser.add_argument('--test-months', type=int, default=2,
+    parser.add_argument('--test-months', type=int, default=3,
                        help='Test period length in months')
     parser.add_argument('--initial-capital', type=float, default=100000.0,
                        help='Starting capital')
