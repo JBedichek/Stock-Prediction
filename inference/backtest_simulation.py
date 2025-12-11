@@ -1544,6 +1544,8 @@ def main():
                        help='Directory with cluster results (enables cluster filtering)')
     parser.add_argument('--best-clusters-file', type=str, default="./cluster_results/best_clusters_1d.txt",
                        help='File with best cluster IDs (required if --cluster-dir is set)')
+    parser.add_argument('--cluster-batch-size', type=int, default=32,
+                       help='Batch size for cluster encoding (default: 32, reduce if OOM)')
 
     # Other args
     parser.add_argument('--initial-capital', type=float, default=100000.0,
@@ -1606,8 +1608,10 @@ def main():
             model_path=args.model if args.ensemble_models is None else args.ensemble_models[0],
             cluster_dir=args.cluster_dir,
             best_clusters_file=args.best_clusters_file,
-            device=args.device
+            device=args.device,
+            batch_size=args.cluster_batch_size
         )
+        print(f"  ℹ️  Cluster encoding batch size: {args.cluster_batch_size} (use --cluster-batch-size to adjust)")
 
     # Get trading period
     trading_dates = data_loader.get_trading_period(num_months=args.test_months)

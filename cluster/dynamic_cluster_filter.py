@@ -51,7 +51,8 @@ class DynamicClusterFilter:
                  cluster_dir: str,
                  best_cluster_ids: Optional[List[int]] = None,
                  best_clusters_file: Optional[str] = None,
-                 device: str = 'cuda'):
+                 device: str = 'cuda',
+                 batch_size: int = 32):
         """
         Initialize dynamic cluster filter.
 
@@ -61,8 +62,10 @@ class DynamicClusterFilter:
             best_cluster_ids: List of good cluster IDs
             best_clusters_file: File with good cluster IDs (alternative to list)
             device: Device for encoding
+            batch_size: Batch size for encoding (default: 32)
         """
         self.device = device
+        self.batch_size = batch_size
 
         print(f"\n{'='*80}")
         print("INITIALIZING DYNAMIC CLUSTER FILTER")
@@ -151,12 +154,13 @@ class DynamicClusterFilter:
 
         return cluster_ids
 
-    def encode_features(self, features_dict: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+    def encode_features(self, features_dict: Dict[str, torch.Tensor], batch_size: int = 32) -> Dict[str, np.ndarray]:
         """
-        Encode a batch of stocks using transformer mean pooling.
+        Encode stocks using transformer mean pooling (batched for memory efficiency).
 
         Args:
             features_dict: {ticker: features_tensor} where features is (seq_len, feature_dim) or (feature_dim,)
+            batch_size: Batch size for encoding (default: 32)
 
         Returns:
             {ticker: embedding} dictionary
@@ -164,12 +168,11 @@ class DynamicClusterFilter:
         if len(features_dict) == 0:
             return {}
 
-        # Prepare batch - handle variable feature dimensions
+        # First pass: find max feature dimension and prepare data
         tickers = []
         features_list = []
         max_feature_dim = 0
 
-        # First pass: find max feature dimension
         for ticker, features in features_dict.items():
             # Ensure features is a tensor
             if not isinstance(features, torch.Tensor):
@@ -182,83 +185,88 @@ class DynamicClusterFilter:
                 feature_dim = features.shape[-1]
 
             max_feature_dim = max(max_feature_dim, feature_dim)
-
-        # Second pass: pad to consistent dimension
-        for ticker, features in features_dict.items():
-            # Ensure features is a tensor
-            if not isinstance(features, torch.Tensor):
-                features = torch.tensor(features, dtype=torch.float32)
-
-            # Pad if needed
-            if len(features.shape) == 1:
-                current_dim = features.shape[0]
-                if current_dim < max_feature_dim:
-                    padding = torch.zeros(max_feature_dim - current_dim, dtype=torch.float32)
-                    features = torch.cat([features, padding])
-                elif current_dim > max_feature_dim:
-                    features = features[:max_feature_dim]
-            else:
-                current_dim = features.shape[-1]
-                if current_dim < max_feature_dim:
-                    padding_shape = list(features.shape)
-                    padding_shape[-1] = max_feature_dim - current_dim
-                    padding = torch.zeros(padding_shape, dtype=torch.float32)
-                    features = torch.cat([features, padding], dim=-1)
-                elif current_dim > max_feature_dim:
-                    features = features[..., :max_feature_dim]
-
             tickers.append(ticker)
             features_list.append(features)
 
-        # Stack and prepare for model
-        batch_tensor = torch.stack(features_list).to(self.device)  # (batch, feature_dim) or (batch, seq_len, feature_dim)
+        # Process in batches to avoid OOM
+        all_embeddings = {}
 
-        # Handle dimension adjustment if needed
-        model_input_dim = self.model.input_dim
+        for i in range(0, len(tickers), batch_size):
+            batch_tickers = tickers[i:i+batch_size]
+            batch_features = features_list[i:i+batch_size]
 
-        if len(batch_tensor.shape) == 2:
-            # (batch, feature_dim) - need to add sequence dimension
-            current_feature_dim = batch_tensor.shape[1]
+            # Pad batch to consistent dimension
+            padded_batch = []
+            for features in batch_features:
+                # Pad if needed
+                if len(features.shape) == 1:
+                    current_dim = features.shape[0]
+                    if current_dim < max_feature_dim:
+                        padding = torch.zeros(max_feature_dim - current_dim, dtype=torch.float32)
+                        features = torch.cat([features, padding])
+                    elif current_dim > max_feature_dim:
+                        features = features[:max_feature_dim]
+                else:
+                    current_dim = features.shape[-1]
+                    if current_dim < max_feature_dim:
+                        padding_shape = list(features.shape)
+                        padding_shape[-1] = max_feature_dim - current_dim
+                        padding = torch.zeros(padding_shape, dtype=torch.float32)
+                        features = torch.cat([features, padding], dim=-1)
+                    elif current_dim > max_feature_dim:
+                        features = features[..., :max_feature_dim]
 
-            # Pad/truncate to match model input_dim
-            if current_feature_dim < model_input_dim:
-                padding = torch.zeros(batch_tensor.shape[0], model_input_dim - current_feature_dim, device=self.device)
-                batch_tensor = torch.cat([batch_tensor, padding], dim=1)
-            elif current_feature_dim > model_input_dim:
-                batch_tensor = batch_tensor[:, :model_input_dim]
+                padded_batch.append(features)
 
-            # Add sequence dimension
-            seq_len = 2000  # Match model's seq_len
-            batch_tensor = batch_tensor.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, feature_dim)
+            # Stack and prepare for model
+            batch_tensor = torch.stack(padded_batch).to(self.device)
 
-        # Extract transformer embeddings using forward hook
-        with torch.no_grad():
-            activation = {}
-            def get_activation(name):
-                def hook(model, input, output):
-                    activation[name] = output
-                return hook
+            # Handle dimension adjustment if needed
+            model_input_dim = self.model.input_dim
 
-            # Register hook
-            handle = self.model.transformer.register_forward_hook(get_activation('transformer'))
+            if len(batch_tensor.shape) == 2:
+                # (batch, feature_dim) - need to add sequence dimension
+                current_feature_dim = batch_tensor.shape[1]
 
-            # Forward pass
-            _ = self.model(batch_tensor)
+                # Pad/truncate to match model input_dim
+                if current_feature_dim < model_input_dim:
+                    padding = torch.zeros(batch_tensor.shape[0], model_input_dim - current_feature_dim, device=self.device)
+                    batch_tensor = torch.cat([batch_tensor, padding], dim=1)
+                elif current_feature_dim > model_input_dim:
+                    batch_tensor = batch_tensor[:, :model_input_dim]
 
-            # Remove hook
-            handle.remove()
+                # Add sequence dimension
+                seq_len = 2000  # Match model's seq_len
+                batch_tensor = batch_tensor.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, feature_dim)
 
-            # Mean pool transformer output
-            transformer_out = activation['transformer']  # (batch, seq_len, hidden_dim)
-            embeddings = transformer_out.mean(dim=1)  # (batch, hidden_dim)
+            # Extract transformer embeddings using forward hook
+            with torch.no_grad():
+                activation = {}
+                def get_activation(name):
+                    def hook(model, input, output):
+                        activation[name] = output
+                    return hook
 
-        # Convert to numpy
-        embeddings_np = embeddings.cpu().numpy()
+                # Register hook
+                handle = self.model.transformer.register_forward_hook(get_activation('transformer'))
 
-        # Create dictionary
-        embeddings_dict = {ticker: emb for ticker, emb in zip(tickers, embeddings_np)}
+                # Forward pass
+                _ = self.model(batch_tensor)
 
-        return embeddings_dict
+                # Remove hook
+                handle.remove()
+
+                # Mean pool transformer output
+                transformer_out = activation['transformer']  # (batch, seq_len, hidden_dim)
+                embeddings = transformer_out.mean(dim=1)  # (batch, hidden_dim)
+
+            # Convert to numpy and store
+            embeddings_np = embeddings.cpu().numpy()
+
+            for ticker, emb in zip(batch_tickers, embeddings_np):
+                all_embeddings[ticker] = emb
+
+        return all_embeddings
 
     def assign_to_clusters(self, embeddings_dict: Dict[str, np.ndarray]) -> Dict[str, int]:
         """
@@ -307,8 +315,8 @@ class DynamicClusterFilter:
         Returns:
             List of tickers in good clusters (or tuple if return_assignments=True)
         """
-        # Step 1: Encode all stocks
-        embeddings = self.encode_features(features_dict)
+        # Step 1: Encode all stocks (batched for memory efficiency)
+        embeddings = self.encode_features(features_dict, batch_size=self.batch_size)
 
         # Step 2: Assign to clusters
         assignments = self.assign_to_clusters(embeddings)
