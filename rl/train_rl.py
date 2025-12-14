@@ -131,6 +131,7 @@ class Phase1TrainingLoop:
         self.global_step = 0
         self.epsilon = config['epsilon_start']
         self.episode_rewards = []
+        self.episode_stats = []  # Track episode statistics (returns, etc.)
         self.best_avg_reward = -float('inf')
 
         # Phase 1 specific: Track positions for auto-sell
@@ -155,7 +156,7 @@ class Phase1TrainingLoop:
         )
         print(f"✅ Data loaded:")
         print(f"   Stocks: {len(data_loader.test_tickers)}")
-        print(f"   Dates: {len(data_loader.test_dates)}")
+        print(f"   Dates: {len(data_loader.all_dates)}")
         return data_loader
 
     def train(self):
@@ -166,7 +167,17 @@ class Phase1TrainingLoop:
 
         for episode in range(self.config['num_episodes']):
             episode_reward = self._run_episode(episode)
+            episode_stats = self.env.get_episode_stats()
+
             self.episode_rewards.append(episode_reward)
+            self.episode_stats.append(episode_stats)
+
+            # Print immediate feedback after each episode
+            final_value = episode_stats.get('final_value', self.config['initial_capital'])
+            profit = final_value - self.config['initial_capital']
+            return_pct = episode_stats.get('total_return', 0.0) * 100
+
+            print(f"Episode {episode + 1}: Return={return_pct:+.2f}% | Profit=${profit:+,.0f} | Final=${final_value:,.0f} | ε={self.epsilon:.3f}")
 
             # Logging
             if (episode + 1) % self.config['log_frequency'] == 0:
@@ -390,21 +401,39 @@ class Phase1TrainingLoop:
     def _log_progress(self, episode: int):
         """Log training progress."""
         recent_rewards = self.episode_rewards[-self.config['log_frequency']:]
+        recent_stats = self.episode_stats[-self.config['log_frequency']:]
+
         avg_reward = np.mean(recent_rewards)
         std_reward = np.std(recent_rewards)
 
+        # Calculate money-based metrics
+        avg_return = np.mean([s['total_return'] for s in recent_stats]) * 100
+        avg_final_value = np.mean([s['final_value'] for s in recent_stats])
+        avg_profit = avg_final_value - self.config['initial_capital']
+        avg_win_rate = np.mean([s['win_rate'] for s in recent_stats]) * 100
+
         buffer_stats = self.buffer.get_stats()
 
-        print(f"\nEpisode {episode + 1}/{self.config['num_episodes']}")
-        print(f"  Avg Reward (last {self.config['log_frequency']}): {avg_reward:.4f} ± {std_reward:.4f}")
-        print(f"  Epsilon: {self.epsilon:.3f}")
-        print(f"  Buffer: {buffer_stats['size']}/{self.config['buffer_capacity']} ({buffer_stats['capacity_used']*100:.1f}%)")
-        print(f"  Global Step: {self.global_step}")
+        print(f"\n{'='*60}")
+        print(f"PROGRESS: Episode {episode + 1}/{self.config['num_episodes']}")
+        print(f"{'='*60}")
+        print(f"  Avg Return (last {self.config['log_frequency']}):  {avg_return:+.2f}%")
+        print(f"  Avg Profit (last {self.config['log_frequency']}):  ${avg_profit:+,.0f}")
+        print(f"  Avg Final Value:              ${avg_final_value:,.0f}")
+        print(f"  Avg Win Rate:                 {avg_win_rate:.1f}%")
+        print(f"  Avg Reward:                   {avg_reward:.4f} ± {std_reward:.4f}")
+        print(f"  Epsilon:                      {self.epsilon:.3f}")
+        print(f"  Buffer:                       {buffer_stats['size']}/{self.config['buffer_capacity']} ({buffer_stats['capacity_used']*100:.1f}%)")
+        print(f"  Global Step:                  {self.global_step}")
 
         if WANDB_AVAILABLE and self.config['use_wandb']:
             wandb.log({
                 'episode': episode + 1,
                 'avg_reward': avg_reward,
+                'avg_return': avg_return / 100,
+                'avg_profit': avg_profit,
+                'avg_final_value': avg_final_value,
+                'avg_win_rate': avg_win_rate / 100,
                 'epsilon': self.epsilon,
                 'buffer_size': buffer_stats['size'],
                 'global_step': self.global_step
@@ -443,19 +472,25 @@ class Phase1TrainingLoop:
         # Compute statistics
         avg_eval_reward = np.mean(eval_rewards)
         avg_return = np.mean([s['total_return'] for s in eval_stats])
+        avg_final_value = np.mean([s['final_value'] for s in eval_stats])
+        avg_profit = avg_final_value - self.config['initial_capital']
         avg_sharpe = np.mean([s['sharpe_ratio'] for s in eval_stats])
         avg_win_rate = np.mean([s['win_rate'] for s in eval_stats])
 
         print(f"\nEvaluation Results ({self.config['eval_episodes']} episodes):")
-        print(f"  Avg Reward: {avg_eval_reward:.4f}")
-        print(f"  Avg Return: {avg_return*100:.2f}%")
-        print(f"  Avg Sharpe: {avg_sharpe:.2f}")
-        print(f"  Avg Win Rate: {avg_win_rate*100:.1f}%")
+        print(f"  Avg Return:       {avg_return*100:+.2f}%")
+        print(f"  Avg Profit:       ${avg_profit:+,.0f}")
+        print(f"  Avg Final Value:  ${avg_final_value:,.0f}")
+        print(f"  Avg Reward:       {avg_eval_reward:.4f}")
+        print(f"  Avg Sharpe:       {avg_sharpe:.2f}")
+        print(f"  Avg Win Rate:     {avg_win_rate*100:.1f}%")
 
         if WANDB_AVAILABLE and self.config['use_wandb']:
             wandb.log({
                 'eval/avg_reward': avg_eval_reward,
                 'eval/avg_return': avg_return,
+                'eval/avg_profit': avg_profit,
+                'eval/avg_final_value': avg_final_value,
                 'eval/avg_sharpe': avg_sharpe,
                 'eval/win_rate': avg_win_rate,
                 'episode': episode + 1
@@ -529,7 +564,7 @@ def main():
     parser.add_argument('--top-k-buys', type=int, default=10, help='Top-K buy actions per step')
 
     # Architecture
-    parser.add_argument('--state-dim', type=int, default=1920, help='State dimension')
+    parser.add_argument('--state-dim', type=int, default=1469, help='State dimension (1444 predictor + 25 portfolio context)')
     parser.add_argument('--hidden-dim', type=int, default=1024, help='Hidden dimension')
 
     # Logging
@@ -550,14 +585,36 @@ def main():
     parser.add_argument('--train-frequency', type=int, default=4, help='Train every N steps')
     parser.add_argument('--target-update-frequency', type=int, default=1000, help='Update target every N steps')
 
+    # Multi-GPU
+    parser.add_argument('--multi-gpu', action='store_true', help='Enable multi-GPU asynchronous episode collection')
+    parser.add_argument('--num-workers', type=int, default=2, help='Number of worker processes (default: 2)')
+    parser.add_argument('--worker-gpus', type=str, default='0,1', help='Comma-separated GPU IDs for workers (default: 0,1)')
+    parser.add_argument('--weight-sync-frequency', type=int, default=500, help='Sync weights every N steps (default: 500)')
+
     args = parser.parse_args()
 
     # Convert to config dict
     config = vars(args)
 
+    # Add additional config for multi-GPU mode
+    if args.multi_gpu:
+        config['phase'] = 1  # Phase 1
+        config['action_dim'] = 2  # Phase 1 has 2 actions
+        config['learning_rate'] = config['lr_q_network']
+        config['transaction_cost'] = 0.001
+        config['epsilon_decay'] = (config['epsilon_start'] - config['epsilon_end']) / config['epsilon_decay_steps']
+        config['max_training_steps'] = config['num_episodes'] * config['episode_length']
+
     # Train
-    trainer = Phase1TrainingLoop(config)
-    trainer.train()
+    if args.multi_gpu:
+        from rl.train_rl_multigpu import MultiGPUTrainingLoop
+        print("\n🚀 Using Multi-GPU training mode")
+        trainer = MultiGPUTrainingLoop(config)
+        trainer.train()
+    else:
+        print("\n🚀 Using Single-GPU training mode")
+        trainer = Phase1TrainingLoop(config)
+        trainer.train()
 
 
 if __name__ == '__main__':

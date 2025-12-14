@@ -25,7 +25,6 @@ from tqdm import tqdm
 import sys
 import os
 import h5py
-
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -51,13 +50,14 @@ torch.set_grad_enabled(False)
 class DatasetLoader:
     """Load and manage test dataset for backtesting."""
 
-    def __init__(self, dataset_path: str, num_test_stocks: int = 1000, subset_size: Optional[int] = None, prices_path: Optional[str] = None):
+    def __init__(self, dataset_path: str, num_test_stocks: int = 1000, subset_size: Optional[int] = None, prices_path: Optional[str] = None, features_cache_path: Optional[str] = None):
         """
         Args:
             dataset_path: Path to dataset (pickle or HDF5) with features
             num_test_stocks: Number of stocks from end of alphabet to use
             subset_size: If set, randomly sample this many stocks each trading day (dynamic subsampling)
             prices_path: Optional path to HDF5 file with actual prices (if features are normalized)
+            features_cache_path: Optional path to cached preloaded features (HDF5)
         """
         print(f"\n{'='*80}")
         print("LOADING DATASET")
@@ -142,6 +142,7 @@ class DatasetLoader:
         # Feature cache for fast access
         self.feature_cache = {}  # {(ticker, date): (features, price)}
         self.cache_enabled = False
+        self.features_cache_path = features_cache_path
 
     def get_daily_subset(self) -> List[str]:
         """
@@ -235,6 +236,99 @@ class DatasetLoader:
         self.cache_enabled = True
         print(f"  ✅ Preloaded {len(self.feature_cache):,} ticker-date pairs")
         print(f"  💾 Cache size: ~{len(self.feature_cache) * 1400 * 4 / 1e6:.1f} MB (assuming 1400 features)")
+
+    def save_feature_cache(self, cache_path: str):
+        """
+        Save the preloaded feature cache to disk (HDF5 format).
+
+        Args:
+            cache_path: Path to save the cache file
+        """
+        if not self.cache_enabled or len(self.feature_cache) == 0:
+            print(f"  ⚠️  No features cached, nothing to save")
+            return
+
+        print(f"\n{'='*80}")
+        print("SAVING FEATURE CACHE")
+        print(f"{'='*80}")
+        print(f"Saving {len(self.feature_cache):,} ticker-date pairs to: {cache_path}")
+
+        with h5py.File(cache_path, 'w') as f:
+            # Create groups for each ticker
+            ticker_date_map = {}  # {ticker: [(date, features, price), ...]}
+
+            for (ticker, date), (features, price) in self.feature_cache.items():
+                if ticker not in ticker_date_map:
+                    ticker_date_map[ticker] = []
+                ticker_date_map[ticker].append((date, features.cpu().numpy(), price))
+
+            # Save each ticker's data
+            for ticker, data_list in tqdm(ticker_date_map.items(), desc="  Saving"):
+                grp = f.create_group(ticker)
+
+                # Sort by date to maintain order
+                data_list.sort(key=lambda x: x[0])
+
+                # Extract arrays
+                dates = [item[0] for item in data_list]
+                features = np.stack([item[1] for item in data_list])  # (num_dates, num_features)
+                prices = np.array([item[2] for item in data_list])  # (num_dates,)
+
+                # Save to HDF5
+                grp.create_dataset('dates', data=np.array(dates, dtype='S10'))
+                grp.create_dataset('features', data=features, compression='gzip', compression_opts=4)
+                grp.create_dataset('prices', data=prices, compression='gzip', compression_opts=4)
+
+        print(f"  ✅ Feature cache saved successfully")
+        print(f"  📁 File: {cache_path}")
+
+        # Print file size
+        file_size_mb = os.path.getsize(cache_path) / 1e6
+        print(f"  💾 Size: {file_size_mb:.1f} MB")
+
+    def load_feature_cache(self, cache_path: str) -> bool:
+        """
+        Load preloaded feature cache from disk (HDF5 format).
+
+        Args:
+            cache_path: Path to the cache file
+
+        Returns:
+            True if successfully loaded, False otherwise
+        """
+        if not os.path.exists(cache_path):
+            print(f"  ⚠️  Cache file not found: {cache_path}")
+            return False
+
+        print(f"\n{'='*80}")
+        print("LOADING FEATURE CACHE FROM DISK")
+        print(f"{'='*80}")
+        print(f"Loading from: {cache_path}")
+
+        try:
+            with h5py.File(cache_path, 'r') as f:
+                self.feature_cache = {}
+
+                for ticker in tqdm(list(f.keys()), desc="  Loading"):
+                    grp = f[ticker]
+                    dates = [d.decode('utf-8') for d in grp['dates'][:]]
+                    features = grp['features'][:]  # (num_dates, num_features)
+                    prices = grp['prices'][:]  # (num_dates,)
+
+                    # Populate cache
+                    for i, date in enumerate(dates):
+                        features_tensor = torch.from_numpy(features[i]).float()
+                        price = float(prices[i])
+                        self.feature_cache[(ticker, date)] = (features_tensor, price)
+
+            self.cache_enabled = True
+            print(f"  ✅ Loaded {len(self.feature_cache):,} ticker-date pairs from cache")
+            print(f"  💾 Cache size: ~{len(self.feature_cache) * 1400 * 4 / 1e6:.1f} MB (assuming 1400 features)")
+            return True
+
+        except Exception as e:
+            print(f"  ❌ Failed to load cache: {e}")
+            return False
 
     def __del__(self):
         """Close HDF5 files when object is destroyed."""
@@ -394,6 +488,65 @@ class DatasetLoader:
                 current_price = features[0].item()  # Fall back to features
 
             return features, current_price
+
+    def get_all_features_for_date_batched(self, date: str, tickers: Optional[List[str]] = None) -> Dict[str, Tuple[torch.Tensor, float]]:
+        """
+        OPTIMIZED: Get features and prices for ALL tickers on a specific date in a single batch read.
+
+        This is MUCH faster than calling get_features_and_price() in a loop!
+
+        Args:
+            date: Date to get features for
+            tickers: List of tickers to get (if None, uses all test_tickers)
+
+        Returns:
+            Dictionary mapping ticker -> (features, price)
+        """
+        if tickers is None:
+            tickers = self.test_tickers
+
+        results = {}
+
+        if not self.is_hdf5:
+            # Parquet format - just call get_features_and_price for each
+            for ticker in tickers:
+                result = self.get_features_and_price(ticker, date)
+                if result is not None:
+                    results[ticker] = result
+            return results
+
+        # HDF5 format - optimized batch reading
+        try:
+            date_idx = self.all_dates.index(date)
+        except ValueError:
+            # Date not found
+            return results
+
+        # Read all tickers efficiently
+        for ticker in tickers:
+            if ticker not in self.h5_file:
+                continue
+
+            try:
+                # Read features for this ticker at this date index
+                # Note: Reading h5_file[ticker]['features'][date_idx] is faster than
+                # reading h5_file[ticker]['features'][:] and then indexing
+                features_2d = self.h5_file[ticker]['features']
+                if date_idx >= features_2d.shape[0]:
+                    continue
+
+                features = torch.tensor(features_2d[date_idx], dtype=torch.float32)
+
+                # Get price
+                current_price = self._get_actual_price(ticker, date)
+                if current_price is None:
+                    current_price = features[0].item()
+
+                results[ticker] = (features, current_price)
+            except:
+                continue
+
+        return results
 
     def get_future_price(self, ticker: str, date: str, horizon_days: int) -> Optional[float]:
         """
@@ -1517,6 +1670,10 @@ def main():
                        help='Path to dataset (pickle or HDF5)')
     parser.add_argument('--prices', type=str, default="data/actual_prices.h5",
                        help='Path to HDF5 file with actual prices (optional, for normalized features)')
+    parser.add_argument('--features-cache', type=str, default="./data/preloaded_features.h5",
+                       help='Path to preloaded features cache (HDF5). If not provided, features will be loaded from dataset.')
+    parser.add_argument('--save-features-cache', type=str, default="./data/preloaded_features.h5",
+                       help='Path to save the preloaded features cache after loading (HDF5). Use this to create a cache for future runs.')
     parser.add_argument('--model', type=str, default="checkpoints/best_model_100m_1.18.pt",
                        help='Path to model checkpoint (or first model if using --ensemble-models)')
     parser.add_argument('--ensemble-models', type=str, nargs='+', default=None,
@@ -1535,7 +1692,7 @@ def main():
                        help='Number of stocks to buy each period')
     parser.add_argument('--horizon-idx', type=int, default=0,
                        help='Prediction horizon index (0=1day, 1=5day, 2=10day, 3=20day)')
-    parser.add_argument('--confidence-percentile', type=float, default=0.2,
+    parser.add_argument('--confidence-percentile', type=float, default=0.03,
                        help='Confidence percentile for filtering (default: 0.6 = keep top 40%%)')
     parser.add_argument('--test-months', type=int, default=4,
                        help='Number of months to backtest')
@@ -1547,7 +1704,9 @@ def main():
                        help='File with best cluster IDs (required if --cluster-dir is set)')
     parser.add_argument('--cluster-batch-size', type=int, default=32,
                        help='Batch size for cluster encoding (default: 32, reduce if OOM)')
-    parser.add_argument('--embeddings-cache', type=str, default=None,
+    parser.add_argument('--cluster-top-k-percent', type=float, default=0.03,
+                       help='If set, select top k%% of stocks closest to best centroids instead of hard assignment (0.0-1.0)')
+    parser.add_argument('--embeddings-cache', type=str, default="./data/embeddings_cache.h5",
                        help='Path to pre-computed embeddings cache (HDF5) for fast filtering')
 
     # Other args
@@ -1588,7 +1747,8 @@ def main():
         dataset_path=args.data,
         num_test_stocks=args.num_test_stocks,
         subset_size=args.subset_size,
-        prices_path=args.prices
+        prices_path=args.prices,
+        features_cache_path=args.features_cache
     )
 
     # Initialize dynamic cluster filter if enabled
@@ -1613,7 +1773,8 @@ def main():
             best_clusters_file=args.best_clusters_file,
             device=args.device,
             batch_size=args.cluster_batch_size,
-            embeddings_cache_path=args.embeddings_cache
+            embeddings_cache_path=args.embeddings_cache,
+            top_k_percent=args.cluster_top_k_percent
         )
         if args.embeddings_cache is None:
             print(f"  ℹ️  Cluster encoding batch size: {args.cluster_batch_size} (use --cluster-batch-size to adjust)")
@@ -1625,7 +1786,18 @@ def main():
 
     # Preload features (eliminates I/O bottleneck)
     if not args.no_preload:
-        data_loader.preload_features(trading_dates)
+        # Try to load from cache first
+        cache_loaded = False
+        if args.features_cache is not None:
+            cache_loaded = data_loader.load_feature_cache(args.features_cache)
+
+        # If cache not loaded, preload from dataset
+        if not cache_loaded:
+            data_loader.preload_features(trading_dates)
+
+            # Save cache if requested
+            if args.save_features_cache is not None:
+                data_loader.save_feature_cache(args.save_features_cache)
     else:
         print(f"\n⚠️  Preloading disabled - expect slower performance")
 
@@ -1710,12 +1882,20 @@ def main():
                 dataset_path=args.data,
                 num_test_stocks=args.num_test_stocks,
                 subset_size=args.subset_size,
-                prices_path=args.prices
+                prices_path=args.prices,
+                features_cache_path=args.features_cache
             )
 
             # Preload features if needed
             if not args.no_preload:
-                trial_data_loader.preload_features(trading_dates)
+                # Try to load from cache first
+                cache_loaded = False
+                if args.features_cache is not None:
+                    cache_loaded = trial_data_loader.load_feature_cache(args.features_cache)
+
+                # If cache not loaded, preload from dataset
+                if not cache_loaded:
+                    trial_data_loader.preload_features(trading_dates)
 
             # Run simulation (quiet mode for multi-trial)
             simulator = TradingSimulator(

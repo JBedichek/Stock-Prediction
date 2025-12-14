@@ -19,6 +19,9 @@ from typing import List, Set, Dict, Tuple, Optional
 import h5py
 from tqdm import tqdm
 
+# Import GPUKMeans for unpickling cluster models
+from cluster.gpu_kmeans import GPUKMeans
+
 
 class DynamicClusterFilter:
     """
@@ -53,7 +56,8 @@ class DynamicClusterFilter:
                  best_clusters_file: Optional[str] = None,
                  device: str = 'cuda',
                  batch_size: int = 32,
-                 embeddings_cache_path: Optional[str] = None):
+                 embeddings_cache_path: Optional[str] = None,
+                 top_k_percent: Optional[float] = None):
         """
         Initialize dynamic cluster filter.
 
@@ -65,15 +69,22 @@ class DynamicClusterFilter:
             device: Device for encoding
             batch_size: Batch size for encoding (default: 32)
             embeddings_cache_path: Optional path to pre-computed embeddings cache (HDF5)
+            top_k_percent: If set, select top k% of stocks closest to centroids instead of hard assignment (0.0-1.0)
         """
         self.device = device
         self.batch_size = batch_size
         self.embeddings_cache_path = embeddings_cache_path
         self.embeddings_cache = None
+        self.top_k_percent = top_k_percent
 
         print(f"\n{'='*80}")
         print("INITIALIZING DYNAMIC CLUSTER FILTER")
         print(f"{'='*80}")
+
+        if top_k_percent is not None:
+            print(f"  Mode: Top-{top_k_percent*100:.1f}% selection by distance to centroids")
+        else:
+            print(f"  Mode: Hard cluster assignment")
 
         # Load embeddings cache if provided
         if embeddings_cache_path:
@@ -317,6 +328,45 @@ class DynamicClusterFilter:
 
         return assignments
 
+    def compute_distances_to_centroids(self, embeddings_dict: Dict[str, np.ndarray]) -> Dict[str, Dict[int, float]]:
+        """
+        Compute distances from each stock to all cluster centroids.
+
+        Args:
+            embeddings_dict: {ticker: embedding}
+
+        Returns:
+            {ticker: {cluster_id: distance}} nested dictionary
+        """
+        if len(embeddings_dict) == 0:
+            return {}
+
+        # Convert to matrix
+        tickers = list(embeddings_dict.keys())
+        X = np.array([embeddings_dict[ticker] for ticker in tickers])
+
+        # Apply same transformations used during clustering
+        if self.scaler is not None:
+            X = self.scaler.transform(X)
+
+        if self.pca is not None:
+            X = self.pca.transform(X)
+
+        # Get cluster centroids from the KMeans model
+        centroids = self.clustering_model.cluster_centers_
+
+        # Compute distances to all centroids (using Euclidean distance)
+        # distances shape: (n_stocks, n_clusters)
+        distances = np.sqrt(((X[:, np.newaxis, :] - centroids[np.newaxis, :, :]) ** 2).sum(axis=2))
+
+        # Create nested dictionary {ticker: {cluster_id: distance}}
+        result = {}
+        for i, ticker in enumerate(tickers):
+            result[ticker] = {cluster_id: float(distances[i, cluster_id])
+                            for cluster_id in range(len(centroids))}
+
+        return result
+
     def get_embeddings_from_cache(self, tickers: List[str], date: str) -> Dict[str, np.ndarray]:
         """
         Get embeddings from cache for given tickers and date.
@@ -379,14 +429,37 @@ class DynamicClusterFilter:
             # No cache - encode all
             embeddings = self.encode_features(features_dict, batch_size=self.batch_size)
 
-        # Step 2: Assign to clusters
-        assignments = self.assign_to_clusters(embeddings)
+        # Step 2: Choose filtering method based on top_k_percent setting
+        if self.top_k_percent is not None:
+            # Distance-based top-k% selection
+            distances = self.compute_distances_to_centroids(embeddings)
 
-        # Step 3: Filter to good clusters
-        allowed_tickers = [
-            ticker for ticker, cluster_id in assignments.items()
-            if cluster_id in self.best_cluster_ids
-        ]
+            # For each best cluster, collect stocks sorted by distance to that centroid
+            stocks_with_distances = []
+            for ticker, dist_dict in distances.items():
+                # Find minimum distance to any best cluster centroid
+                min_dist = min(dist_dict[cluster_id] for cluster_id in self.best_cluster_ids)
+                best_cluster = min(self.best_cluster_ids, key=lambda cid: dist_dict[cid])
+                stocks_with_distances.append((ticker, min_dist, best_cluster))
+
+            # Sort by distance (ascending - closest first)
+            stocks_with_distances.sort(key=lambda x: x[1])
+
+            # Select top-k%
+            k = max(1, int(len(stocks_with_distances) * self.top_k_percent))
+            allowed_tickers = [ticker for ticker, _, _ in stocks_with_distances[:k]]
+
+            # Create assignments for compatibility
+            assignments = {ticker: cluster_id for ticker, _, cluster_id in stocks_with_distances}
+        else:
+            # Hard cluster assignment (original behavior)
+            assignments = self.assign_to_clusters(embeddings)
+
+            # Filter to good clusters
+            allowed_tickers = [
+                ticker for ticker, cluster_id in assignments.items()
+                if cluster_id in self.best_cluster_ids
+            ]
 
         if return_assignments:
             return allowed_tickers, assignments

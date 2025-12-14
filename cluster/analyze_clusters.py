@@ -232,56 +232,114 @@ class ClusterAnalyzer:
                               min_return: float = 0.0,
                               min_win_rate: float = 0.5,
                               min_sharpe: float = 0.0,
-                              top_k: Optional[int] = None) -> List[int]:
+                              top_k: Optional[int] = None,
+                              top_k_percent_coverage: Optional[float] = None,
+                              ranking_metric: str = 'mean_return') -> List[int]:
         """
         Identify best clusters based on criteria.
 
         Args:
             cluster_stats: Cluster statistics
             horizon: Horizon to evaluate
-            min_return: Minimum mean return
-            min_win_rate: Minimum win rate
-            min_sharpe: Minimum Sharpe ratio
-            top_k: If set, return top K clusters by mean return
+            min_return: Minimum mean return (ignored if top_k_percent_coverage is set)
+            min_win_rate: Minimum win rate (ignored if top_k_percent_coverage is set)
+            min_sharpe: Minimum Sharpe ratio (ignored if top_k_percent_coverage is set)
+            top_k: If set, return top K clusters by ranking metric (ignored if top_k_percent_coverage is set)
+            top_k_percent_coverage: If set, select top clusters covering k% of total data (0.0-1.0)
+            ranking_metric: Metric to rank clusters by (default: 'mean_return')
 
         Returns:
             List of cluster IDs meeting criteria
         """
         print(f"\n🎯 Identifying best clusters...")
-        print(f"   Criteria:")
-        print(f"     - Horizon: {horizon} days")
-        print(f"     - Min return: {min_return*100:.2f}%")
-        print(f"     - Min win rate: {min_win_rate*100:.1f}%")
-        print(f"     - Min Sharpe: {min_sharpe:.2f}")
 
-        good_clusters = []
+        # MODE 1: Top-k% coverage (new, recommended)
+        if top_k_percent_coverage is not None:
+            print(f"   Mode: Top-k% coverage")
+            print(f"   Criteria:")
+            print(f"     - Horizon: {horizon} days")
+            print(f"     - Coverage target: {top_k_percent_coverage*100:.1f}% of stocks")
+            print(f"     - Ranking metric: {ranking_metric}")
 
-        for cluster_id, stats in cluster_stats.items():
-            if horizon not in stats:
-                continue
+            # Calculate total stocks across all clusters
+            total_stocks = sum(len(tickers) for tickers in self.cluster_to_tickers.values())
+            target_stocks = int(total_stocks * top_k_percent_coverage)
 
-            horizon_stats = stats[horizon]
+            print(f"\n   📊 Dataset stats:")
+            print(f"     - Total stocks: {total_stocks}")
+            print(f"     - Target stocks: {target_stocks} ({top_k_percent_coverage*100:.1f}%)")
 
-            if (horizon_stats['mean_return'] >= min_return and
-                horizon_stats['win_rate'] >= min_win_rate and
-                horizon_stats['sharpe'] >= min_sharpe):
-                good_clusters.append((cluster_id, horizon_stats['mean_return']))
+            # Collect all clusters with their performance metrics and stock counts
+            cluster_data = []
+            for cluster_id, stats in cluster_stats.items():
+                if horizon not in stats:
+                    continue
 
-        # Sort by return
-        good_clusters.sort(key=lambda x: x[1], reverse=True)
+                horizon_stats = stats[horizon]
+                num_stocks = len(self.cluster_to_tickers[cluster_id])
 
-        if top_k:
-            good_clusters = good_clusters[:top_k]
+                cluster_data.append({
+                    'cluster_id': cluster_id,
+                    'metric_value': horizon_stats[ranking_metric],
+                    'num_stocks': num_stocks
+                })
 
-        cluster_ids = [c[0] for c in good_clusters]
+            # Sort by metric (descending - best first)
+            cluster_data.sort(key=lambda x: x['metric_value'], reverse=True)
 
-        print(f"\n   ✓ Found {len(cluster_ids)} clusters meeting criteria")
+            # Select top clusters until we reach target coverage
+            selected_clusters = []
+            cumulative_stocks = 0
 
-        if len(cluster_ids) > 0:
-            total_stocks = sum(len(self.cluster_to_tickers[cid]) for cid in cluster_ids)
-            print(f"   ✓ Total stocks in good clusters: {total_stocks}")
+            for cluster in cluster_data:
+                selected_clusters.append(cluster['cluster_id'])
+                cumulative_stocks += cluster['num_stocks']
 
-        return cluster_ids
+                if cumulative_stocks >= target_stocks:
+                    break
+
+            print(f"\n   ✓ Selected {len(selected_clusters)} clusters")
+            print(f"   ✓ Total stocks covered: {cumulative_stocks} ({cumulative_stocks/total_stocks*100:.1f}%)")
+
+            return selected_clusters
+
+        # MODE 2: Threshold-based filtering (original)
+        else:
+            print(f"   Mode: Threshold-based filtering")
+            print(f"   Criteria:")
+            print(f"     - Horizon: {horizon} days")
+            print(f"     - Min return: {min_return*100:.2f}%")
+            print(f"     - Min win rate: {min_win_rate*100:.1f}%")
+            print(f"     - Min Sharpe: {min_sharpe:.2f}")
+
+            good_clusters = []
+
+            for cluster_id, stats in cluster_stats.items():
+                if horizon not in stats:
+                    continue
+
+                horizon_stats = stats[horizon]
+
+                if (horizon_stats['mean_return'] >= min_return and
+                    horizon_stats['win_rate'] >= min_win_rate and
+                    horizon_stats['sharpe'] >= min_sharpe):
+                    good_clusters.append((cluster_id, horizon_stats['mean_return']))
+
+            # Sort by return
+            good_clusters.sort(key=lambda x: x[1], reverse=True)
+
+            if top_k:
+                good_clusters = good_clusters[:top_k]
+
+            cluster_ids = [c[0] for c in good_clusters]
+
+            print(f"\n   ✓ Found {len(cluster_ids)} clusters meeting criteria")
+
+            if len(cluster_ids) > 0:
+                total_stocks = sum(len(self.cluster_to_tickers[cid]) for cid in cluster_ids)
+                print(f"   ✓ Total stocks in good clusters: {total_stocks}")
+
+            return cluster_ids
 
     def visualize_cluster_performance(self, cluster_stats: Dict, output_dir: str, horizon: int = 5):
         """
@@ -370,7 +428,13 @@ class ClusterAnalyzer:
 
 def analyze_cluster_performance(cluster_dir: str, dataset_path: str, prices_path: str,
                                 horizons: List[int] = [1, 5, 10, 20],
-                                output_dir: Optional[str] = None) -> Dict:
+                                output_dir: Optional[str] = None,
+                                top_k_percent_coverage: Optional[float] = None,
+                                ranking_metric: str = 'mean_return',
+                                min_return: float = 0.005,
+                                min_win_rate: float = 0.4,
+                                min_sharpe: float = 0.05,
+                                top_k: int = 5) -> Dict:
     """
     Main function to analyze cluster performance.
 
@@ -380,6 +444,12 @@ def analyze_cluster_performance(cluster_dir: str, dataset_path: str, prices_path
         prices_path: Path to prices
         horizons: Horizons to analyze
         output_dir: Output directory for results
+        top_k_percent_coverage: If set, select top clusters covering k% of stocks
+        ranking_metric: Metric to rank clusters by
+        min_return: Min mean return (threshold mode)
+        min_win_rate: Min win rate (threshold mode)
+        min_sharpe: Min Sharpe ratio (threshold mode)
+        top_k: Top K clusters (threshold mode)
 
     Returns:
         Analysis results dictionary
@@ -421,10 +491,12 @@ def analyze_cluster_performance(cluster_dir: str, dataset_path: str, prices_path
         best_clusters = analyzer.identify_best_clusters(
             cluster_stats,
             horizon=horizon,
-            min_return=0.01,  # 0.5% min return
-            min_win_rate=0.4,  # 52% win rate
-            min_sharpe=0.0005,
-            top_k=20  # Top 20 clusters
+            min_return=min_return,
+            min_win_rate=min_win_rate,
+            min_sharpe=min_sharpe,
+            top_k=top_k,
+            top_k_percent_coverage=top_k_percent_coverage,
+            ranking_metric=ranking_metric
         )
         results['best_clusters'][horizon] = best_clusters
 
@@ -475,7 +547,13 @@ def main():
     parser.add_argument('--horizons', type=int, nargs='+', default=[1, 5, 10, 20], help='Horizons to analyze')
     parser.add_argument('--output-dir', type=str, default=None, help='Output directory (default: cluster_dir)')
 
-    # Filtering
+    # Filtering (choose one mode)
+    parser.add_argument('--top-k-percent-coverage', type=float, default="0.1",
+                       help='Select top clusters covering k%% of total stocks (0.0-1.0, recommended)')
+    parser.add_argument('--ranking-metric', type=str, default='mean_return',
+                       help='Metric to rank clusters by (default: mean_return)')
+
+    # Threshold-based filtering (legacy, ignored if --top-k-percent-coverage is set)
     parser.add_argument('--min-return', type=float, default=0.005, help='Min mean return for best clusters')
     parser.add_argument('--min-win-rate', type=float, default=0.4, help='Min win rate for best clusters')
     parser.add_argument('--min-sharpe', type=float, default=0.05, help='Min Sharpe for best clusters')
@@ -489,7 +567,13 @@ def main():
         args.dataset_path,
         args.prices_path,
         args.horizons,
-        args.output_dir
+        args.output_dir,
+        top_k_percent_coverage=args.top_k_percent_coverage,
+        ranking_metric=args.ranking_metric,
+        min_return=args.min_return,
+        min_win_rate=args.min_win_rate,
+        min_sharpe=args.min_sharpe,
+        top_k=args.top_k
     )
 
     # Save results

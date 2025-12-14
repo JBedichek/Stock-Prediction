@@ -1,0 +1,33 @@
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Directory listing for /legacy/</title>
+</head>
+<body>
+<h1>Directory listing for /legacy/</h1>
+<hr>
+<ul>
+<li><a href="analyze_hybrid_features.py">analyze_hybrid_features.py</a></li>
+<li><a href="CLAUDE.md">CLAUDE.md</a></li>
+<li><a href="DAILY_FEATURES_COMPLETE_GUIDE.md">DAILY_FEATURES_COMPLETE_GUIDE.md</a></li>
+<li><a href="DATASET.md">DATASET.md</a></li>
+<li><a href="FMP_COMPREHENSIVE_GUIDE.md">FMP_COMPREHENSIVE_GUIDE.md</a></li>
+<li><a href="FMP_DAILY_AVAILABLE_FEATURES.md">FMP_DAILY_AVAILABLE_FEATURES.md</a></li>
+<li><a href="FMP_DAILY_DATA_ANALYSIS.md">FMP_DAILY_DATA_ANALYSIS.md</a></li>
+<li><a href="FMP_SETUP_GUIDE.md">FMP_SETUP_GUIDE.md</a></li>
+<li><a href="FMP_STABLE_API_ENDPOINTS.md">FMP_STABLE_API_ENDPOINTS.md</a></li>
+<li><a href="FUNDAMENTAL_INTEGRATION_SUMMARY.md">FUNDAMENTAL_INTEGRATION_SUMMARY.md</a></li>
+<li><a href="fundamental_metrics_availability.csv">fundamental_metrics_availability.csv</a></li>
+<li><a href="FUNDAMENTAL_METRICS_IMPLEMENTATION.md">FUNDAMENTAL_METRICS_IMPLEMENTATION.md</a></li>
+<li><a href="fundamental_metrics_raw_data.csv">fundamental_metrics_raw_data.csv</a></li>
+<li><a href="GRAND_MASTER_PLAN.md">GRAND_MASTER_PLAN.md</a></li>
+<li><a href="hybrid_features_documentation.json">hybrid_features_documentation.json</a></li>
+<li><a href="HYBRID_SCRAPER_GUIDE.md">HYBRID_SCRAPER_GUIDE.md</a></li>
+<li><a href="README.md">README.md</a></li>
+<li><a href="recommended_fundamental_metrics.json">recommended_fundamental_metrics.json</a></li>
+<li><a href="unused_historical_code.py">unused_historical_code.py</a></li>
+</ul>
+<hr>
+</body>
+</html>

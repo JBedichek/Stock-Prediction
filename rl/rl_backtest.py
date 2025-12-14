@@ -87,7 +87,7 @@ class RLBacktester:
         )
 
         print(f"   ✅ Loaded {len(data_loader.test_tickers)} tickers")
-        print(f"   ✅ Loaded {len(data_loader.test_dates)} dates")
+        print(f"   ✅ Loaded {len(data_loader.all_dates)} dates")
         return data_loader
 
     def _load_agent(self) -> TradingAgent:
@@ -302,9 +302,9 @@ class BaselineComparison:
         """Run a single random baseline episode."""
         # Select random start date
         episode_length = self.config['episode_length']
-        max_start_idx = len(self.data_loader.test_dates) - episode_length - 1
+        max_start_idx = len(self.data_loader.all_dates) - episode_length - 1
         start_idx = np.random.randint(0, max_start_idx)
-        dates = self.data_loader.test_dates[start_idx:start_idx + episode_length]
+        dates = self.data_loader.all_dates[start_idx:start_idx + episode_length]
 
         # Random portfolio
         num_positions = self.config['max_positions']
@@ -389,9 +389,9 @@ class BaselineComparison:
         """Run a single buy-and-hold episode."""
         # Select random start date
         episode_length = self.config['episode_length']
-        max_start_idx = len(self.data_loader.test_dates) - episode_length - 1
+        max_start_idx = len(self.data_loader.all_dates) - episode_length - 1
         start_idx = np.random.randint(0, max_start_idx)
-        dates = self.data_loader.test_dates[start_idx:start_idx + episode_length]
+        dates = self.data_loader.all_dates[start_idx:start_idx + episode_length]
 
         # Buy top N stocks (by market cap or random)
         num_positions = self.config['max_positions']

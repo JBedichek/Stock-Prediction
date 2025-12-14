@@ -19,6 +19,8 @@ import torch.optim as optim
 import argparse
 import random
 import numpy as np
+import pickle
+import pandas as pd
 from pathlib import Path
 import sys
 import os
@@ -31,6 +33,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from rl.rl_components import TradingAgent, ReplayBuffer, compute_dqn_loss, ACTIONS
 from rl.rl_environment import TradingEnvironment
 from inference.backtest_simulation import DatasetLoader
+
+# CRITICAL: Re-enable gradients for RL training
+# backtest_simulation.py disables gradients globally for inference,
+# but we need them for RL training
+torch.set_grad_enabled(True)
 
 # Optional: W&B logging
 try:
@@ -101,7 +108,7 @@ class Phase2TrainingLoop:
             predictor_checkpoint_path=config['predictor_checkpoint'],
             state_dim=config['state_dim'],
             hidden_dim=config['hidden_dim'],
-            action_dim=5  # Phase 2: Full 5 actions
+            action_dim=3  # Simplified: HOLD, BUY, SELL
         ).to(self.device)
 
         # Freeze/unfreeze predictor
@@ -111,7 +118,51 @@ class Phase2TrainingLoop:
             self.agent.feature_extractor.unfreeze_predictor()
             print("🔥 Joint training enabled (predictor unfrozen)")
 
-        # Initialize environment
+        # Set Q-network to training mode
+        self.agent.q_network.train()
+        print("🎯 Q-network set to training mode")
+
+        # CRITICAL: Preload features for LAST 4 YEARS only (much faster!)
+        # This eliminates HDF5 reads during state precomputation (MASSIVE speedup!)
+        print("\n💾 Preloading features into RAM cache...")
+        print("   📅 Using last 4 years of data only (recent market dynamics)")
+
+        # Get trading days from prices file and filter to last 4 years
+        sample_ticker = list(self.data_loader.prices_file.keys())[0]
+        prices_dates_bytes = self.data_loader.prices_file[sample_ticker]['dates'][:]
+        all_trading_days = sorted([d.decode('utf-8') for d in prices_dates_bytes])
+
+        # Filter to last 4 years (~1000 trading days)
+        from datetime import datetime, timedelta
+        cutoff_date = (datetime.now() - timedelta(days=4*365)).strftime('%Y-%m-%d')
+        recent_trading_days = [d for d in all_trading_days if d >= cutoff_date]
+        print(f"   📊 Filtered from {len(all_trading_days)} to {len(recent_trading_days)} trading days (last 4 years)")
+
+        # Store for later use
+        self.recent_trading_days = recent_trading_days
+
+        # Define cache path (include date range in filename to avoid conflicts)
+        cache_path = f'data/rl_feature_cache_4yr.h5'
+
+        # Try to load from cache first (instant if exists!)
+        cache_loaded = False
+        if os.path.exists(cache_path):
+            print(f"   📂 Found existing cache: {cache_path}")
+            print(f"   ⚡ Loading from cache (instant!)...")
+            cache_loaded = self.data_loader.load_feature_cache(cache_path)
+
+        # If cache not loaded, preload from HDF5 and save cache
+        if not cache_loaded:
+            print("   ⚠️  No cache found - preloading from HDF5...")
+            print("   This will take ~1 minute but only happens once!")
+            self.data_loader.preload_features(recent_trading_days)
+
+            # Save cache for next time
+            print(f"\n   💾 Saving cache to: {cache_path}")
+            print(f"   (Next run will load instantly!)")
+            self.data_loader.save_feature_cache(cache_path)
+
+        # Initialize environment (without precomputation first)
         print("\n🏪 Initializing trading environment...")
         self.env = TradingEnvironment(
             data_loader=self.data_loader,
@@ -120,8 +171,33 @@ class Phase2TrainingLoop:
             max_positions=config['max_positions'],
             episode_length=config['episode_length'],
             transaction_cost=config.get('transaction_cost', 0.001),
-            device=self.device
+            device=self.device,
+            precompute_all_states=False,  # We'll handle caching manually below
+            trading_days_filter=self.recent_trading_days,  # Use last 4 years only!
+            top_k_per_horizon=config.get('top_k_per_horizon', 10)  # Filter to top-10 per horizon
         )
+        print(f"   🎯 Action space filtering: Top-{config.get('top_k_per_horizon', 10)} stocks per time horizon")
+        print(f"   (Reduces from ~900 stocks to ~{min(40, 4 * config.get('top_k_per_horizon', 10))} stocks per day)")
+
+        # Try to load state cache (skips ~20-min precomputation!)
+        state_cache_path = 'data/rl_state_cache_4yr.h5'
+        state_cache_loaded = False
+        if os.path.exists(state_cache_path):
+            print(f"\n💾 Found state cache: {state_cache_path}")
+            print(f"   ⚡ Loading precomputed states (instant!)...")
+            state_cache_loaded = self.env.load_state_cache(state_cache_path)
+
+        # If cache not loaded, precompute all states and save
+        if not state_cache_loaded:
+            print("\n⚠️  No state cache found - precomputing states for last 4 years...")
+            print(f"   This takes ~20 minutes but only happens once!")
+            print(f"   Computing states for {len(self.recent_trading_days)} trading days...")
+            self.env._precompute_all_states()
+
+            # Save cache for next time
+            print(f"\n💾 Saving state cache to: {state_cache_path}")
+            print(f"   (Next run will load instantly!)")
+            self.env.save_state_cache(state_cache_path)
 
         # Initialize replay buffer
         self.buffer = ReplayBuffer(capacity=config['buffer_capacity'])
@@ -144,7 +220,11 @@ class Phase2TrainingLoop:
         self.global_step = 0
         self.epsilon = config['epsilon_start']
         self.episode_rewards = []
+        self.episode_stats = []  # Track episode statistics (returns, etc.)
         self.best_avg_reward = -float('inf')
+
+        # Metrics tracking (for CSV export)
+        self.metrics_history = []  # List of dicts with per-episode metrics
 
         print("\n✅ Initialization complete!")
         print(f"\nConfiguration:")
@@ -166,7 +246,7 @@ class Phase2TrainingLoop:
         )
         print(f"✅ Data loaded:")
         print(f"   Stocks: {len(data_loader.test_tickers)}")
-        print(f"   Dates: {len(data_loader.test_dates)}")
+        print(f"   Dates: {len(data_loader.all_dates)}")
         return data_loader
 
     def train(self):
@@ -175,9 +255,51 @@ class Phase2TrainingLoop:
         print("STARTING TRAINING")
         print("="*80 + "\n")
 
-        for episode in range(self.config['num_episodes']):
+        # Progress bar for episodes
+        episodes_pbar = tqdm(range(self.config['num_episodes']), desc="Training Episodes", unit="ep")
+
+        for episode in episodes_pbar:
             episode_reward = self._run_episode(episode)
+            episode_stats = self.env.get_episode_stats()
+
             self.episode_rewards.append(episode_reward)
+            self.episode_stats.append(episode_stats)
+
+            # Calculate stats for display
+            final_value = episode_stats.get('final_value', self.config['initial_capital'])
+            profit = final_value - self.config['initial_capital']
+            return_pct = episode_stats.get('total_return', 0.0) * 100
+
+            # Track metrics for CSV export
+            episode_metrics = {
+                'episode': episode + 1,
+                'global_step': self.global_step,
+                'reward': episode_reward,
+                'return_pct': return_pct,
+                'profit': profit,
+                'final_value': final_value,
+                'sharpe_ratio': episode_stats.get('sharpe_ratio', 0.0),
+                'max_drawdown': episode_stats.get('max_drawdown', 0.0),
+                'win_rate': episode_stats.get('win_rate', 0.0),
+                'num_trades': episode_stats.get('num_trades', 0),
+                'epsilon': self.epsilon,
+                'buffer_size': len(self.buffer)
+            }
+            self.metrics_history.append(episode_metrics)
+
+            # Update progress bar with current stats
+            episodes_pbar.set_postfix({
+                'Return': f'{return_pct:+.2f}%',
+                'Profit': f'${profit:+,.0f}',
+                'Value': f'${final_value:,.0f}',
+                'ε': f'{self.epsilon:.3f}'
+            })
+
+            # Print immediate feedback after each episode
+            print(f"Episode {episode + 1}: Return={return_pct:+.2f}% | Profit=${profit:+,.0f} | Final=${final_value:,.0f} | ε={self.epsilon:.3f}")
+
+            # Save data every episode
+            self._save_episode_data(episode)
 
             # Logging
             if (episode + 1) % self.config['log_frequency'] == 0:
@@ -190,6 +312,8 @@ class Phase2TrainingLoop:
             # Checkpoint
             if (episode + 1) % self.config['checkpoint_frequency'] == 0:
                 self._save_checkpoint(episode)
+
+        episodes_pbar.close()
 
         print("\n" + "="*80)
         print("TRAINING COMPLETE")
@@ -211,6 +335,13 @@ class Phase2TrainingLoop:
         done = False
         episode_reward = 0.0
 
+        # Progress bar for episode steps
+        steps_pbar = tqdm(total=self.config['episode_length'],
+                         desc=f"Episode {episode+1}",
+                         unit="step",
+                         leave=False)
+
+        step = 0
         while not done:
             # Select actions (Phase 2: full 5-action space)
             actions = self._select_actions_phase2(states)
@@ -239,7 +370,17 @@ class Phase2TrainingLoop:
             states = next_states
             episode_reward += reward
             self.global_step += 1
+            step += 1
 
+            # Update step progress bar
+            steps_pbar.update(1)
+            steps_pbar.set_postfix({
+                'Reward': f'{reward:+.4f}',
+                'Value': f'${info.get("portfolio_value", 0):,.0f}',
+                'Pos': info.get('num_positions', 0)
+            })
+
+        steps_pbar.close()
         return episode_reward
 
     def _select_actions_phase2(self, states: Dict[str, torch.Tensor]) -> Dict[str, int]:
@@ -274,8 +415,8 @@ class Phase2TrainingLoop:
         actions = {}
         for i, ticker in enumerate(tickers):
             if random.random() < self.epsilon:
-                # Explore: random action
-                action = random.randint(0, 4)
+                # Explore: random action (3 actions: HOLD, BUY, SELL)
+                action = random.randint(0, 2)
             else:
                 # Exploit: best action
                 action = q_values_batch[i].argmax().item()
@@ -380,21 +521,39 @@ class Phase2TrainingLoop:
     def _log_progress(self, episode: int):
         """Log training progress."""
         recent_rewards = self.episode_rewards[-self.config['log_frequency']:]
+        recent_stats = self.episode_stats[-self.config['log_frequency']:]
+
         avg_reward = np.mean(recent_rewards)
         std_reward = np.std(recent_rewards)
 
+        # Calculate money-based metrics
+        avg_return = np.mean([s['total_return'] for s in recent_stats]) * 100
+        avg_final_value = np.mean([s['final_value'] for s in recent_stats])
+        avg_profit = avg_final_value - self.config['initial_capital']
+        avg_win_rate = np.mean([s['win_rate'] for s in recent_stats]) * 100
+
         buffer_stats = self.buffer.get_stats()
 
-        print(f"\nEpisode {episode + 1}/{self.config['num_episodes']}")
-        print(f"  Avg Reward (last {self.config['log_frequency']}): {avg_reward:.4f} ± {std_reward:.4f}")
-        print(f"  Epsilon: {self.epsilon:.3f}")
-        print(f"  Buffer: {buffer_stats['size']}/{self.config['buffer_capacity']} ({buffer_stats['capacity_used']*100:.1f}%)")
-        print(f"  Global Step: {self.global_step}")
+        print(f"\n{'='*80}")
+        print(f"PROGRESS: Episode {episode + 1}/{self.config['num_episodes']}")
+        print(f"{'='*80}")
+        print(f"  Avg Return (last {self.config['log_frequency']}):  {avg_return:+.2f}%")
+        print(f"  Avg Profit (last {self.config['log_frequency']}):  ${avg_profit:+,.0f}")
+        print(f"  Avg Final Value:              ${avg_final_value:,.0f}")
+        print(f"  Avg Win Rate:                 {avg_win_rate:.1f}%")
+        print(f"  Avg Reward:                   {avg_reward:.4f} ± {std_reward:.4f}")
+        print(f"  Epsilon:                      {self.epsilon:.3f}")
+        print(f"  Buffer:                       {buffer_stats['size']}/{self.config['buffer_capacity']} ({buffer_stats['capacity_used']*100:.1f}%)")
+        print(f"  Global Step:                  {self.global_step}")
 
         if WANDB_AVAILABLE and self.config['use_wandb']:
             wandb.log({
                 'episode': episode + 1,
                 'avg_reward': avg_reward,
+                'avg_return': avg_return / 100,
+                'avg_profit': avg_profit,
+                'avg_final_value': avg_final_value,
+                'avg_win_rate': avg_win_rate / 100,
                 'epsilon': self.epsilon,
                 'buffer_size': buffer_stats['size'],
                 'global_step': self.global_step
@@ -432,13 +591,17 @@ class Phase2TrainingLoop:
         # Compute statistics
         avg_eval_reward = np.mean(eval_rewards)
         avg_return = np.mean([s['total_return'] for s in eval_stats])
+        avg_final_value = np.mean([s['final_value'] for s in eval_stats])
+        avg_profit = avg_final_value - self.config['initial_capital']
         avg_sharpe = np.mean([s['sharpe_ratio'] for s in eval_stats])
         avg_win_rate = np.mean([s['win_rate'] for s in eval_stats])
         avg_max_dd = np.mean([s['max_drawdown'] for s in eval_stats])
 
         print(f"\nEvaluation Results ({self.config['eval_episodes']} episodes):")
+        print(f"  Avg Return:       {avg_return*100:+.2f}%")
+        print(f"  Avg Profit:       ${avg_profit:+,.0f}")
+        print(f"  Avg Final Value:  ${avg_final_value:,.0f}")
         print(f"  Avg Reward:       {avg_eval_reward:.4f}")
-        print(f"  Avg Return:       {avg_return*100:.2f}%")
         print(f"  Avg Sharpe:       {avg_sharpe:.2f}")
         print(f"  Avg Max Drawdown: {avg_max_dd*100:.2f}%")
         print(f"  Avg Win Rate:     {avg_win_rate*100:.1f}%")
@@ -447,6 +610,8 @@ class Phase2TrainingLoop:
             wandb.log({
                 'eval/avg_reward': avg_eval_reward,
                 'eval/avg_return': avg_return,
+                'eval/avg_profit': avg_profit,
+                'eval/avg_final_value': avg_final_value,
                 'eval/avg_sharpe': avg_sharpe,
                 'eval/avg_max_drawdown': avg_max_dd,
                 'eval/win_rate': avg_win_rate,
@@ -458,6 +623,30 @@ class Phase2TrainingLoop:
             self.best_avg_reward = avg_eval_reward
             self._save_checkpoint(episode, prefix='best')
             print(f"  🎉 New best model! (Reward: {avg_eval_reward:.4f})")
+
+    def _save_episode_data(self, episode: int):
+        """Save episode data (replay buffer, history, metrics) every episode."""
+        checkpoint_dir = Path(self.config['checkpoint_dir'])
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save replay buffer
+        buffer_path = checkpoint_dir / f'replay_buffer_episode_{episode + 1}.pkl'
+        with open(buffer_path, 'wb') as f:
+            pickle.dump(self.buffer, f)
+
+        # Save episode history (all episodes so far)
+        history_path = checkpoint_dir / f'episode_history.pkl'
+        episode_data = {
+            'episode_rewards': self.episode_rewards,
+            'episode_stats': self.episode_stats
+        }
+        with open(history_path, 'wb') as f:
+            pickle.dump(episode_data, f)
+
+        # Save metrics as CSV (cumulative)
+        metrics_path = checkpoint_dir / 'training_metrics.csv'
+        df = pd.DataFrame(self.metrics_history)
+        df.to_csv(metrics_path, index=False)
 
     def _save_checkpoint(self, episode: int, prefix: str = 'checkpoint'):
         """Save model checkpoint."""
@@ -473,7 +662,10 @@ class Phase2TrainingLoop:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'epsilon': self.epsilon,
             'best_avg_reward': self.best_avg_reward,
-            'config': self.config
+            'config': self.config,
+            'episode_rewards': self.episode_rewards,
+            'episode_stats': self.episode_stats,
+            'metrics_history': self.metrics_history
         }
 
         # Add predictor state if joint training
@@ -501,7 +693,7 @@ def main():
     parser.add_argument('--dataset-path', type=str, default="data/all_complete_dataset.h5", help='Path to dataset (HDF5 or pickle)')
     parser.add_argument('--prices-path', type=str, default="data/actual_prices.h5", help='Path to prices HDF5 (if features are normalized)')
     parser.add_argument('--num-test-stocks', type=int, default=1000, help='Number of test stocks')
-    parser.add_argument('--predictor-checkpoint', type=str, required=True, help='Path to predictor checkpoint')
+    parser.add_argument('--predictor-checkpoint', type=str, default="./checkpoints/best_model.pt", help='Path to predictor checkpoint')
 
     # Phase 2 settings
     parser.add_argument('--num-stocks', type=int, default=1000, help='Number of stocks to use (Phase 2: 1000)')
@@ -528,7 +720,7 @@ def main():
     parser.add_argument('--transaction-cost', type=float, default=0.001, help='Transaction cost (0.1%)')
 
     # Architecture
-    parser.add_argument('--state-dim', type=int, default=1920, help='State dimension')
+    parser.add_argument('--state-dim', type=int, default=1469, help='State dimension (1444 predictor + 25 portfolio context)')
     parser.add_argument('--hidden-dim', type=int, default=1024, help='Hidden dimension')
 
     # Logging
@@ -544,19 +736,41 @@ def main():
     parser.add_argument('--run-name', type=str, default=None, help='W&B run name')
 
     # System
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device')
+    parser.add_argument('--device', type=str, default='cuda:1' if torch.cuda.is_available() else 'cpu', help='Device')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--train-frequency', type=int, default=4, help='Train every N steps')
     parser.add_argument('--target-update-frequency', type=int, default=1000, help='Update target every N steps')
+
+    # Multi-GPU
+    parser.add_argument('--multi-gpu', action='store_true', help='Enable multi-GPU asynchronous episode collection')
+    parser.add_argument('--num-workers', type=int, default=2, help='Number of worker processes (default: 2)')
+    parser.add_argument('--worker-gpus', type=str, default='0,1', help='Comma-separated GPU IDs for workers (default: 0,1)')
+    parser.add_argument('--weight-sync-frequency', type=int, default=500, help='Sync weights every N steps (default: 500)')
 
     args = parser.parse_args()
 
     # Convert to config dict
     config = vars(args)
 
+    # Add additional config for multi-GPU mode
+    if args.multi_gpu:
+        config['phase'] = 2  # Phase 2
+        config['action_dim'] = 5  # Phase 2 has 5 actions
+        config['learning_rate'] = config['lr_q_network']
+        config['transaction_cost'] = 0.001
+        config['epsilon_decay'] = (config['epsilon_start'] - config['epsilon_end']) / config['epsilon_decay_steps']
+        config['max_training_steps'] = config['num_episodes'] * config['episode_length']
+
     # Train
-    trainer = Phase2TrainingLoop(config)
-    trainer.train()
+    if args.multi_gpu:
+        from rl.train_rl_multigpu import MultiGPUTrainingLoop
+        print("\n🚀 Using Multi-GPU training mode (Phase 2)")
+        trainer = MultiGPUTrainingLoop(config)
+        trainer.train()
+    else:
+        print("\n🚀 Using Single-GPU training mode (Phase 2)")
+        trainer = Phase2TrainingLoop(config)
+        trainer.train()
 
 
 if __name__ == '__main__':
