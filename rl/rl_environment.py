@@ -105,7 +105,7 @@ class TradingEnvironment:
                  initial_capital: float = 100000,
                  max_positions: int = 10,
                  episode_length: int = 40,
-                 transaction_cost: float = 0.001,
+                 transaction_cost: float = 0.0,  # No transaction costs (was 0.001)
                  device: str = 'cuda',
                  precompute_all_states: bool = False,
                  trading_days_filter: Optional[List[str]] = None,
@@ -119,7 +119,7 @@ class TradingEnvironment:
             initial_capital: Starting capital ($)
             max_positions: Maximum number of simultaneous positions
             episode_length: Number of trading days per episode
-            transaction_cost: Transaction cost as fraction (0.001 = 0.1%)
+            transaction_cost: Transaction cost as fraction (0.0 = no cost, 0.001 = 0.1%)
             device: Device for computations
             precompute_all_states: If True, pre-compute states for ALL dates once at init
                                   (one-time cost, then reused across all episodes)

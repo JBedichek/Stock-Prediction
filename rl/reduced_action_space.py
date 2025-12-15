@@ -32,6 +32,23 @@ def get_top_4_stocks(cached_states: Dict[str, torch.Tensor]) -> List[Tuple[str, 
     Returns:
         List of (ticker, horizon_idx) tuples, one per horizon
     """
+    return get_top_k_stocks_per_horizon(cached_states, k=1)
+
+
+def get_top_k_stocks_per_horizon(
+    cached_states: Dict[str, torch.Tensor],
+    k: int = 3
+) -> List[Tuple[str, int]]:
+    """
+    Get top-K stocks for each of 4 time horizons (VECTORIZED).
+
+    Args:
+        cached_states: Dict mapping ticker -> cached state (1444 dims)
+        k: Number of top stocks to return per horizon
+
+    Returns:
+        List of (ticker, horizon_idx) tuples, k per horizon (4*k total)
+    """
     if len(cached_states) == 0:
         return []
 
@@ -51,15 +68,53 @@ def get_top_4_stocks(cached_states: Dict[str, torch.Tensor]) -> List[Tuple[str, 
     # Extract expected returns for all stocks at once: (N_stocks, 4)
     expected_returns = states_tensor[:, 1428:1432]
 
-    # Find argmax for each horizon (0-3)
+    # Find top-K for each horizon (0-3)
     top_stocks = []
     for horizon_idx in range(4):
         horizon_returns = expected_returns[:, horizon_idx]  # (N_stocks,)
-        best_idx = horizon_returns.argmax().item()
-        best_ticker = tickers[best_idx]
-        top_stocks.append((best_ticker, horizon_idx))
+
+        # Get top-k indices for this horizon
+        top_k = min(k, len(tickers))  # Handle case where fewer stocks than k
+        _, top_indices = torch.topk(horizon_returns, top_k)
+
+        for idx in top_indices:
+            top_stocks.append((tickers[idx.item()], horizon_idx))
 
     return top_stocks
+
+
+def sample_top_4_from_top_k(
+    top_k_stocks: List[Tuple[str, int]],
+    sample_size: int = 4,
+    deterministic: bool = False
+) -> List[Tuple[str, int]]:
+    """
+    Sample 4 stocks from top-K stocks (with randomization for training).
+
+    Args:
+        top_k_stocks: List of (ticker, horizon_idx) from get_top_k_stocks_per_horizon
+        sample_size: Number of stocks to sample (default 4)
+        deterministic: If True, always take first 4 (for validation)
+
+    Returns:
+        List of 4 (ticker, horizon_idx) tuples
+    """
+    if len(top_k_stocks) <= sample_size:
+        return top_k_stocks
+
+    if deterministic:
+        # Take first one from each horizon (deterministic)
+        selected = []
+        for horizon_idx in range(4):
+            for ticker, h_idx in top_k_stocks:
+                if h_idx == horizon_idx and (ticker, h_idx) not in selected:
+                    selected.append((ticker, h_idx))
+                    break
+        return selected[:sample_size]
+    else:
+        # Randomly sample (for training diversity)
+        import random
+        return random.sample(top_k_stocks, sample_size)
 
 
 def select_action_epsilon_greedy(

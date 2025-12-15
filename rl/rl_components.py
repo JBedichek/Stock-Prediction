@@ -1123,7 +1123,8 @@ def compute_critic_loss(agent: ActorCriticAgent,
 def compute_actor_loss(agent: ActorCriticAgent,
                       batch: List[Dict],
                       device: str = 'cuda',
-                      entropy_coef: float = 0.01) -> Tuple[torch.Tensor, Dict]:
+                      entropy_coef: float = 0.01,
+                      action_diversity_coef: float = 0.0) -> Tuple[torch.Tensor, Dict]:
     """
     Compute actor loss for a batch of transitions.
 
@@ -1179,13 +1180,43 @@ def compute_actor_loss(agent: ActorCriticAgent,
     # Entropy regularization (encourage exploration)
     entropy_loss = -entropy.mean()
 
+    # Action diversity regularization (discourage always choosing action 0/HOLD)
+    # Compute action distribution in batch (for logging)
+    action_diversity_loss_batch = 0.0
+    if action_diversity_coef > 0:
+        # Method 1: Penalize imbalanced BATCH actions (lagging indicator)
+        action_counts = torch.bincount(actions, minlength=agent.action_dim).float()
+        action_probs_empirical = action_counts / len(actions)
+        uniform_dist = torch.ones(agent.action_dim, device=device) / agent.action_dim
+        action_probs_empirical = action_probs_empirical + 1e-8
+        kl_div_batch = (action_probs_empirical * (torch.log(action_probs_empirical) - torch.log(uniform_dist))).sum()
+        action_diversity_loss_batch = kl_div_batch
+
+        # Method 2: Penalize policy probabilities that concentrate on one action (leading indicator)
+        # This directly affects the policy output, not just the batch
+        # Compute average probability mass on action 0 (HOLD) across the batch
+        probs_action_0 = probs[:, 0]  # Probability of action 0 for each state
+        # Penalize if action 0 has high probability on average
+        # Target: action 0 should have prob ~0.2 (uniform over 5 actions)
+        target_prob = 1.0 / agent.action_dim
+        action0_penalty = torch.relu(probs_action_0.mean() - target_prob * 1.5)  # Penalty if prob > 0.3
+
+        # Combine both methods
+        action_diversity_loss = action_diversity_loss_batch + action0_penalty * 10.0  # Scale up the direct penalty
+
+    else:
+        action_diversity_loss = 0.0
+        probs_action_0 = probs[:, 0]  # Still compute for logging
+
     # Total loss
-    loss = policy_loss + entropy_coef * entropy_loss
+    loss = policy_loss + entropy_coef * entropy_loss + action_diversity_coef * action_diversity_loss
 
     # Info for logging
     info = {
         'policy_loss': policy_loss.item(),
         'entropy': entropy.mean().item(),
+        'action_diversity_loss': action_diversity_loss.item() if isinstance(action_diversity_loss, torch.Tensor) else action_diversity_loss,
+        'action0_prob': probs_action_0.mean().item(),
         'avg_advantage': advantages.mean().item(),
         'std_advantage': advantages.std().item(),
         'avg_q_value': action_q_values.mean().item(),

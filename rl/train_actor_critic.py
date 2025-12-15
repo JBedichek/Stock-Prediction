@@ -28,7 +28,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from rl.rl_components import ActorCriticAgent, ReplayBuffer, compute_critic_loss, compute_actor_loss
 from rl.rl_environment import TradingEnvironment
 from rl.vectorized_env import VectorizedTradingEnv
-from rl.reduced_action_space import get_top_4_stocks, create_global_state, decode_action_to_trades
+from rl.reduced_action_space import (
+    get_top_4_stocks, get_top_k_stocks_per_horizon, sample_top_4_from_top_k,
+    create_global_state, decode_action_to_trades
+)
 from inference.backtest_simulation import DatasetLoader
 
 # Re-enable gradients
@@ -59,7 +62,12 @@ class ActorCriticTrainer:
             prices_path=config.get('prices_path', 'data/actual_prices.h5'),
             num_test_stocks=config.get('num_test_stocks', 100)
         )
-        print(f"   ✅ Loaded {len(self.data_loader.test_tickers)} stocks")
+        # Count stocks with price data
+        all_tickers = list(self.data_loader.h5_file.keys()) if self.data_loader.is_hdf5 else list(self.data_loader.data.keys())
+        stocks_with_prices = sum(1 for ticker in all_tickers
+                                if ticker in self.data_loader.prices_file)
+        print(f"   ✅ Loaded {len(all_tickers)} total stocks")
+        print(f"   ✅ {stocks_with_prices} stocks have price data (used for training/validation)")
 
         # Initialize agent
         print("\n2. Initializing agent...")
@@ -83,8 +91,9 @@ class ActorCriticTrainer:
             print(f"   ⚠️  No pre-trained critic found at {critic_checkpoint_path}")
             print(f"      Starting with random critic weights (both critics)")
 
-        # Freeze predictor
+        # Freeze predictor and ensure it stays in eval mode (critical for consistent dropout behavior)
         self.agent.feature_extractor.freeze_predictor()
+        self.agent.feature_extractor.eval()  # Ensure entire feature extractor is in eval mode
 
         # Optimizers
         self.actor_optimizer = optim.AdamW(
@@ -148,9 +157,63 @@ class ActorCriticTrainer:
         sample_ticker = list(self.data_loader.prices_file.keys())[0]
         prices_dates_bytes = self.data_loader.prices_file[sample_ticker]['dates'][:]
         all_trading_days = sorted([d.decode('utf-8') for d in prices_dates_bytes])
-        self.recent_trading_days = [d for d in all_trading_days if d >= cutoff_date]
+        recent_trading_days = [d for d in all_trading_days if d >= cutoff_date]
 
-        print(f"   📊 Using {len(self.recent_trading_days)} trading days (last 4 years)")
+        # Train/Validation split: Use most recent 2 months for validation
+        print(f"   📅 Total trading days in last 4 years: {len(recent_trading_days)}")
+        print(f"   📅 Date range: {recent_trading_days[0]} to {recent_trading_days[-1]}")
+
+        # Find the most recent date with data
+        most_recent_date = datetime.strptime(recent_trading_days[-1], '%Y-%m-%d')
+        print(f"   📅 Most recent date: {most_recent_date.strftime('%Y-%m-%d')}")
+
+        # Calculate validation cutoff (2 months back from most recent)
+        val_months_back = config.get('val_months_back', 2)
+        val_cutoff_date = (most_recent_date - timedelta(days=val_months_back * 30)).strftime('%Y-%m-%d')
+
+        # Split into train and validation
+        self.train_dates = [d for d in recent_trading_days if d < val_cutoff_date]
+        self.val_dates = [d for d in recent_trading_days if d >= val_cutoff_date]
+
+        print(f"   📊 Train: {len(self.train_dates)} days ({self.train_dates[0]} to {self.train_dates[-1]})")
+        print(f"   📊 Val:   {len(self.val_dates)} days ({self.val_dates[0]} to {self.val_dates[-1]})")
+        print(f"   📊 Validation uses most recent {val_months_back} months of data")
+
+        # Validate we have enough data
+        if len(self.val_dates) < 20:
+            print(f"   ⚠️  Warning: Only {len(self.val_dates)} validation days - may need more data")
+        if len(self.train_dates) < 100:
+            print(f"   ⚠️  Warning: Only {len(self.train_dates)} training days - may need more data")
+
+        # Verify validation dates have actual price data
+        # Check a few validation dates to ensure they have data for test stocks
+        print(f"   🔍 Verifying validation data availability...")
+        test_dates = self.val_dates[::max(1, len(self.val_dates)//5)]  # Sample 5 dates
+        missing_data_dates = []
+        for date in test_dates:
+            # Check if we have prices for at least some test stocks on this date
+            has_data = False
+            for ticker in list(self.data_loader.test_tickers)[:10]:  # Check first 10 test stocks
+                if ticker in self.data_loader.prices_file:
+                    ticker_data = self.data_loader.prices_file[ticker]
+                    dates_bytes = ticker_data['dates'][:]
+                    ticker_dates = [d.decode('utf-8') for d in dates_bytes]
+                    if date in ticker_dates:
+                        has_data = True
+                        break
+            if not has_data:
+                missing_data_dates.append(date)
+
+        if missing_data_dates:
+            print(f"   ⚠️  Warning: Some validation dates may have limited data: {missing_data_dates[:3]}")
+        else:
+            print(f"   ✅ Validation dates have price data")
+
+        # Use train dates for training
+        self.recent_trading_days = self.train_dates
+
+        print(f"\n   🌍 Training/Validation/Inference will use ALL {stocks_with_prices} stocks")
+        print(f"   📈 Agent will select top-K from entire stock universe each day")
 
         # Initialize environment (vectorized for parallel simulation)
         print("\n4. Initializing vectorized environment...")
@@ -244,6 +307,12 @@ class ActorCriticTrainer:
         # Cache top-4 stocks per date (same across all parallel envs)
         self.top_4_cache = {}
 
+        # Validation tracking
+        self.best_val_return = -float('inf')
+        self.best_val_portfolio_value = 0.0
+        self.val_history = []
+        self.epochs_without_improvement = 0
+
         # Initialize WandB
         use_wandb = config.get('use_wandb', True)
         if use_wandb:
@@ -294,6 +363,8 @@ class ActorCriticTrainer:
         episode_q1_values = [[] for _ in range(num_parallel)]
         episode_q2_values = [[] for _ in range(num_parallel)]
         episode_q_diffs = [[] for _ in range(num_parallel)]
+        episode_action_diversity_losses = [[] for _ in range(num_parallel)]
+        episode_action0_probs = [[] for _ in range(num_parallel)]
 
         # Run episodes until all complete
         max_steps = self.config.get('episode_length', 30)
@@ -312,15 +383,25 @@ class ActorCriticTrainer:
                         unique_dates[date] = []
                     unique_dates[date].append(i)
 
-            # Get top-4 stocks for each unique date (only compute once per date)
+            # Get top-K stocks for each unique date, then randomly sample 4 (only compute once per date)
             date_to_top4 = {}
+            top_k_per_horizon = self.config.get('top_k_per_horizon_sampling', 3)
+
             for date in unique_dates:
                 if date not in self.top_4_cache:
-                    # First time seeing this date - compute and cache
+                    # First time seeing this date - compute top-K and cache
                     env_idx = unique_dates[date][0]
-                    cached_states = self.vec_env.envs[env_idx].state_cache[date]
-                    self.top_4_cache[date] = get_top_4_stocks(cached_states)
-                date_to_top4[date] = self.top_4_cache[date]
+                    all_cached_states = self.vec_env.envs[env_idx].state_cache[date]
+                    # TRAINING: Use ALL stocks with price data (same as validation/inference)
+                    # This ensures the agent trains on the full stock universe it will see in production
+                    cached_states = {ticker: state for ticker, state in all_cached_states.items()
+                                   if ticker in self.data_loader.prices_file}
+                    # Get top-K per horizon (e.g., k=3 gives 12 total stocks)
+                    self.top_4_cache[date] = get_top_k_stocks_per_horizon(cached_states, k=top_k_per_horizon)
+
+                # Randomly sample 4 from top-K for each environment (training diversity)
+                top_k_stocks = self.top_4_cache[date]
+                date_to_top4[date] = sample_top_4_from_top_k(top_k_stocks, sample_size=4, deterministic=False)
 
             # Assign top-4 stocks to each environment
             top_4_stocks_list = []
@@ -409,11 +490,15 @@ class ActorCriticTrainer:
                             next_env = self.vec_env.envs[i]
                             next_date = next_env.current_date
 
-                            # Get cached top-4 for next date
+                            # Get cached top-K for next date, then randomly sample 4
                             if next_date not in self.top_4_cache:
                                 next_cached_states = next_env.state_cache[next_date]
-                                self.top_4_cache[next_date] = get_top_4_stocks(next_cached_states)
-                            next_top_4_stocks = self.top_4_cache[next_date]
+                                top_k_per_horizon = self.config.get('top_k_per_horizon_sampling', 3)
+                                self.top_4_cache[next_date] = get_top_k_stocks_per_horizon(next_cached_states, k=top_k_per_horizon)
+
+                            # Randomly sample 4 from top-K (training diversity)
+                            top_k_stocks = self.top_4_cache[next_date]
+                            next_top_4_stocks = sample_top_4_from_top_k(top_k_stocks, sample_size=4, deterministic=False)
 
                             # Create states for next top-4 stocks only
                             next_top_4_tickers = [ticker for ticker, _ in next_top_4_stocks]
@@ -516,6 +601,8 @@ class ActorCriticTrainer:
                         episode_advantages[i].append(actor_info['avg_advantage'])
                         episode_q_values[i].append(actor_info['avg_q_value'])
                         episode_grad_norms[i].append(actor_info['grad_norm'])
+                        episode_action_diversity_losses[i].append(actor_info.get('action_diversity_loss', 0.0))
+                        episode_action0_probs[i].append(actor_info.get('action0_prob', 0.0))
 
                 # Update both target critics
                 self.agent.update_target_critics(tau=self.config.get('tau', 0.005))
@@ -555,6 +642,8 @@ class ActorCriticTrainer:
                 'avg_critic_loss': avg_critic_loss,
                 'avg_actor_loss': avg_actor_loss,
                 'avg_entropy': np.mean(episode_entropies[i]) if episode_entropies[i] else 0.0,
+                'avg_action_diversity_loss': np.mean(episode_action_diversity_losses[i]) if episode_action_diversity_losses[i] else 0.0,
+                'avg_action0_prob': np.mean(episode_action0_probs[i]) if episode_action0_probs[i] else 0.0,
                 'avg_advantage': np.mean(episode_advantages[i]) if episode_advantages[i] else 0.0,
                 'avg_q_value': np.mean(episode_q_values[i]) if episode_q_values[i] else 0.0,
                 'avg_q1_value': np.mean(episode_q1_values[i]) if episode_q1_values[i] else 0.0,
@@ -810,7 +899,8 @@ class ActorCriticTrainer:
             agent=self.agent,
             batch=batch,
             device=self.device,
-            entropy_coef=self.config.get('entropy_coef', 0.05)
+            entropy_coef=self.config.get('entropy_coef', 0.05),
+            action_diversity_coef=self.config.get('action_diversity_coef', 0.0)
         )
 
         self.actor_optimizer.zero_grad()
@@ -871,6 +961,7 @@ class ActorCriticTrainer:
                     'actor_loss': stats['avg_actor_loss'],
                     'actor_loss_ema': stats['ema_actor_loss'],
                     'entropy': stats['avg_entropy'],
+                    'action_diversity_loss': stats.get('avg_action_diversity_loss', 0.0),
                     'q_value': stats['avg_q_value'],
                     'q1_value': stats['avg_q1_value'],
                     'q2_value': stats['avg_q2_value'],
@@ -884,6 +975,36 @@ class ActorCriticTrainer:
                     'action_3_pct': stats['pct_action_3'],
                     'action_4_pct': stats['pct_action_4'],
                 }, step=self.episode)
+
+            # Run validation
+            val_interval = self.config.get('val_interval', 500)
+            if val_interval > 0 and self.episode % val_interval < num_parallel:
+                val_stats = self.validate(
+                    num_episodes=self.config.get('val_episodes', 10),
+                    force_initial_trade=self.config.get('val_force_initial_trade', True)
+                )
+
+                # Log validation to WandB
+                if use_wandb:
+                    wandb.log({
+                        'val_mean_return': val_stats['val_mean_return'],
+                        'val_std_return': val_stats['val_std_return'],
+                        'val_mean_portfolio_value': val_stats['val_mean_portfolio_value'],
+                        'val_std_portfolio_value': val_stats['val_std_portfolio_value'],
+                        'val_min_return': val_stats['val_min_return'],
+                        'val_max_return': val_stats['val_max_return'],
+                        'best_val_return': self.best_val_return,
+                        'best_val_portfolio_value': self.best_val_portfolio_value,
+                        'epochs_without_improvement': self.epochs_without_improvement,
+                    }, step=self.episode)
+
+                # Early stopping check
+                early_stop_patience = self.config.get('early_stop_patience', 0)
+                if early_stop_patience > 0 and self.epochs_without_improvement >= early_stop_patience:
+                    print(f"\n⚠️  Early stopping: No improvement for {early_stop_patience} validation checks")
+                    print(f"   Best val return: {self.best_val_return:+.4f}")
+                    print(f"   Best val portfolio: ${self.best_val_portfolio_value/1000:.1f}k")
+                    break
 
             # Save checkpoint
             if self.episode % self.config.get('save_interval', 1000) < num_parallel:
@@ -927,7 +1048,10 @@ class ActorCriticTrainer:
             'critic1_optimizer_state_dict': self.critic1_optimizer.state_dict(),
             'critic2_optimizer_state_dict': self.critic2_optimizer.state_dict(),
             'config': self.config,
-            'episode_history': self.episode_history
+            'episode_history': self.episode_history,
+            'val_history': self.val_history,
+            'best_val_return': self.best_val_return,
+            'best_val_portfolio_value': self.best_val_portfolio_value,
         }
 
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -938,6 +1062,263 @@ class ActorCriticTrainer:
         df = pd.DataFrame(self.episode_history)
         csv_path = './checkpoints/actor_critic_training_history.csv'
         df.to_csv(csv_path, index=False)
+
+    def validate(self, num_episodes: int = 10, force_initial_trade: bool = True) -> Dict:
+        """
+        Run validation episodes on held-out dates (no training).
+
+        Validation simulates realistic production conditions:
+        - Uses held-out DATES (most recent 2 months)
+        - Uses ALL STOCKS (not just test subset) - realistic stock universe
+        - Tests temporal generalization (train on past, validate on future)
+
+        Args:
+            num_episodes: Number of validation episodes to run
+            force_initial_trade: If True, force a random buy on first step to ensure trading activity
+
+        Returns:
+            Dictionary of validation statistics
+        """
+        print(f"\n🔍 Running validation ({num_episodes} episodes on {len(self.val_dates)} val dates)...")
+        if force_initial_trade:
+            print(f"   🎲 Forced initial trade enabled for validation")
+        print(f"   🌍 Using ALL stocks for validation (production-realistic conditions)")
+
+        # Create temporary validation environment
+        # Cap episode length to available validation days (avoid randint error)
+        requested_episode_length = self.config.get('episode_length', 30)
+        val_episode_length = min(len(self.val_dates) - 1, requested_episode_length)
+        if val_episode_length < requested_episode_length:
+            print(f"   ⚠️  Episode length capped at {val_episode_length} days (validation period only has {len(self.val_dates)} days)")
+
+        val_env = TradingEnvironment(
+            data_loader=self.data_loader,
+            agent=self.agent,
+            initial_capital=self.config.get('initial_capital', 100000),
+            max_positions=self.config.get('max_positions', 1),
+            episode_length=val_episode_length,
+            device=self.device,
+            trading_days_filter=self.val_dates,  # Use validation dates
+            top_k_per_horizon=self.config.get('top_k_per_horizon', 10)
+        )
+
+        # Share state cache if available
+        if hasattr(self.vec_env.envs[0], 'state_cache'):
+            val_env.state_cache = self.vec_env.envs[0].state_cache
+            val_env.price_cache = self.vec_env.envs[0].price_cache
+
+        # Set networks to eval mode (CRITICAL: Must include feature_extractor!)
+        self.agent.actor.eval()
+        self.agent.critic1.eval()
+        self.agent.critic2.eval()
+        self.agent.feature_extractor.eval()  # FIX: Ensure predictor dropout is disabled
+
+        val_returns = []
+        val_portfolio_values = []
+        all_actions = []  # Track all actions across episodes
+        all_trades_count = 0  # Count total trades
+
+        with torch.no_grad():
+            for ep in range(num_episodes):
+                val_env.reset()
+                current_position = None
+                episode_return = 0.0
+
+                for step in range(val_episode_length):
+                    # Get current state - USE ALL STOCKS for validation (realistic production conditions)
+                    all_cached_states = val_env.state_cache[val_env.current_date]
+                    # Only filter out stocks without price data, but include ALL stocks (not just test set)
+                    cached_states = {ticker: state for ticker, state in all_cached_states.items()
+                                   if ticker in self.data_loader.prices_file}
+
+                    if step == 0 and ep == 0:  # Debug first step of first episode
+                        print(f"   📊 Validation debug:")
+                        print(f"      Total cached states: {len(all_cached_states)}")
+                        print(f"      Filtered states (with price data): {len(cached_states)}")
+                        print(f"      Sample filtered tickers: {sorted(list(cached_states.keys()))[:20]}")
+
+                        # Show ticker diversity
+                        first_letters = {}
+                        for ticker in cached_states.keys():
+                            letter = ticker[0]
+                            first_letters[letter] = first_letters.get(letter, 0) + 1
+                        print(f"      Ticker diversity (first letter): {dict(sorted(first_letters.items())[:10])}")
+
+                    # Use deterministic top-4 for validation (always same stocks for consistency)
+                    top_k_per_horizon = self.config.get('top_k_per_horizon_sampling', 3)
+                    top_k_stocks = get_top_k_stocks_per_horizon(cached_states, k=top_k_per_horizon)
+                    top_4_stocks = sample_top_4_from_top_k(top_k_stocks, sample_size=4, deterministic=True)
+
+                    if step == 0 and ep == 0:
+                        print(f"      Top-4 stocks: {[ticker for ticker, _ in top_4_stocks]}")
+
+                    # Get cached prices and compute portfolio value
+                    cached_prices = val_env.price_cache.get(val_env.current_date, {})
+                    portfolio_value = val_env._portfolio_value_cached(cached_prices)
+
+                    # Force an initial trade if requested (to ensure trading activity)
+                    if force_initial_trade and step == 0 and current_position is None:
+                        # Pick a random stock from top-4 that has data
+                        import random
+                        available_stocks = [ticker for ticker, _ in top_4_stocks if ticker in cached_states and ticker in cached_prices]
+                        if available_stocks:
+                            random_stock = random.choice(available_stocks)
+                            action = [i+1 for i, (ticker, _) in enumerate(top_4_stocks) if ticker == random_stock][0]
+                            trades = [{'action': 'BUY', 'ticker': random_stock}]
+                            if ep == 0:
+                                print(f"      🎲 Forced initial trade: BUY {random_stock}")
+                        else:
+                            if ep == 0:
+                                print(f"      ⚠️  No available stocks to trade, skipping forced trade")
+                            trades = []
+                            action = 0
+                    else:
+                        # Create states for top-4 stocks
+                        states = {}
+
+                        for ticker, _ in top_4_stocks:
+                            if ticker in cached_states and ticker in cached_prices:
+                                cached_state = cached_states[ticker]
+                                price = cached_prices[ticker]
+                                portfolio_context = val_env._create_portfolio_context_fast(
+                                    ticker, price, portfolio_value
+                                )
+                                state = torch.cat([
+                                    cached_state[:1444].to(self.device),
+                                    portfolio_context.to(self.device)
+                                ])
+                                states[ticker] = state
+
+                        # DEBUG: Log policy behavior for first episode, first 10 steps
+                        if ep == 0 and (step < 10 or step % 10 == 0):
+                            from rl.reduced_action_space import create_global_state
+                            import torch.nn.functional as F
+
+                            global_state = create_global_state(
+                                top_4_stocks, states, current_position, device=self.device
+                            )
+                            with torch.no_grad():
+                                logits = self.agent.actor(global_state.unsqueeze(0)).squeeze(0)
+                                probs = F.softmax(logits, dim=-1)
+
+                                # Get Q-values for debugging
+                                q_values1 = self.agent.critic1(global_state.unsqueeze(0)).squeeze(0)
+                                q_values2 = self.agent.critic2(global_state.unsqueeze(0)).squeeze(0)
+                                q_values = torch.min(q_values1, q_values2)
+
+                            print(f"\n      🔍 VALIDATION DEBUG [Ep {ep}, Step {step}, Date {val_env.current_date}]:")
+                            print(f"         Current position: {current_position}")
+                            print(f"         Top-4 stocks: {[t for t, _ in top_4_stocks]}")
+                            print(f"         Portfolio value: ${portfolio_value:,.2f}")
+                            print(f"         Cash: ${val_env.cash:,.2f}")
+                            print(f"         Step index: {val_env.step_idx}")
+
+                            # DEBUG: Print state statistics
+                            print(f"         Global state shape: {global_state.shape}")
+                            print(f"         Global state mean: {global_state.mean().item():.6f}")
+                            print(f"         Global state std: {global_state.std().item():.6f}")
+                            print(f"         Global state min/max: {global_state.min().item():.2f} / {global_state.max().item():.2f}")
+
+                            # Show sample of portfolio context
+                            portfolio_context_start = 4 * 1469
+                            sample_portfolio = global_state[portfolio_context_start:portfolio_context_start+10]
+                            print(f"         Sample portfolio context: {sample_portfolio.cpu().numpy()}")
+
+                            print(f"         Logits: {logits.cpu().numpy()}")
+                            print(f"         Action probs: {probs.cpu().numpy()}")
+                            print(f"         Q-values: {q_values.cpu().numpy()}")
+                            print(f"         Action 0 (HOLD) prob: {probs[0].item():.4f}")
+
+                        # Select action deterministically (no exploration)
+                        action, _, _, trades = self.agent.select_action_reduced(
+                            top_4_stocks=top_4_stocks,
+                            states=states,
+                            current_position=current_position,
+                            epsilon=0.0,  # No exploration
+                            deterministic=True
+                        )
+
+                        if ep == 0 and (step < 10 or step % 10 == 0):
+                            action_meaning = "HOLD" if action == 0 else f"SWITCH TO {[t for t, _ in top_4_stocks][action-1]}"
+                            print(f"         Selected action: {action} ({action_meaning})")
+                            print(f"         Trades: {trades}")
+                            if action == 0:
+                                print(f"         ⚠️  Agent chose HOLD (action 0)")
+
+                    # Track actions and trades
+                    all_actions.append(action)
+                    all_trades_count += len(trades)
+
+                    # Execute trades
+                    actions = {}
+                    for trade in trades:
+                        ticker = trade['ticker']
+                        if trade['action'] == 'BUY':
+                            actions[ticker] = 1
+                        elif trade['action'] == 'SELL':
+                            actions[ticker] = 2
+
+                    # Step environment
+                    _, reward, done, info = val_env.step(actions)
+
+                    # Update position
+                    for trade in trades:
+                        if trade['action'] == 'SELL':
+                            current_position = None
+                        elif trade['action'] == 'BUY':
+                            current_position = trade['ticker']
+
+                    episode_return += reward
+
+                    if done:
+                        break
+
+                val_returns.append(episode_return)
+                val_portfolio_values.append(info['portfolio_value'])
+
+        # Restore training mode for actor/critics
+        self.agent.actor.train()
+        self.agent.critic1.train()
+        self.agent.critic2.train()
+        # NOTE: feature_extractor stays in eval mode (predictor is frozen and should not have dropout enabled)
+
+        # Compute statistics
+        val_stats = {
+            'val_mean_return': np.mean(val_returns),
+            'val_std_return': np.std(val_returns),
+            'val_mean_portfolio_value': np.mean(val_portfolio_values),
+            'val_std_portfolio_value': np.std(val_portfolio_values),
+            'val_min_return': np.min(val_returns),
+            'val_max_return': np.max(val_returns),
+        }
+
+        print(f"   ✅ Val Return: {val_stats['val_mean_return']:+.4f} ± {val_stats['val_std_return']:.4f}")
+        print(f"   ✅ Val Portfolio: ${val_stats['val_mean_portfolio_value']/1000:.1f}k ± ${val_stats['val_std_portfolio_value']/1000:.1f}k")
+
+        # Log action distribution
+        import collections
+        action_counts = collections.Counter(all_actions)
+        total_steps = len(all_actions)
+        print(f"   📊 Action Distribution ({total_steps} total steps):")
+        for action_id in range(5):
+            count = action_counts.get(action_id, 0)
+            pct = 100.0 * count / total_steps if total_steps > 0 else 0
+            action_name = "HOLD" if action_id == 0 else f"SWITCH-{action_id}"
+            print(f"      Action {action_id} ({action_name}): {count:4d} ({pct:5.1f}%)")
+        print(f"   📊 Total trades executed: {all_trades_count} (avg {all_trades_count/num_episodes:.1f} per episode)")
+
+        # Track best validation performance
+        if val_stats['val_mean_return'] > self.best_val_return:
+            self.best_val_return = val_stats['val_mean_return']
+            self.best_val_portfolio_value = val_stats['val_mean_portfolio_value']
+            self.epochs_without_improvement = 0
+            print(f"   🎯 New best validation performance!")
+        else:
+            self.epochs_without_improvement += 1
+
+        self.val_history.append(val_stats)
+
+        return val_stats
 
     def _load_checkpoint(self, checkpoint_path: str):
         """Load training state from checkpoint."""
@@ -967,7 +1348,15 @@ class ActorCriticTrainer:
             self.ema_return = last_stats.get('ema_return', None)
             self.ema_portfolio_value = last_stats.get('ema_portfolio_value', None)
 
+        # Restore validation tracking
+        self.val_history = checkpoint.get('val_history', [])
+        self.best_val_return = checkpoint.get('best_val_return', -float('inf'))
+        self.best_val_portfolio_value = checkpoint.get('best_val_portfolio_value', 0.0)
+
         print(f"   Loaded {len(self.episode_history)} historical episodes")
+        if self.val_history:
+            print(f"   Loaded {len(self.val_history)} validation checkpoints")
+            print(f"   Best validation return: {self.best_val_return:+.4f}")
 
 
 if __name__ == '__main__':
@@ -988,14 +1377,14 @@ if __name__ == '__main__':
         # Environment
         'initial_capital': 100000,
         'max_positions': 1,  # Single stock mode
-        'episode_length': 30,  # Shorter episodes for faster opportunity switching
+        'episode_length': 30,  # Longer episodes to expose holding behavior (was 30)
         'top_k_per_horizon': 10,
 
         # Training
         'num_episodes': 500000,
-        'num_parallel_envs': 16,  # Parallel environments for faster data collection
+        'num_parallel_envs': 32,  # Parallel environments for faster data collection
         'batch_size': 1024,  # Large batch for stable gradients
-        'updates_per_transition': 0.05,  # 0.25 = 1 update per 4 env steps (conservative, prevents overestimation)
+        'updates_per_transition': 0.25,  # 0.25 = 1 update per 4 env steps (conservative, prevents overestimation)
         'buffer_capacity': 50000,  # Smaller buffer = fresher data
         'reward_scale': 100.0,  # Scale rewards (0.01 → 1.0) for better gradients
         'actor_lr': 1e-4,
@@ -1003,16 +1392,27 @@ if __name__ == '__main__':
         'gamma': 0.99,
         'tau': 0.01,  # Increased from 0.005 for faster target network updates
         'entropy_coef': 0.05,  # Entropy regularization (prevent collapse)
+        'action_diversity_coef': 0.01,  # Action diversity regularization (encourage trading, not just holding)
         'epsilon': 0.1,  # Epsilon-greedy exploration rate
         'actor_update_freq': 2,  # Update actor every 2 critic updates
         'freeze_critic_episodes': 0,  # No critic freezing
 
         # Logging
-        'log_interval': 50,
-        'save_interval': 1000,
+        'log_interval': 500,
+        'save_interval': 5000,
         'use_wandb': True,
         'wandb_project': 'stock-rl-trading',
         'wandb_run_name': None,  # Auto-generated if None
+
+        # Validation
+        'val_months_back': 3,  # Use most recent N months for validation (increased from 2 to accommodate 60-day episodes)
+        'val_interval': 500,  # Run validation every N episodes (0 = disable)
+        'val_episodes': 10,  # Number of validation episodes to run
+        'val_force_initial_trade': True,  # Force an initial buy in validation to ensure trading
+        'early_stop_patience': 0,  # Stop if no improvement for N validation checks (0 = disable)
+
+        # Stock selection randomization (prevents overfitting)
+        'top_k_per_horizon_sampling': 3,  # Get top-3 per horizon (12 total), randomly sample 4
 
         # Resume training (set to checkpoint path to continue from)
         'resume_checkpoint': None,  # e.g., './checkpoints/actor_critic_ep10000.pt'
