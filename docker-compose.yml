@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  stock-prediction:
+    build: .
+    image: stock-prediction:latest
+    container_name: stock-prediction
+
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Mount data and checkpoints from host
+    volumes:
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+      - ./results:/app/results
+
+    # Interactive mode
+    stdin_open: true
+    tty: true
+
+    # Environment variables
+    environment:
+      - PYTHONPATH=/app
+      - CUDA_VISIBLE_DEVICES=0
+
+    # Working directory
+    working_dir: /app
+
+  # Training service
+  train:
+    extends:
+      service: stock-prediction
+    command: >
+      python -m training.walk_forward_training
+        --data data/all_complete_dataset.h5
+        --prices data/actual_prices_clean.h5
+        --output-dir checkpoints/walk_forward
+        --num-folds 6
+        --batch-size 64
+
+  # Evaluation service
+  evaluate:
+    extends:
+      service: stock-prediction
+    command: >
+      python -m inference.principled_evaluation
+        --checkpoint-dir checkpoints/walk_forward
+        --data data/all_complete_dataset.h5
+        --prices data/actual_prices_clean.h5
+        --sweep
+
+  # Download data service
+  download-data:
+    extends:
+      service: stock-prediction
+    command: >
+      python scripts/download_data.py
+        --repo-id ${HF_REPO_ID:-your-username/stock-prediction-data}

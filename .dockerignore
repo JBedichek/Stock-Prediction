@@ -1,0 +1,67 @@
+# Data files (download separately from Hugging Face)
+*.h5
+*.hdf5
+*.pkl
+data/
+actual_prices.h5
+all_complete_dataset.h5
+all_price_data*.pkl
+
+# Checkpoints (download separately)
+checkpoints/
+*.pt
+*.pth
+
+# Results and outputs
+results/
+*.png
+*.json
+walk_forward_*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Temp
+tmp/
+temp/
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Profiling
+profiling_results/
