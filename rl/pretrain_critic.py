@@ -80,29 +80,31 @@ def pretrain_critic(
     print("\n2. Initializing agent...")
     agent = ActorCriticAgent(
         predictor_checkpoint_path=predictor_checkpoint,
-        state_dim=5881,  # 4 stocks × 1469 + 5 position encoding
+        state_dim=11761,  # 8 stocks × 1469 + 9 position encoding (4 long + 4 short + position type)
         hidden_dim=1024,
-        action_dim=5  # cash + 4 stocks
+        action_dim=9  # HOLD + 4 long stocks + 4 short stocks
     ).to(device)
 
-    # Freeze predictor and actor (only training critic)
+    # Freeze predictor and actor (only training critics)
     agent.feature_extractor.freeze_predictor()
     for param in agent.actor.parameters():
         param.requires_grad = False
     agent.actor.eval()
 
-    # Critic in training mode
-    agent.critic.train()
-    agent.target_critic.eval()
+    # Twin critics in training mode
+    agent.critic1.train()
+    agent.critic2.train()
+    agent.target_critic1.eval()
+    agent.target_critic2.eval()
 
     print(f"   ✅ Agent initialized")
     print(f"   - Feature extractor: FROZEN")
     print(f"   - Actor: FROZEN (not used)")
-    print(f"   - Critic: TRAINING")
+    print(f"   - Twin Critics: TRAINING")
 
-    # Optimizer for critic only
+    # Optimizer for both critics
     optimizer = optim.AdamW(
-        agent.critic.parameters(),
+        list(agent.critic1.parameters()) + list(agent.critic2.parameters()),
         lr=learning_rate,
         weight_decay=1e-4
     )
@@ -147,13 +149,16 @@ def pretrain_critic(
             optimizer.zero_grad()
             loss.backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), max_norm=1.0)
+            # Gradient clipping (both critics)
+            torch.nn.utils.clip_grad_norm_(
+                list(agent.critic1.parameters()) + list(agent.critic2.parameters()),
+                max_norm=1.0
+            )
 
             optimizer.step()
 
-            # Update target network (for consistency with online phase)
-            agent.update_target_critic(tau=tau)
+            # Update target networks (for consistency with online phase)
+            agent.update_target_critics(tau=tau)  # Updates both target critics
 
             # Record loss
             epoch_losses.append(loss.item())
@@ -179,8 +184,10 @@ def pretrain_critic(
             # Save checkpoint
             checkpoint = {
                 'epoch': epoch,
-                'critic_state_dict': agent.critic.state_dict(),
-                'target_critic_state_dict': agent.target_critic.state_dict(),
+                'critic1_state_dict': agent.critic1.state_dict(),
+                'critic2_state_dict': agent.critic2.state_dict(),
+                'target_critic1_state_dict': agent.target_critic1.state_dict(),
+                'target_critic2_state_dict': agent.target_critic2.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
                 'training_history': training_history
@@ -223,7 +230,8 @@ def evaluate_critic(
     Returns:
         Dictionary of evaluation metrics
     """
-    agent.critic.eval()
+    agent.critic1.eval()
+    agent.critic2.eval()
 
     # Sample batch
     batch = buffer.sample(num_samples)
@@ -234,15 +242,23 @@ def evaluate_critic(
     rewards = torch.tensor([t['reward'] for t in batch], dtype=torch.float32).to(device)
 
     with torch.no_grad():
-        # Get Q-values
-        q_values = agent.critic(states)
-        predicted_values = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+        # Get Q-values from both critics
+        q1_values = agent.critic1(states)
+        q2_values = agent.critic2(states)
+
+        # Get predicted values for taken actions
+        predicted_values_q1 = q1_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+        predicted_values_q2 = q2_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        # Use minimum for conservative estimate (TD3 approach)
+        predicted_values = torch.min(predicted_values_q1, predicted_values_q2)
 
         # Calculate metrics
         mse = ((predicted_values - rewards) ** 2).mean().item()
         mae = (predicted_values - rewards).abs().mean().item()
 
-        # Q-value statistics
+        # Q-value statistics (using min of both critics)
+        q_values = torch.min(q1_values, q2_values)
         q_mean = q_values.mean().item()
         q_std = q_values.std().item()
         q_max = q_values.max().item()
@@ -259,7 +275,8 @@ def evaluate_critic(
         'avg_actual_reward': rewards.mean().item()
     }
 
-    agent.critic.train()
+    agent.critic1.train()
+    agent.critic2.train()
 
     return metrics
 
@@ -269,7 +286,7 @@ if __name__ == '__main__':
     agent, history = pretrain_critic(
         data_path='data/critic_training_data.pkl',
         save_path='./checkpoints/pretrained_critic.pt',
-        num_epochs=5,
+        num_epochs=40,
         batch_size=256,
         learning_rate=1e-4
     )

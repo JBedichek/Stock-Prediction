@@ -9,6 +9,7 @@ Scrapes news articles from multiple sources:
 Collects news headlines and full text for embedding.
 """
 
+import os
 import requests
 import pandas as pd
 import numpy as np

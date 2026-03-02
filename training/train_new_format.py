@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils.checkpoint import checkpoint
 from lion_pytorch import Lion
 import wandb
 import argparse
@@ -167,7 +168,8 @@ class SimpleTransformerPredictor(nn.Module):
                  num_heads: int = 8,
                  dropout: float = 0.1,
                  num_pred_days: int = 4,
-                 pred_mode: str = 'regression'):
+                 pred_mode: str = 'regression',
+                 use_gradient_checkpointing: bool = False):
         """
         Initialize model.
 
@@ -179,6 +181,7 @@ class SimpleTransformerPredictor(nn.Module):
             dropout: Dropout rate
             num_pred_days: Number of future days to predict
             pred_mode: 'regression' or 'classification'
+            use_gradient_checkpointing: If True, use gradient checkpointing to save memory
         """
         super().__init__()
 
@@ -186,6 +189,7 @@ class SimpleTransformerPredictor(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_pred_days = num_pred_days
         self.pred_mode = pred_mode
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Input projection
         self.input_proj = nn.Sequential(
@@ -273,8 +277,12 @@ class SimpleTransformerPredictor(nn.Module):
         # Add positional encoding
         x = x + self.pos_encoding[:, :seq_len, :]
 
-        # Transformer
-        x = self.transformer(x)  # (batch, seq_len, hidden_dim)
+        # Transformer (with optional gradient checkpointing)
+        if self.use_gradient_checkpointing and self.training:
+            # Checkpoint the transformer to save memory
+            x = checkpoint(self.transformer, x, use_reentrant=False)
+        else:
+            x = self.transformer(x)  # (batch, seq_len, hidden_dim)
 
         # Mean pooling across sequence dimension
         x = x.mean(dim=1)  # (batch, hidden_dim)

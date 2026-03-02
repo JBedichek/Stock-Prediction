@@ -993,7 +993,8 @@ class TradingSimulator:
                  initial_capital: float = 100000.0,
                  confidence_percentile: float = 0.6,
                  verbose: bool = True,
-                 dynamic_cluster_filter = None):
+                 dynamic_cluster_filter = None,
+                 transaction_cost_pct: float = 0.001):
         """
         Args:
             data_loader: Dataset loader
@@ -1005,6 +1006,7 @@ class TradingSimulator:
             confidence_percentile: Percentile for confidence filtering (0.6 = keep top 40%)
             verbose: Print detailed trade information (default: True)
             dynamic_cluster_filter: Optional DynamicClusterFilter for daily filtering
+            transaction_cost_pct: Round-trip transaction cost as decimal (default 0.1% = 0.001)
         """
         self.data_loader = data_loader
         self.predictor = predictor
@@ -1015,6 +1017,7 @@ class TradingSimulator:
         self.confidence_percentile = confidence_percentile
         self.verbose = verbose
         self.dynamic_cluster_filter = dynamic_cluster_filter
+        self.transaction_cost_pct = transaction_cost_pct
 
         # Track cluster filtering stats
         self.cluster_filter_stats = {
@@ -1079,7 +1082,9 @@ class TradingSimulator:
             result = self.data_loader.get_features_and_price(ticker, date)
             if result is not None:
                 features, current_price = result
-                valid_data.append((ticker, features, current_price))
+                # Skip stocks with invalid prices (zero or negative)
+                if current_price is not None and current_price > 0:
+                    valid_data.append((ticker, features, current_price))
 
         if len(valid_data) == 0:
             return []
@@ -1180,17 +1185,24 @@ class TradingSimulator:
         stock_returns = []
 
         for ticker, expected_return, confidence, buy_price in top_stocks:
+            # Skip stocks with invalid buy price
+            if buy_price is None or buy_price <= 0:
+                continue
+
             # Get actual future price
             sell_price = self.data_loader.get_future_price(ticker, date, self.horizon_days)
 
-            if sell_price is None:
+            if sell_price is None or sell_price <= 0:
                 # Stock data not available - assume no change
                 actual_return = 1.0
             else:
                 actual_return = sell_price / buy_price
 
+            # Apply transaction costs (buy + sell = round trip)
+            actual_return_after_costs = actual_return * (1.0 - self.transaction_cost_pct)
+
             # Calculate profit for this stock
-            stock_profit = capital_per_stock * actual_return
+            stock_profit = capital_per_stock * actual_return_after_costs
             total_return += stock_profit
 
             stock_returns.append({
@@ -1263,6 +1275,9 @@ class TradingSimulator:
         """
         Run full trading simulation over the period.
 
+        Uses NON-OVERLAPPING trades: only trade every horizon_days to avoid
+        reusing capital that's locked in existing positions.
+
         Args:
             trading_dates: List of dates to trade on
 
@@ -1274,14 +1289,17 @@ class TradingSimulator:
         print(f"{'='*80}")
         print(f"Strategy: Buy top-{self.top_k} stocks, hold for {self.horizon_days} days")
         print(f"Initial capital: ${self.initial_capital:,.2f}")
+        print(f"Trade frequency: Every {self.horizon_days} days (non-overlapping)")
 
         capital = self.initial_capital
         self.capital_history = [capital]
         self.trade_history = []
-        self.daily_returns = []
+        self.daily_returns = []  # Actually per-trade returns, not daily
 
         # We need to skip last horizon_days dates (can't complete trades)
-        tradeable_dates = trading_dates[:-self.horizon_days]
+        # AND only trade every horizon_days to avoid overlapping trades
+        all_tradeable_dates = trading_dates[:-self.horizon_days]
+        tradeable_dates = all_tradeable_dates[::self.horizon_days]  # Non-overlapping
 
         if self.verbose:
             print(f"\nSimulating {len(tradeable_dates)} trades...")
@@ -1322,9 +1340,15 @@ class TradingSimulator:
         avg_return = np.mean(self.daily_returns) if self.daily_returns else 0
         std_return = np.std(self.daily_returns) if self.daily_returns else 0
 
-        # Sharpe ratio (assuming 252 trading days/year, 0% risk-free rate)
-        if std_return > 0:
-            sharpe_ratio = (avg_return / std_return) * np.sqrt(252)
+        # Sharpe ratio (annualized based on holding period)
+        # With horizon_days holding period, there are 252/horizon_days trades per year
+        # Use a minimum std threshold to avoid astronomical values from near-zero variance
+        min_std_threshold = 1e-6
+        trades_per_year = 252 / self.horizon_days
+        if std_return > min_std_threshold:
+            sharpe_ratio = (avg_return / std_return) * np.sqrt(trades_per_year)
+            # Clamp to reasonable range (beyond ±10 is already exceptional)
+            sharpe_ratio = np.clip(sharpe_ratio, -100, 100)
         else:
             sharpe_ratio = 0
 
@@ -1668,8 +1692,8 @@ def main():
     # Data args
     parser.add_argument('--data', type=str, default="data/all_complete_dataset.h5",
                        help='Path to dataset (pickle or HDF5)')
-    parser.add_argument('--prices', type=str, default="data/actual_prices.h5",
-                       help='Path to HDF5 file with actual prices (optional, for normalized features)')
+    parser.add_argument('--prices', type=str, default="data/actual_prices_clean.h5",
+                       help='Path to HDF5 file with actual prices (use _clean.h5 for validated data)')
     parser.add_argument('--features-cache', type=str, default="./data/preloaded_features.h5",
                        help='Path to preloaded features cache (HDF5). If not provided, features will be loaded from dataset.')
     parser.add_argument('--save-features-cache', type=str, default="./data/preloaded_features.h5",

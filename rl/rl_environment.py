@@ -165,6 +165,10 @@ class TradingEnvironment:
         self.total_trades = 0
         self.profitable_trades = 0
 
+        # Risk tracking (for risk-aware reward shaping)
+        self.returns_history = []  # Track returns for volatility calculation
+        self.portfolio_history = []  # Track portfolio values for drawdown calculation
+
         # State cache (computed once per episode, stored in CPU RAM)
         # Structure: {date: {ticker: state_tensor (CPU)}}
         self.state_cache = {}
@@ -215,6 +219,10 @@ class TradingEnvironment:
         self.episode_history = []
         self.total_trades = 0
         self.profitable_trades = 0
+
+        # Reset risk tracking
+        self.returns_history = []
+        self.portfolio_history = [self.initial_capital]  # Start with initial capital
 
         # Check if states are already cached (from precompute_all_states)
         all_dates_cached = all(date in self.state_cache for date in self.dates)
@@ -647,7 +655,8 @@ class TradingEnvironment:
         portfolio_context = self._create_portfolio_context(ticker, current_price)
 
         # Concatenate: predictor features + portfolio context
-        state = torch.cat([pred_features, portfolio_context])
+        # Ensure both tensors are on the same device
+        state = torch.cat([pred_features, portfolio_context.to(pred_features.device)])
 
         return state
 
@@ -770,7 +779,73 @@ class TradingEnvironment:
         # Use cached prices for the current date (after advancing)
         next_cached_prices = self.price_cache.get(self.current_date if not done else self.dates[-1], {})
         portfolio_value_after = self._portfolio_value_cached(next_cached_prices)
-        reward = (portfolio_value_after - portfolio_value_before) / portfolio_value_before
+
+        # Compute return (handle short selling: portfolio can be negative)
+        # When shorting, a negative portfolio becoming more negative is a LOSS
+        # E.g., -100k → -120k means we lost 20k (return = -20%)
+        if abs(portfolio_value_before) < 1.0:  # Near-zero portfolio (avoid division issues)
+            # Use absolute change when base is tiny
+            raw_return = (portfolio_value_after - portfolio_value_before) / self.initial_capital
+        else:
+            # Standard percentage return
+            raw_return = (portfolio_value_after - portfolio_value_before) / abs(portfolio_value_before)
+
+        # Clip extreme returns to prevent overflow (±1000% = ±10x is already extreme)
+        raw_return = np.clip(raw_return, -10.0, 10.0)
+
+        # Additional safety: validate values are finite
+        if not np.isfinite(raw_return):
+            print(f"WARNING: Non-finite raw_return at step {self.step_idx}! "
+                  f"Before: {portfolio_value_before}, After: {portfolio_value_after}")
+            raw_return = 0.0
+
+        # Track returns and portfolio values for risk-aware reward shaping
+        self.returns_history.append(raw_return)
+        self.portfolio_history.append(portfolio_value_after)
+
+        # Asymmetric reward: Quadratic penalty for losses, linear reward for gains
+        # This makes agent more risk-averse to large losses
+        # Examples: -50% → -2500, -25% → -625, +25% → +25, +50% → +50
+        if raw_return < 0:
+            asymmetric_reward = raw_return * abs(raw_return) * 100  # Quadratic for losses
+        else:
+            asymmetric_reward = raw_return  # Linear for gains
+
+        # RISK-AWARE REWARD SHAPING (for noisy stock data)
+        # Compute rolling volatility penalty (20-day window)
+        volatility_penalty = 0.0
+        if len(self.returns_history) >= 2:
+            recent_returns = self.returns_history[-min(20, len(self.returns_history)):]
+            volatility = float(np.std(recent_returns))
+            volatility_penalty = 0.1 * volatility  # Penalize high volatility
+
+        # Compute drawdown penalty (20-day window)
+        drawdown_penalty = 0.0
+        if len(self.portfolio_history) >= 2:
+            recent_values = self.portfolio_history[-min(20, len(self.portfolio_history)):]
+            peak = max(recent_values)
+            current_value = recent_values[-1]
+            if peak > 0:
+                drawdown = (peak - current_value) / peak
+                drawdown_penalty = 0.5 * drawdown  # Penalize large drawdowns
+
+        # Final risk-adjusted reward
+        reward = asymmetric_reward - volatility_penalty - drawdown_penalty
+
+        # PENALTY FOR HOLDING CASH (encourages deploying capital)
+        # If agent has no positions, penalize to encourage trading
+        cash_hold_penalty = 0.0
+        if len(self.portfolio) == 0:
+            # Small daily penalty for holding 100% cash
+            # Equivalent to missing ~0.05% daily return opportunity
+            cash_hold_penalty = 0.0005
+            reward -= cash_hold_penalty
+
+        # Final safety check: ensure reward is finite
+        if not np.isfinite(reward):
+            print(f"WARNING: Non-finite reward at step {self.step_idx}! "
+                  f"asymmetric: {asymmetric_reward}, vol_penalty: {volatility_penalty}, dd_penalty: {drawdown_penalty}")
+            reward = 0.0
 
         # Info dictionary
         info = {
@@ -779,7 +854,8 @@ class TradingEnvironment:
             'num_positions': len(self.portfolio),
             'trades': trade_info,
             'step': self.step_idx,
-            'date': self.current_date if not done else self.dates[-1]
+            'date': self.current_date if not done else self.dates[-1],
+            'cash_hold_penalty': cash_hold_penalty
         }
 
         # Record in history
@@ -824,10 +900,12 @@ class TradingEnvironment:
         """
         Execute a single action.
 
-        Simplified action space (3 actions):
+        Action space (5 actions) WITH SHORT SELLING:
         0 = HOLD: Do nothing
-        1 = BUY: Allocate 50% of available capital
-        2 = SELL: Close position
+        1 = BUY: Allocate 100% of available capital (go LONG)
+        2 = SELL: Close long position
+        3 = SHORT: Borrow and sell shares (go SHORT)
+        4 = COVER: Buy back and return borrowed shares (close SHORT)
 
         Args:
             ticker: Stock ticker
@@ -849,8 +927,8 @@ class TradingEnvironment:
             if self.cash <= 0:
                 return None  # No cash
 
-            # Fixed 50% allocation (simpler than learning position sizing)
-            allocation_pct = 0.5
+            # Fixed 100% allocation (invest all available capital)
+            allocation_pct = 1.0
             allocation = self.cash * allocation_pct
 
             # Account for transaction costs
@@ -916,6 +994,92 @@ class TradingEnvironment:
                 'date': self.current_date
             }
 
+        elif action_id == 3:  # SHORT (borrow and sell shares)
+            # Check constraints
+            if ticker in self.portfolio:
+                return None  # Already have position (long or short)
+            if len(self.portfolio) >= self.max_positions:
+                return None  # Too many positions
+            if self.cash <= 0:
+                return None  # No cash for margin
+
+            # Fixed 100% allocation (use all available capital for shorting)
+            allocation_pct = 1.0
+            allocation = self.cash * allocation_pct
+
+            # Account for transaction costs
+            allocation_after_costs = allocation * (1 - self.transaction_cost)
+
+            # Calculate shares to short (sell borrowed shares)
+            shares = allocation_after_costs / current_price
+
+            if shares <= 0:
+                return None
+
+            # Execute short: store NEGATIVE shares to distinguish from long
+            # We receive cash from selling borrowed shares
+            self.portfolio[ticker] = {
+                'size': -shares,  # Negative indicates SHORT position
+                'entry_price': current_price,  # Price at which we shorted
+                'entry_date': self.current_date,
+                'days_held': 0
+            }
+            self.cash += allocation_after_costs  # Receive cash from sale
+            self.total_trades += 1
+
+            return {
+                'ticker': ticker,
+                'action': 'SHORT',
+                'shares': shares,  # Report positive shares (amount shorted)
+                'price': current_price,
+                'proceeds': allocation_after_costs,  # Cash received
+                'date': self.current_date
+            }
+
+        elif action_id == 4:  # COVER (buy back borrowed shares)
+            if ticker not in self.portfolio:
+                return None  # No position to cover
+
+            pos = self.portfolio[ticker]
+            if pos['size'] >= 0:
+                return None  # Not a short position (it's a long)
+
+            # Buy back borrowed shares
+            shares = abs(pos['size'])  # Convert negative to positive
+            cost = shares * current_price
+            cost_with_costs = cost * (1 + self.transaction_cost)
+
+            if cost_with_costs > self.cash:
+                return None  # Not enough cash to cover
+
+            # Calculate P&L (SHORT profits when price goes DOWN)
+            # We sold at entry_price, buying back at current_price
+            proceeds_from_short = shares * pos['entry_price']  # What we received when shorting
+            cost_to_cover = cost_with_costs  # What we pay to cover
+            pnl = proceeds_from_short - cost_to_cover  # Profit if price went down
+            pnl_pct = pnl / proceeds_from_short
+
+            # Execute cover
+            self.cash -= cost_with_costs
+            del self.portfolio[ticker]
+            self.total_trades += 1
+
+            if pnl > 0:
+                self.profitable_trades += 1
+
+            return {
+                'ticker': ticker,
+                'action': 'COVER',
+                'shares': shares,
+                'entry_price': pos['entry_price'],  # Price we shorted at
+                'exit_price': current_price,  # Price we covered at
+                'cost': cost_with_costs,
+                'pnl': pnl,
+                'pnl_pct': pnl_pct,
+                'days_held': pos['days_held'],
+                'date': self.current_date
+            }
+
         return None
 
     def _mark_to_market(self):
@@ -928,7 +1092,14 @@ class TradingEnvironment:
         for ticker in list(self.portfolio.keys()):
             current_price = cached_prices.get(ticker)
             if current_price is not None:
-                self._execute_single_action(ticker, 4, current_price)  # SELL
+                pos = self.portfolio[ticker]
+                # Check if LONG or SHORT position
+                if pos['size'] > 0:
+                    # LONG position: use SELL (action 2)
+                    self._execute_single_action(ticker, 2, current_price)
+                elif pos['size'] < 0:
+                    # SHORT position: use COVER (action 4)
+                    self._execute_single_action(ticker, 4, current_price)
 
     def _portfolio_value(self) -> float:
         """

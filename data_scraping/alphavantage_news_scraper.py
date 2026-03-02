@@ -11,6 +11,7 @@ API Docs: https://www.alphavantage.co/documentation/#news-sentiment
 Pricing: https://www.alphavantage.co/premium/
 """
 
+import os
 import requests
 import time
 from datetime import datetime, timedelta

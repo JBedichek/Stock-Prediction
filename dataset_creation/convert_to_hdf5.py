@@ -20,6 +20,7 @@ Usage:
         --output all_complete_dataset.h5
 """
 
+import os
 import h5py
 import numpy as np
 import torch

@@ -122,8 +122,8 @@ if __name__ == '__main__':
                        help='Path to HDF5 dataset')
     parser.add_argument('--model-path', type=str, default='./checkpoints/best_model_100m_1.18.pt',
                        help='Path to model checkpoint')
-    parser.add_argument('--prices-path', type=str, default='./data/actual_prices.h5',
-                       help='Path to actual prices HDF5')
+    parser.add_argument('--prices-path', type=str, default='./data/actual_prices_clean.h5',
+                       help='Path to actual prices HDF5 (use _clean.h5 for validated data)')
 
     # Cluster filtering
     parser.add_argument('--cluster-dir', type=str, default='./cluster_results',

@@ -679,8 +679,8 @@ def main():
     # Dataset paths
     parser.add_argument('--dataset', type=str, default='data/all_complete_dataset.h5',
                        help='Path to HDF5 dataset')
-    parser.add_argument('--prices', type=str, default='data/actual_prices.h5',
-                       help='Path to prices HDF5')
+    parser.add_argument('--prices', type=str, default='data/actual_prices_clean.h5',
+                       help='Path to prices HDF5 (use _clean.h5 for validated data)')
 
     # Model paths
     parser.add_argument('--model', type=str, default='checkpoints/best_model.pt',

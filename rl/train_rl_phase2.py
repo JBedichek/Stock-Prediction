@@ -691,7 +691,7 @@ def main():
 
     # Data
     parser.add_argument('--dataset-path', type=str, default="data/all_complete_dataset.h5", help='Path to dataset (HDF5 or pickle)')
-    parser.add_argument('--prices-path', type=str, default="data/actual_prices.h5", help='Path to prices HDF5 (if features are normalized)')
+    parser.add_argument('--prices-path', type=str, default="data/actual_prices_clean.h5", help='Path to prices HDF5 (use _clean for validated data)')
     parser.add_argument('--num-test-stocks', type=int, default=1000, help='Number of test stocks')
     parser.add_argument('--predictor-checkpoint', type=str, default="./checkpoints/best_model.pt", help='Path to predictor checkpoint')
 

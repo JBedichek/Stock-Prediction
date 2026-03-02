@@ -50,15 +50,31 @@ def fetch_price_data(ticker: str, start_date: str, end_date: str,
     for attempt in range(retry_count):
         try:
             # Download data
+            # IMPORTANT: Use auto_adjust=False to get both raw Close and Adj Close
+            # Then use Adj Close for split-adjusted prices
             stock = yf.Ticker(ticker)
-            df = stock.history(start=start_date, end=end_date, auto_adjust=True)
+            df = stock.history(start=start_date, end=end_date, auto_adjust=False)
 
             # Check if we got data
             if df.empty:
                 return None
 
-            # Rename columns to match FMP format
+            # Reset index to get Date as column
             df = df.reset_index()
+
+            # Calculate adjustment factor from Close vs Adj Close
+            # This accounts for both splits and dividends
+            if 'Adj Close' in df.columns and 'Close' in df.columns:
+                adj_factor = df['Adj Close'] / df['Close'].replace(0, np.nan)
+                adj_factor = adj_factor.fillna(1.0)
+
+                # Apply adjustment to OHLC prices for consistency
+                df['Open'] = df['Open'] * adj_factor
+                df['High'] = df['High'] * adj_factor
+                df['Low'] = df['Low'] * adj_factor
+                df['Close'] = df['Adj Close']  # Use adjusted close
+
+            # Rename columns to match FMP format
             df = df.rename(columns={
                 'Date': 'date',
                 'Open': 'open',

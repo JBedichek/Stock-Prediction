@@ -541,7 +541,7 @@ def main():
     # Required
     parser.add_argument('--cluster-dir', type=str, default="./cluster_results", help='Directory with cluster results')
     parser.add_argument('--dataset-path', type=str, default="./data/all_complete_dataset.h5", help='Path to dataset')
-    parser.add_argument('--prices-path', type=str, default="./data/actual_prices.h5", help='Path to prices HDF5')
+    parser.add_argument('--prices-path', type=str, default="./data/actual_prices_clean.h5", help='Path to prices HDF5 (use _clean for validated data)')
 
     # Analysis
     parser.add_argument('--horizons', type=int, nargs='+', default=[1, 5, 10, 20], help='Horizons to analyze')

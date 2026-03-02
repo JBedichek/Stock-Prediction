@@ -784,8 +784,8 @@ def main():
     # Data args
     parser.add_argument('--data', type=str, default="data/all_complete_dataset.h5",
                        help='Path to dataset')
-    parser.add_argument('--prices', type=str, default="data/actual_prices.h5",
-                       help='Path to prices HDF5')
+    parser.add_argument('--prices', type=str, default="data/actual_prices_clean.h5",
+                       help='Path to prices HDF5 (use _clean.h5 for validated data)')
     parser.add_argument('--model', type=str, default="checkpoints/best_model.pt",
                        help='Path to model checkpoint (or first model if using --ensemble-models)')
     parser.add_argument('--ensemble-models', type=str, nargs='+', default=None,

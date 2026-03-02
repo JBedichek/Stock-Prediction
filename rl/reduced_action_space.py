@@ -22,29 +22,100 @@ import numpy as np
 from typing import Dict, Tuple, List, Optional
 
 
-def get_top_4_stocks(cached_states: Dict[str, torch.Tensor]) -> List[Tuple[str, int]]:
+def get_top_4_stocks(
+    cached_states: Dict[str, torch.Tensor],
+    sample_fraction: float = 1.0
+) -> List[Tuple[str, int]]:
     """
-    Get top-1 stock for each of 4 time horizons (VECTORIZED).
+    Get top-1 stock for each of 4 time horizons (VECTORIZED) with optional random sampling.
 
     Args:
         cached_states: Dict mapping ticker -> cached state (1444 dims)
+        sample_fraction: Fraction of stocks to randomly sample before selecting top-4
+                        (1.0 = use all stocks, 0.3 = randomly sample 30% of stocks)
 
     Returns:
         List of (ticker, horizon_idx) tuples, one per horizon
     """
-    return get_top_k_stocks_per_horizon(cached_states, k=1)
+    return get_top_k_stocks_per_horizon(cached_states, k=1, sample_fraction=sample_fraction)
+
+
+def get_bottom_4_stocks(
+    cached_states: Dict[str, torch.Tensor],
+    sample_fraction: float = 1.0
+) -> List[Tuple[str, int]]:
+    """
+    Get bottom-1 stock (worst predicted) for each of 4 time horizons for SHORT SELLING.
+
+    Args:
+        cached_states: Dict mapping ticker -> cached state (1444 dims)
+        sample_fraction: Fraction of stocks to randomly sample before selecting bottom-4
+                        (1.0 = use all stocks, 0.3 = randomly sample 30% of stocks)
+
+    Returns:
+        List of (ticker, horizon_idx) tuples, one per horizon (worst performers)
+    """
+    if len(cached_states) == 0:
+        return []
+
+    # Vectorized version: much faster than Python loops
+    tickers = list(cached_states.keys())
+
+    # Random sampling for diversity (prevents overfitting to specific stocks)
+    if sample_fraction < 1.0:
+        import random
+        sample_size = max(1, int(len(tickers) * sample_fraction))
+        # Ensure we have enough stocks to select bottom-4 from
+        sample_size = max(sample_size, 4)  # At least 4 stocks total
+        if sample_size < len(tickers):
+            tickers = random.sample(tickers, sample_size)
+
+    # Stack all cached states: (N_stocks, 1444 or 1469)
+    # OPTIMIZED: Pre-allocate tensor instead of list append + stack
+    n_stocks = len(tickers)
+    device = next(iter(cached_states.values())).device
+    states_tensor = torch.empty((n_stocks, 1444), device=device, dtype=torch.float32)
+
+    for i, ticker in enumerate(tickers):
+        state = cached_states[ticker]
+        if state.dim() > 1:
+            state = state.squeeze()
+        states_tensor[i] = state[:1444]  # First 1444 dims only
+
+    # Extract expected returns for all stocks at once: (N_stocks, 4)
+    expected_returns = states_tensor[:, 1428:1432]
+
+    # Find bottom-1 (worst) for each horizon (0-3) for shorting
+    bottom_stocks = []
+    for horizon_idx in range(4):
+        horizon_returns = expected_returns[:, horizon_idx]  # (N_stocks,)
+
+        # Get BOTTOM-1 index for this horizon (topk with largest=False gets smallest)
+        _, bottom_indices = torch.topk(horizon_returns, k=1, largest=False)
+
+        for idx in bottom_indices:
+            bottom_stocks.append((tickers[idx.item()], horizon_idx))
+
+    return bottom_stocks
 
 
 def get_top_k_stocks_per_horizon(
     cached_states: Dict[str, torch.Tensor],
-    k: int = 3
+    k: int = 3,
+    sample_fraction: float = 1.0
 ) -> List[Tuple[str, int]]:
     """
-    Get top-K stocks for each of 4 time horizons (VECTORIZED).
+    Get top-K stocks for each of 4 time horizons (VECTORIZED) with optional random sampling.
+
+    This function supports random sampling of the stock universe before selecting top-K,
+    which prevents overfitting to specific stocks and improves generalization.
 
     Args:
         cached_states: Dict mapping ticker -> cached state (1444 dims)
         k: Number of top stocks to return per horizon
+        sample_fraction: Fraction of stocks to randomly sample before selecting top-K
+                        (1.0 = use all stocks, 0.3 = randomly sample 30% of stocks)
+                        Set < 1.0 during training for diversity, 1.0 for validation
 
     Returns:
         List of (ticker, horizon_idx) tuples, k per horizon (4*k total)
@@ -55,15 +126,26 @@ def get_top_k_stocks_per_horizon(
     # Vectorized version: much faster than Python loops
     tickers = list(cached_states.keys())
 
+    # Random sampling for diversity (prevents overfitting to specific stocks)
+    if sample_fraction < 1.0:
+        import random
+        sample_size = max(1, int(len(tickers) * sample_fraction))
+        # Ensure we have enough stocks to select top-K from
+        sample_size = max(sample_size, k * 4)  # At least k per horizon
+        if sample_size < len(tickers):
+            tickers = random.sample(tickers, sample_size)
+
     # Stack all cached states: (N_stocks, 1444 or 1469)
-    states_list = []
-    for ticker in tickers:
+    # OPTIMIZED: Pre-allocate tensor instead of list append + stack
+    n_stocks = len(tickers)
+    device = next(iter(cached_states.values())).device
+    states_tensor = torch.empty((n_stocks, 1444), device=device, dtype=torch.float32)
+
+    for i, ticker in enumerate(tickers):
         state = cached_states[ticker]
         if state.dim() > 1:
             state = state.squeeze()
-        states_list.append(state[:1444])  # First 1444 dims only
-
-    states_tensor = torch.stack(states_list)  # (N_stocks, 1444)
+        states_tensor[i] = state[:1444]  # First 1444 dims only
 
     # Extract expected returns for all stocks at once: (N_stocks, 4)
     expected_returns = states_tensor[:, 1428:1432]
@@ -152,54 +234,107 @@ def select_action_epsilon_greedy(
 
 def create_global_state(
     top_4_stocks: List[Tuple[str, int]],
+    bottom_4_stocks: List[Tuple[str, int]],
     states: Dict[str, torch.Tensor],
     current_position: Optional[str],
-    device: str = 'cuda'
+    is_short: bool = False,
+    device: str = 'cuda',
+    allow_short: bool = True
 ) -> torch.Tensor:
     """
     Create global state representation for actor.
 
-    Concatenates:
-    - States for 4 top stocks (4 × 1469 = 5876 dims)
-    - One-hot encoding of current position (5 dims: cash or stock 1-4)
+    With short selling (allow_short=True):
+    - States for 4 top stocks to LONG (4 × 1469 = 5876 dims)
+    - States for 4 bottom stocks to SHORT (4 × 1469 = 5876 dims)
+    - One-hot encoding of current position (9 dims: cash, long 1-4, short 1-4)
+    Total: 11761 dims
+
+    Without short selling (allow_short=False):
+    - States for 4 top stocks to LONG (4 × 1469 = 5876 dims)
+    - One-hot encoding of current position (5 dims: cash, long 1-4)
     Total: 5881 dims
 
     Args:
-        top_4_stocks: List of (ticker, horizon_idx) for top stocks
+        top_4_stocks: List of (ticker, horizon_idx) for top stocks (to go LONG)
+        bottom_4_stocks: List of (ticker, horizon_idx) for bottom stocks (to go SHORT)
         states: Dict mapping ticker -> state tensor
         current_position: Currently held stock ticker (or None if in cash)
+        is_short: True if current position is a short, False if long
         device: Device to create tensor on
+        allow_short: Whether short selling is allowed
 
     Returns:
-        Global state tensor (5881 dims)
+        Global state tensor (11761 dims if allow_short=True, 5881 dims if allow_short=False)
     """
-    # Extract states for top 4 stocks
-    stock_states = []
-    stock_tickers = [ticker for ticker, _ in top_4_stocks]
+    # Extract states for top 4 stocks (LONG candidates)
+    long_stock_states = []
+    long_tickers = [ticker for ticker, _ in top_4_stocks]
 
     for ticker, _ in top_4_stocks:
         if ticker in states:
-            stock_states.append(states[ticker])
+            long_stock_states.append(states[ticker])
         else:
             # Fallback: zero state if ticker not found
-            stock_states.append(torch.zeros(1469, device=device))
+            long_stock_states.append(torch.zeros(1469, device=device))
 
-    # Concatenate stock states (4 × 1469 = 5876 dims)
-    stock_states_concat = torch.cat(stock_states)
+    if allow_short:
+        # Extract states for bottom 4 stocks (SHORT candidates)
+        short_stock_states = []
+        short_tickers = [ticker for ticker, _ in bottom_4_stocks]
 
-    # One-hot encode current position (5 dims)
-    position_encoding = torch.zeros(5, device=device)
-    if current_position is None:
-        position_encoding[0] = 1.0  # Cash
-    elif current_position in stock_tickers:
-        idx = stock_tickers.index(current_position) + 1  # 1-4 for stocks
-        position_encoding[idx] = 1.0
+        for ticker, _ in bottom_4_stocks:
+            if ticker in states:
+                short_stock_states.append(states[ticker])
+            else:
+                # Fallback: zero state if ticker not found
+                short_stock_states.append(torch.zeros(1469, device=device))
+
+        # Concatenate all 8 stock states (8 × 1469 = 11752 dims)
+        stock_states_concat = torch.cat(long_stock_states + short_stock_states)
+
+        # One-hot encode current position (9 dims)
+        # [cash, long1, long2, long3, long4, short1, short2, short3, short4]
+        position_encoding = torch.zeros(9, device=device)
+
+        if current_position is None:
+            position_encoding[0] = 1.0  # Cash
+        elif not is_short and current_position in long_tickers:
+            # Long position in one of the top stocks
+            idx = long_tickers.index(current_position) + 1  # 1-4 for long stocks
+            position_encoding[idx] = 1.0
+        elif is_short and current_position in short_tickers:
+            # Short position in one of the bottom stocks
+            idx = short_tickers.index(current_position) + 5  # 5-8 for short stocks
+            position_encoding[idx] = 1.0
+        else:
+            # Holding a stock not in current top/bottom 8 - encode as cash
+            position_encoding[0] = 1.0
+
+        # Concatenate: 11752 + 9 = 11761 dims
+        global_state = torch.cat([stock_states_concat, position_encoding])
+
     else:
-        # Holding a stock not in top 4 - encode as cash
-        position_encoding[0] = 1.0
+        # Without short selling: only 4 long stocks
+        # Concatenate 4 stock states (4 × 1469 = 5876 dims)
+        stock_states_concat = torch.cat(long_stock_states)
 
-    # Concatenate: 5876 + 5 = 5881 dims
-    global_state = torch.cat([stock_states_concat, position_encoding])
+        # One-hot encode current position (5 dims)
+        # [cash, long1, long2, long3, long4]
+        position_encoding = torch.zeros(5, device=device)
+
+        if current_position is None:
+            position_encoding[0] = 1.0  # Cash
+        elif current_position in long_tickers:
+            # Long position in one of the top stocks
+            idx = long_tickers.index(current_position) + 1  # 1-4 for long stocks
+            position_encoding[idx] = 1.0
+        else:
+            # Holding a stock not in current top 4 - encode as cash
+            position_encoding[0] = 1.0
+
+        # Concatenate: 5876 + 5 = 5881 dims
+        global_state = torch.cat([stock_states_concat, position_encoding])
 
     return global_state
 
@@ -207,40 +342,78 @@ def create_global_state(
 def decode_action_to_trades(
     action: int,
     top_4_stocks: List[Tuple[str, int]],
-    current_position: Optional[str]
-) -> List[Dict]:
+    bottom_4_stocks: List[Tuple[str, int]],
+    current_position: Optional[str],
+    current_is_short: bool = False
+) -> Tuple[List[Dict], Optional[str], bool]:
     """
-    Decode discrete action to trades (sell/buy operations).
+    Decode discrete action to trades (buy/sell/short operations) WITH SHORT SELLING.
 
     Args:
-        action: Discrete action (0-4)
-                0 = HOLD CURRENT POSITION (cash or stock)
-                1-4 = SWITCH TO STOCK 1-4 (top-ranked for each horizon)
-        top_4_stocks: List of (ticker, horizon_idx) for top stocks
+        action: Discrete action (0-8)
+                0 = HOLD CURRENT POSITION (cash, long, or short)
+                1-4 = GO LONG STOCK 1-4 (top-ranked for each horizon)
+                5-8 = GO SHORT STOCK 5-8 (bottom-ranked for each horizon)
+        top_4_stocks: List of (ticker, horizon_idx) for top stocks (LONG candidates)
+        bottom_4_stocks: List of (ticker, horizon_idx) for bottom stocks (SHORT candidates)
         current_position: Currently held stock ticker (or None for cash)
+        current_is_short: True if current position is a short, False if long
 
     Returns:
-        List of trade dicts: [{'action': 'SELL', 'ticker': ...}, {'action': 'BUY', 'ticker': ...}]
+        Tuple of (trades, new_position, new_is_short)
+        - trades: List of trade dicts with 'action' ('BUY', 'SELL', 'SHORT', 'COVER')
+        - new_position: New position ticker (or None for cash)
+        - new_is_short: True if new position is short
     """
     trades = []
-    stock_tickers = [ticker for ticker, _ in top_4_stocks]
+    long_tickers = [ticker for ticker, _ in top_4_stocks]
+    short_tickers = [ticker for ticker, _ in bottom_4_stocks]
 
-    # Action 0: Hold current position (whether cash or stock)
+    # Action 0: Hold current position (whether cash, long, or short)
     if action == 0:
-        return trades  # No trades - maintain current position
+        return trades, current_position, current_is_short
 
-    # Actions 1-4: Switch to specific stock
-    target_position = stock_tickers[action - 1]
+    # Actions 1-4: Go LONG on stocks 1-4
+    if 1 <= action <= 4:
+        target_ticker = long_tickers[action - 1]
+        target_is_short = False
 
-    # If already holding the target stock, do nothing
-    if current_position == target_position:
-        return trades
+        # If already long this stock, do nothing
+        if current_position == target_ticker and not current_is_short:
+            return trades, current_position, current_is_short
 
-    # Sell current position if any
-    if current_position is not None:
-        trades.append({'action': 'SELL', 'ticker': current_position})
+        # Close current position if any
+        if current_position is not None:
+            if current_is_short:
+                trades.append({'action': 'COVER', 'ticker': current_position})
+            else:
+                trades.append({'action': 'SELL', 'ticker': current_position})
 
-    # Buy target position
-    trades.append({'action': 'BUY', 'ticker': target_position})
+        # Go long target stock
+        trades.append({'action': 'BUY', 'ticker': target_ticker})
 
-    return trades
+        return trades, target_ticker, False
+
+    # Actions 5-8: Go SHORT on stocks 5-8 (bottom 4)
+    if 5 <= action <= 8:
+        target_ticker = short_tickers[action - 5]
+        target_is_short = True
+
+        # If already short this stock, do nothing
+        if current_position == target_ticker and current_is_short:
+            return trades, current_position, current_is_short
+
+        # Close current position if any
+        if current_position is not None:
+            if current_is_short:
+                trades.append({'action': 'COVER', 'ticker': current_position})
+            else:
+                trades.append({'action': 'SELL', 'ticker': current_position})
+
+        # Go short target stock
+        trades.append({'action': 'SHORT', 'ticker': target_ticker})
+
+        return trades, target_ticker, True
+
+    # Should never reach here
+    return trades, current_position, current_is_short

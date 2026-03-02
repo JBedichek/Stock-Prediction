@@ -7,6 +7,7 @@ This data is used to create market-relative features for individual stocks.
 Data collected ONCE for all stocks (not per-stock), making it very efficient.
 """
 
+import os
 import requests
 import pandas as pd
 import numpy as np

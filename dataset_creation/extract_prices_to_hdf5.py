@@ -11,6 +11,7 @@ Usage:
         --output actual_prices.h5
 """
 
+import os
 import h5py
 import argparse
 import numpy as np
@@ -23,17 +24,24 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from utils.utils import pic_load
 
 
-def extract_prices_from_pickle(input_path: str, output_path: str):
+def extract_prices_from_pickle(input_path: str, output_path: str, max_price: float = 10000.0):
     """
     Extract actual prices from all_price_data.pkl to HDF5.
 
     Assumes input format: {ticker: DataFrame with dates as index/column and prices}
+
+    Args:
+        input_path: Path to input pickle file
+        output_path: Path to output HDF5 file
+        max_price: Maximum reasonable price - stocks with prices above this are skipped
+                   (helps filter out stocks with corrupted/unadjusted split data)
     """
     print(f"\n{'='*80}")
     print("EXTRACTING PRICES TO HDF5")
     print(f"{'='*80}")
     print(f"Input:  {input_path}")
     print(f"Output: {output_path}")
+    print(f"Max price filter: ${max_price:,.0f}")
 
     # Load price data
     print(f"\n📦 Loading price data...")
@@ -41,12 +49,17 @@ def extract_prices_from_pickle(input_path: str, output_path: str):
     tickers = sorted(price_data.keys())
     print(f"  ✅ Loaded {len(tickers)} tickers")
 
+    skipped_empty = 0
+    skipped_bad_price = []
+    extracted = 0
+
     with h5py.File(output_path, 'w') as f_out:
         for ticker in tqdm(tickers, desc="Extracting"):
             df = price_data[ticker]
 
             # Handle empty DataFrames
             if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                skipped_empty += 1
                 continue
 
             # Extract dates and prices from DataFrame
@@ -56,8 +69,9 @@ def extract_prices_from_pickle(input_path: str, output_path: str):
                     date_col = 'Date' if 'Date' in df.columns else 'date'
                     dates = df[date_col].astype(str).tolist()
                     # Price could be in various columns
+                    # Prioritize split-adjusted prices (Adj Close) over raw Close
                     price_col = None
-                    for col in ['Close', 'close', 'price', 'Price', 'Adj Close']:
+                    for col in ['Adj Close', 'adj_close', 'close', 'Close', 'price', 'Price']:
                         if col in df.columns:
                             price_col = col
                             break
@@ -72,6 +86,14 @@ def extract_prices_from_pickle(input_path: str, output_path: str):
                     prices = df.iloc[:, 0].values.astype(np.float32)
             else:
                 # Not a DataFrame, skip
+                skipped_empty += 1
+                continue
+
+            # Data quality filter: skip stocks with unreasonable prices
+            # This catches stocks with corrupted/unadjusted split data
+            price_max = np.nanmax(prices)
+            if price_max > max_price:
+                skipped_bad_price.append((ticker, price_max))
                 continue
 
             # Convert dates to bytes for HDF5
@@ -81,9 +103,21 @@ def extract_prices_from_pickle(input_path: str, output_path: str):
             grp = f_out.create_group(ticker)
             grp.create_dataset('prices', data=prices, compression='gzip')
             grp.create_dataset('dates', data=dates_bytes, compression='gzip')
+            extracted += 1
 
     print(f"\n✅ Prices extracted successfully!")
-    print(f"💾 Saved to: {output_path}")
+    print(f"  Extracted: {extracted} tickers")
+    print(f"  Skipped (empty): {skipped_empty}")
+    print(f"  Skipped (bad price data): {len(skipped_bad_price)}")
+
+    if skipped_bad_price:
+        print(f"\n⚠️  Tickers skipped due to unreasonable prices (>${max_price:,.0f}):")
+        for ticker, price in sorted(skipped_bad_price, key=lambda x: -x[1])[:20]:
+            print(f"    {ticker}: ${price:,.2f}")
+        if len(skipped_bad_price) > 20:
+            print(f"    ... and {len(skipped_bad_price) - 20} more")
+
+    print(f"\n💾 Saved to: {output_path}")
 
 
 def verify_prices_file(prices_path: str):
@@ -115,11 +149,13 @@ def main():
                        help='Input price pickle file')
     parser.add_argument('--output', type=str, default='actual_prices.h5',
                        help='Output prices HDF5')
+    parser.add_argument('--max-price', type=float, default=10000.0,
+                       help='Maximum reasonable stock price - stocks above this are skipped (default: 10000)')
 
     args = parser.parse_args()
 
     # Extract prices
-    extract_prices_from_pickle(args.input, args.output)
+    extract_prices_from_pickle(args.input, args.output, args.max_price)
 
     # Verify
     verify_prices_file(args.output)

@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from rl.rl_components import ActorCriticAgent, ReplayBuffer
 from rl.rl_environment import TradingEnvironment
-from rl.reduced_action_space import get_top_4_stocks, create_global_state, decode_action_to_trades
+from rl.reduced_action_space import get_top_4_stocks, get_bottom_4_stocks, create_global_state, decode_action_to_trades
 from inference.backtest_simulation import DatasetLoader
 
 # Re-enable gradients
@@ -235,13 +235,14 @@ class ProgrammaticTradingStrategy:
             current_position: Currently held stock ticker (or None if in cash)
 
         Returns:
-            Discrete action (0-4):
-                0 = Hold current position (cash or stock)
-                1-4 = Switch to stock 1-4
+            Discrete action (0-8) WITH SHORT SELLING:
+                0 = Hold current position (cash, long, or short)
+                1-4 = Go LONG stocks 1-4 (top-ranked)
+                5-8 = Go SHORT stocks 5-8 (bottom-ranked)
         """
         # Random exploration
         if random.random() < self.epsilon:
-            return random.randint(0, 4)
+            return random.randint(0, 8)
 
         # Extract stock tickers from top_4_stocks
         stock_tickers = [ticker for ticker, _ in top_4_stocks]
@@ -425,6 +426,7 @@ class SimpleBatchedEpisodeRunner:
         self.episode_step = [0] * num_episodes
         self.episode_active = [True] * num_episodes  # Track if episode still running
         self.episode_positions = [None] * num_episodes  # Current position (ticker or None)
+        self.episode_is_short = [False] * num_episodes  # Track if position is short
 
         # Storage
         self.episode_transitions = [[] for _ in range(num_episodes)]
@@ -485,6 +487,12 @@ class SimpleBatchedEpisodeRunner:
                 if ticker in cached_states:
                     pred_features_cache[ticker] = cached_states[ticker][:1444]  # First 1444 dims
 
+            # CRITICAL OPTIMIZATION: Compute top-4 and bottom-4 stocks ONCE per date (not per episode!)
+            # This saves 5000x redundant computations per date
+            # Use sample_fraction=1.0 for deterministic offline data generation
+            top_4_stocks_for_date = get_top_4_stocks(cached_states, sample_fraction=1.0)
+            bottom_4_stocks_for_date = get_bottom_4_stocks(cached_states, sample_fraction=1.0)
+
             # Process each episode that includes this date
             for ep_idx in range(self.num_episodes):
                 if not self.episode_active[ep_idx]:
@@ -506,8 +514,9 @@ class SimpleBatchedEpisodeRunner:
                     cached_prices
                 )
 
-                # Get top-4 stocks (one per time horizon)
-                top_4_stocks = get_top_4_stocks(cached_states)
+                # Use pre-computed top-4 and bottom-4 stocks (computed once per date above)
+                top_4_stocks = top_4_stocks_for_date
+                bottom_4_stocks = bottom_4_stocks_for_date
 
                 # OPTIMIZED: Create states with correct portfolio context (no GPU transfer, stay on CPU)
                 states = self._create_states_for_episode(
@@ -518,20 +527,23 @@ class SimpleBatchedEpisodeRunner:
                     portfolio_value
                 )
 
-                # Create global state (4 stocks × 1469 + 5 position encoding = 5881 dims)
+                # Create global state (8 stocks × 1469 + 9 position encoding = 11761 dims)
                 current_position = self.episode_positions[ep_idx]
+                current_is_short = self.episode_is_short[ep_idx]
                 try:
                     global_state = create_global_state(
                         top_4_stocks=top_4_stocks,
+                        bottom_4_stocks=bottom_4_stocks,
                         states=states,
                         current_position=current_position,
+                        is_short=current_is_short,
                         device='cpu'
                     )
                 except (KeyError, IndexError, ValueError):
                     self.episode_step[ep_idx] += 1
                     continue
 
-                # Select discrete action (0-4)
+                # Select discrete action (0-8)
                 try:
                     action = self.strategies[ep_idx].select_action(
                         top_4_stocks, cached_states, current_position
@@ -540,27 +552,27 @@ class SimpleBatchedEpisodeRunner:
                     self.episode_step[ep_idx] += 1
                     continue
 
-                # Decode action to trades
-                trades = decode_action_to_trades(action, top_4_stocks, current_position)
+                # Decode action to trades (returns trades, new_position, new_is_short)
+                trades, next_position, next_is_short = decode_action_to_trades(
+                    action, top_4_stocks, bottom_4_stocks, current_position, current_is_short
+                )
 
                 # Execute trades
                 reward = 0.0
                 next_portfolio = {k: v.copy() for k, v in self.episode_portfolios[ep_idx].items()}
                 next_cash = self.episode_cash[ep_idx]
-                next_position = current_position
 
                 for trade in trades:
                     ticker = trade['ticker']
-                    trade_reward, next_portfolio, next_cash = self._execute_action(
-                        ep_idx, ticker, 1 if trade['action'] == 'BUY' else 2, date
-                    )
-                    reward += trade_reward
+                    # Map trade actions to action IDs
+                    action_map = {'BUY': 1, 'SELL': 2, 'SHORT': 3, 'COVER': 4}
+                    action_id = action_map.get(trade['action'], 0)
 
-                    # Update next position
-                    if trade['action'] == 'SELL':
-                        next_position = None
-                    elif trade['action'] == 'BUY':
-                        next_position = ticker
+                    if action_id > 0:
+                        trade_reward, next_portfolio, next_cash = self._execute_action(
+                            ep_idx, ticker, action_id, date
+                        )
+                        reward += trade_reward
 
                 # If no trades, reward is 0
                 if not trades:
@@ -573,7 +585,8 @@ class SimpleBatchedEpisodeRunner:
                     cached_prices
                 )
                 next_cached_states = self.env.state_cache[date]  # Same date, updated position
-                next_top_4_stocks = get_top_4_stocks(next_cached_states)
+                next_top_4_stocks = get_top_4_stocks(next_cached_states, sample_fraction=1.0)
+                next_bottom_4_stocks = get_bottom_4_stocks(next_cached_states, sample_fraction=1.0)
 
                 # Create next states with updated portfolio
                 next_states = {}
@@ -592,8 +605,10 @@ class SimpleBatchedEpisodeRunner:
                 try:
                     next_global_state = create_global_state(
                         top_4_stocks=next_top_4_stocks,
+                        bottom_4_stocks=next_bottom_4_stocks,
                         states=next_states,
                         current_position=next_position,
+                        is_short=next_is_short,
                         device='cpu'
                     )
                 except (KeyError, IndexError, ValueError):
@@ -602,7 +617,7 @@ class SimpleBatchedEpisodeRunner:
                 # Store transition with global states and discrete action
                 transition = {
                     'state': global_state.cpu(),
-                    'action': action,  # Discrete action (0-4)
+                    'action': action,  # Discrete action (0-8)
                     'reward': reward,
                     'next_state': next_global_state.cpu(),
                     'done': False,
@@ -616,6 +631,7 @@ class SimpleBatchedEpisodeRunner:
                 self.episode_portfolios[ep_idx] = next_portfolio
                 self.episode_cash[ep_idx] = next_cash
                 self.episode_positions[ep_idx] = next_position
+                self.episode_is_short[ep_idx] = next_is_short
                 self.episode_step[ep_idx] += 1
 
         # Collect hyperparameters
@@ -799,7 +815,7 @@ class SimpleBatchedEpisodeRunner:
 
         if action == 1:  # BUY
             if len(portfolio) == 0:  # Not holding
-                allocation = cash * 0.5
+                allocation = cash * 1.0  # Invest 100% of available capital
                 shares = allocation / current_price
                 # FIX: Use same structure as environment (size, not shares)
                 next_portfolio[ticker] = {
@@ -956,7 +972,8 @@ def _run_episode_worker(args):
 
     agent.feature_extractor.freeze_predictor()
     agent.actor.eval()
-    agent.critic.eval()
+    agent.critic1.eval()  # Twin critics
+    agent.critic2.eval()
 
     # Initialize environment
     env = TradingEnvironment(
@@ -1101,7 +1118,8 @@ def generate_synthetic_data(
 
     agent.feature_extractor.freeze_predictor()
     agent.actor.eval()  # Don't need actor for data generation
-    agent.critic.eval()  # Don't need critic for data generation
+    agent.critic1.eval()  # Don't need critics for data generation (twin critics)
+    agent.critic2.eval()
 
     # Preload features
     print("\n3. Preloading features...")
@@ -1250,11 +1268,15 @@ def generate_synthetic_data(
 
 if __name__ == '__main__':
     # Generate synthetic data (VECTORIZED BATCHING - no multiprocessing!)
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+
     buffer = generate_synthetic_data(
-        num_episodes=50000,  # Generate 20K episodes
+        num_episodes=8000,  # Generate 2K episodes (2K × 30 = 60K transitions, enough for pretraining)
         episode_length=30,  # 30 days each
         save_path='data/critic_training_data.pkl',
-        device='cpu',  # CPU recommended for data generation
+        device=device,  # Use GPU if available (20-50x faster than CPU for transformer)
     )
 
     print("\n✅ Synthetic data generation complete!")

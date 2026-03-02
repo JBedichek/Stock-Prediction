@@ -101,14 +101,11 @@ def set_nan_inf(data):
     This eliminates any NaN or inf in a tensor by
     setting it to one, so downstream operations are
     minimally disrupted.
+
+    Uses torch.nan_to_num to avoid in-place operations that break gradients.
     '''
-    if torch.isinf(data).any():
-        inf_mask = torch.isinf(data)
-        data[inf_mask] = 1
-    if torch.isnan(data).any():
-        nan_mask = torch.isnan(data)
-        data[nan_mask] = 1
-    return data
+    # Use nan_to_num which is gradient-safe (non-in-place)
+    return torch.nan_to_num(data, nan=0.0, posinf=1.0, neginf=-1.0)
 
 def get_abs_price_dim(price_seq):
     '''
