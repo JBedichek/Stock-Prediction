@@ -447,7 +447,7 @@ def scrape_hybrid_dataset(stock_dict: Dict[str, str], fmp_api_key: str,
 
 if __name__ == '__main__':
     import argparse
-    from data_scraping.Stock import a_lot_of_stocks, s_lot_of_stocks, all_stocks
+    from data_scraping.stock_data import a_lot_of_stocks, s_lot_of_stocks, all_stocks
 
     parser = argparse.ArgumentParser(description='Hybrid data scraper (yfinance + FMP)')
     parser.add_argument('--api_key', type=str, default="YOUR_FMP_API_KEY_HERE",

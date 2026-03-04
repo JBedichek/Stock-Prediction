@@ -47,7 +47,7 @@ class ClusterEncoder:
                 self.model = checkpoint['model']
             elif 'model_state_dict' in checkpoint:
                 # SimpleTransformerPredictor from train_new_format.py
-                from training.train_new_format import SimpleTransformerPredictor
+                from training.model import SimpleTransformerPredictor
 
                 config = checkpoint.get('config', {})
 

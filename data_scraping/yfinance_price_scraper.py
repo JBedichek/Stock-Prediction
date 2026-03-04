@@ -259,7 +259,7 @@ def fetch_date_range_prices(start_date: str, end_date: str,
                 print(f"  Loaded {len(tickers)} tickers from existing dataset")
             else:
                 # Fallback to Stock.py
-                from data_scraping.Stock import all_stocks
+                from data_scraping.stock_data import all_stocks
                 tickers = list(all_stocks().keys())
                 print(f"  Loaded {len(tickers)} tickers from Stock.py")
         except Exception as e:
@@ -395,7 +395,7 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 if __name__ == '__main__':
     import argparse
-    from data_scraping.Stock import s_lot_of_stocks, a_lot_of_stocks, test_stock_tickers, all_stocks
+    from data_scraping.stock_data import s_lot_of_stocks, a_lot_of_stocks, test_stock_tickers, all_stocks
 
     parser = argparse.ArgumentParser(description='Scrape daily price data using yfinance')
     parser.add_argument('--dataset', type=str, default='test',

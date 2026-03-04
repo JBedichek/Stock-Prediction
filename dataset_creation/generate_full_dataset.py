@@ -47,7 +47,7 @@ from data_scraping.news_scraper import scrape_news_dataset as gnews_scrape
 from data_scraping.alphavantage_news_scraper import scrape_news_dataset as av_scrape
 from data_scraping.news_embedder import create_news_embeddings
 from data_scraping.fmp_enhanced_processor import process_enhanced_data
-from data_scraping.Stock import (
+from data_scraping.stock_data import (
     all_stocks,
     s_lot_of_stocks,
     a_lot_of_stocks,

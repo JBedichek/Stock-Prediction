@@ -29,7 +29,7 @@ import h5py
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.utils import pic_load
-from training.train_new_format import SimpleTransformerPredictor, convert_price_ratios_to_bins_vectorized
+from training.model import SimpleTransformerPredictor, convert_price_ratios_to_bins_vectorized
 
 # ===== CPU Optimizations =====
 # Set optimal number of threads for CPU inference
@@ -50,7 +50,7 @@ torch.set_grad_enabled(False)
 class DatasetLoader:
     """Load and manage test dataset for backtesting."""
 
-    def __init__(self, dataset_path: str, num_test_stocks: int = 1000, subset_size: Optional[int] = None, prices_path: Optional[str] = None, features_cache_path: Optional[str] = None):
+    def __init__(self, dataset_path: str, num_test_stocks: int = 1000, subset_size: Optional[int] = None, prices_path: Optional[str] = None, features_cache_path: Optional[str] = None, seq_len: int = 60):
         """
         Args:
             dataset_path: Path to dataset (pickle or HDF5) with features
@@ -58,7 +58,9 @@ class DatasetLoader:
             subset_size: If set, randomly sample this many stocks each trading day (dynamic subsampling)
             prices_path: Optional path to HDF5 file with actual prices (if features are normalized)
             features_cache_path: Optional path to cached preloaded features (HDF5)
+            seq_len: Sequence length for feature lookback (default: 60 - must match training)
         """
+        self.seq_len = seq_len
         print(f"\n{'='*80}")
         print("LOADING DATASET")
         print(f"{'='*80}")
@@ -164,16 +166,18 @@ class DatasetLoader:
 
     def preload_features(self, date_range: List[str]):
         """
-        Preload all features for test tickers in the date range (eliminates I/O bottleneck).
+        Preload all feature SEQUENCES for test tickers in the date range (eliminates I/O bottleneck).
 
         When daily subsampling is enabled, caches the entire pool (not just test_tickers).
+        Each cached entry is a (seq_len, num_features) sequence, not a single feature vector.
 
         Args:
             date_range: List of dates to preload
         """
         print(f"\n{'='*80}")
-        print("PRELOADING FEATURES (eliminates I/O bottleneck)")
+        print("PRELOADING FEATURE SEQUENCES (eliminates I/O bottleneck)")
         print(f"{'='*80}")
+        print(f"  Sequence length: {self.seq_len}")
 
         # If daily subsampling is enabled, cache the full pool
         # Otherwise cache test_tickers (which may be subset by external code)
@@ -188,6 +192,7 @@ class DatasetLoader:
         if self.is_hdf5:
             # HDF5: Load all features at once for each ticker
             debug_counter = 0
+            skipped_insufficient_history = 0
             for ticker in tqdm(tickers_to_cache, desc="  Loading"):
                 if ticker not in self.h5_file:
                     continue
@@ -195,51 +200,90 @@ class DatasetLoader:
                 # Load entire feature array once
                 features_2d = self.h5_file[ticker]['features'][:]  # (num_dates, num_features)
 
-                # Cache only the dates we need
+                # Cache only the dates we need (with full sequences)
                 for date in date_range:
                     try:
                         date_idx = self.all_dates.index(date)
+
+                        # Need seq_len days of history ending at date_idx
+                        start_idx = date_idx - self.seq_len + 1
+                        if start_idx < 0:
+                            skipped_insufficient_history += 1
+                            continue  # Not enough history
+
                         if date_idx < features_2d.shape[0]:
-                            features = torch.from_numpy(features_2d[date_idx, :]).float()
-                            # Get actual price from prices file or fall back to features[0]
-                            debug = False  # Debug first 5
-                            if debug:
-                                print(f"\n  🔍 Debug preload #{debug_counter}: {ticker} on {date}")
-                                print(f"      features[0] = {features[0].item():.4f}")
+                            # Extract sequence: (seq_len, num_features)
+                            features_seq = torch.from_numpy(features_2d[start_idx:date_idx + 1, :]).float()
+
+                            # Get actual price from prices file or fall back to features[-1, 0]
+                            debug = False
                             current_price = self._get_actual_price(ticker, date, debug=debug)
                             if current_price is None:
-                                current_price = features[0].item()
-                                if debug:
-                                    print(f"      Using features[0] as fallback: ${current_price:.4f}")
-                            else:
-                                if debug:
-                                    print(f"      Got actual price: ${current_price:.2f}")
-                            self.feature_cache[(ticker, date)] = (features, current_price)
+                                current_price = features_seq[-1, 0].item()
+
+                            self.feature_cache[(ticker, date)] = (features_seq, current_price)
                             debug_counter += 1
                     except ValueError:
                         continue
+
+            if skipped_insufficient_history > 0:
+                print(f"  ⚠️  Skipped {skipped_insufficient_history} entries with insufficient history (<{self.seq_len} days)")
         else:
-            # Pickle: Already in memory, just create index
+            # Pickle: Need to gather sequences
+            skipped_insufficient_history = 0
             for ticker in tqdm(tickers_to_cache, desc="  Indexing"):
                 if ticker not in self.data:
                     continue
 
                 for date in date_range:
-                    if date in self.data[ticker]:
-                        features = self.data[ticker][date]
-                        # Get actual price from prices file or fall back to features[0]
-                        current_price = self._get_actual_price(ticker, date)
-                        if current_price is None:
-                            current_price = features[0].item()
-                        self.feature_cache[(ticker, date)] = (features, current_price)
+                    if date not in self.data[ticker]:
+                        continue
+
+                    try:
+                        date_idx = self.all_dates.index(date)
+                    except ValueError:
+                        continue
+
+                    # Need seq_len days of history
+                    start_idx = date_idx - self.seq_len + 1
+                    if start_idx < 0:
+                        skipped_insufficient_history += 1
+                        continue
+
+                    # Gather sequence
+                    features_list = []
+                    valid_sequence = True
+                    for idx in range(start_idx, date_idx + 1):
+                        d = self.all_dates[idx]
+                        if d not in self.data[ticker]:
+                            valid_sequence = False
+                            break
+                        features_list.append(self.data[ticker][d])
+
+                    if not valid_sequence:
+                        continue
+
+                    features_seq = torch.stack(features_list)  # (seq_len, num_features)
+
+                    # Get actual price from prices file or fall back to features[-1, 0]
+                    current_price = self._get_actual_price(ticker, date)
+                    if current_price is None:
+                        current_price = features_seq[-1, 0].item()
+
+                    self.feature_cache[(ticker, date)] = (features_seq, current_price)
+
+            if skipped_insufficient_history > 0:
+                print(f"  ⚠️  Skipped {skipped_insufficient_history} entries with insufficient history (<{self.seq_len} days)")
 
         self.cache_enabled = True
-        print(f"  ✅ Preloaded {len(self.feature_cache):,} ticker-date pairs")
-        print(f"  💾 Cache size: ~{len(self.feature_cache) * 1400 * 4 / 1e6:.1f} MB (assuming 1400 features)")
+        print(f"  ✅ Preloaded {len(self.feature_cache):,} ticker-date pairs (seq_len={self.seq_len})")
+        print(f"  💾 Cache size: ~{len(self.feature_cache) * self.seq_len * 1400 * 4 / 1e6:.1f} MB (assuming 1400 features)")
 
     def save_feature_cache(self, cache_path: str):
         """
         Save the preloaded feature cache to disk (HDF5 format).
+
+        Note: Features are now sequences of shape (seq_len, num_features).
 
         Args:
             cache_path: Path to save the cache file
@@ -249,18 +293,21 @@ class DatasetLoader:
             return
 
         print(f"\n{'='*80}")
-        print("SAVING FEATURE CACHE")
+        print("SAVING FEATURE SEQUENCE CACHE")
         print(f"{'='*80}")
-        print(f"Saving {len(self.feature_cache):,} ticker-date pairs to: {cache_path}")
+        print(f"Saving {len(self.feature_cache):,} ticker-date pairs (seq_len={self.seq_len}) to: {cache_path}")
 
         with h5py.File(cache_path, 'w') as f:
-            # Create groups for each ticker
-            ticker_date_map = {}  # {ticker: [(date, features, price), ...]}
+            # Store seq_len as attribute
+            f.attrs['seq_len'] = self.seq_len
 
-            for (ticker, date), (features, price) in self.feature_cache.items():
+            # Create groups for each ticker
+            ticker_date_map = {}  # {ticker: [(date, features_seq, price), ...]}
+
+            for (ticker, date), (features_seq, price) in self.feature_cache.items():
                 if ticker not in ticker_date_map:
                     ticker_date_map[ticker] = []
-                ticker_date_map[ticker].append((date, features.cpu().numpy(), price))
+                ticker_date_map[ticker].append((date, features_seq.cpu().numpy(), price))
 
             # Save each ticker's data
             for ticker, data_list in tqdm(ticker_date_map.items(), desc="  Saving"):
@@ -271,7 +318,8 @@ class DatasetLoader:
 
                 # Extract arrays
                 dates = [item[0] for item in data_list]
-                features = np.stack([item[1] for item in data_list])  # (num_dates, num_features)
+                # Each item[1] is (seq_len, num_features), stack to (num_dates, seq_len, num_features)
+                features = np.stack([item[1] for item in data_list])
                 prices = np.array([item[2] for item in data_list])  # (num_dates,)
 
                 # Save to HDF5
@@ -279,7 +327,7 @@ class DatasetLoader:
                 grp.create_dataset('features', data=features, compression='gzip', compression_opts=4)
                 grp.create_dataset('prices', data=prices, compression='gzip', compression_opts=4)
 
-        print(f"  ✅ Feature cache saved successfully")
+        print(f"  ✅ Feature sequence cache saved successfully")
         print(f"  📁 File: {cache_path}")
 
         # Print file size
@@ -288,7 +336,7 @@ class DatasetLoader:
 
     def load_feature_cache(self, cache_path: str) -> bool:
         """
-        Load preloaded feature cache from disk (HDF5 format).
+        Load preloaded feature sequence cache from disk (HDF5 format).
 
         Args:
             cache_path: Path to the cache file
@@ -301,7 +349,7 @@ class DatasetLoader:
             return False
 
         print(f"\n{'='*80}")
-        print("LOADING FEATURE CACHE FROM DISK")
+        print("LOADING FEATURE SEQUENCE CACHE FROM DISK")
         print(f"{'='*80}")
         print(f"Loading from: {cache_path}")
 
@@ -309,21 +357,36 @@ class DatasetLoader:
             with h5py.File(cache_path, 'r') as f:
                 self.feature_cache = {}
 
+                # Check seq_len from cache matches current setting
+                cached_seq_len = f.attrs.get('seq_len', None)
+                if cached_seq_len is not None:
+                    if cached_seq_len != self.seq_len:
+                        print(f"  ⚠️  Cache seq_len ({cached_seq_len}) doesn't match current setting ({self.seq_len})")
+                        print(f"  ⚠️  Invalidating cache and reloading from dataset...")
+                        return False
+                    print(f"  ✅ Cache seq_len matches: {cached_seq_len}")
+                else:
+                    print(f"  ⚠️  Cache doesn't have seq_len attribute (old format?)")
+                    print(f"  ⚠️  Invalidating cache and reloading from dataset...")
+                    return False
+
                 for ticker in tqdm(list(f.keys()), desc="  Loading"):
                     grp = f[ticker]
                     dates = [d.decode('utf-8') for d in grp['dates'][:]]
-                    features = grp['features'][:]  # (num_dates, num_features)
+                    # Features are now (num_dates, seq_len, num_features)
+                    features = grp['features'][:]
                     prices = grp['prices'][:]  # (num_dates,)
 
                     # Populate cache
                     for i, date in enumerate(dates):
+                        # Each entry is (seq_len, num_features)
                         features_tensor = torch.from_numpy(features[i]).float()
                         price = float(prices[i])
                         self.feature_cache[(ticker, date)] = (features_tensor, price)
 
             self.cache_enabled = True
-            print(f"  ✅ Loaded {len(self.feature_cache):,} ticker-date pairs from cache")
-            print(f"  💾 Cache size: ~{len(self.feature_cache) * 1400 * 4 / 1e6:.1f} MB (assuming 1400 features)")
+            print(f"  ✅ Loaded {len(self.feature_cache):,} ticker-date pairs from cache (seq_len={self.seq_len})")
+            print(f"  💾 Cache size: ~{len(self.feature_cache) * self.seq_len * 1400 * 4 / 1e6:.1f} MB (assuming 1400 features)")
             return True
 
         except Exception as e:
@@ -435,14 +498,18 @@ class DatasetLoader:
 
     def get_features_and_price(self, ticker: str, date: str) -> Optional[Tuple[torch.Tensor, float]]:
         """
-        Get features and current price for a ticker on a date.
+        Get feature SEQUENCE and current price for a ticker on a date.
+
+        Returns a sequence of length seq_len ending at the given date,
+        which matches what the model was trained on.
 
         Args:
             ticker: Stock ticker
             date: Date string
 
         Returns:
-            (features, current_price) or None if not available
+            (features_sequence, current_price) or None if not available
+            features_sequence shape: (seq_len, num_features)
         """
         # Check cache first (fast path)
         if self.cache_enabled:
@@ -460,47 +527,74 @@ class DatasetLoader:
             except ValueError:
                 return None
 
-            # Get features for this date
+            # Need seq_len days of history ending at date_idx
+            start_idx = date_idx - self.seq_len + 1
+            if start_idx < 0:
+                return None  # Not enough history
+
+            # Get feature sequence for this date range
             features_2d = self.h5_file[ticker]['features'][:]  # (num_dates, num_features)
             if date_idx >= features_2d.shape[0]:
                 return None
 
-            features = torch.from_numpy(features_2d[date_idx, :]).float()
+            # Extract sequence: (seq_len, num_features)
+            features_seq = torch.from_numpy(features_2d[start_idx:date_idx + 1, :]).float()
 
-            # Get actual price (either from prices file or features[0])
+            # Get actual price (either from prices file or features[-1, 0])
             current_price = self._get_actual_price(ticker, date)
             if current_price is None:
-                current_price = features[0].item()  # Fall back to features
+                current_price = features_seq[-1, 0].item()  # Fall back to last day's features
 
-            return features, current_price
+            return features_seq, current_price
         else:
-            # Pickle format
+            # Pickle format - need to gather seq_len days
             if ticker not in self.data:
                 return None
             if date not in self.data[ticker]:
                 return None
 
-            features = self.data[ticker][date]
+            # Get date index
+            try:
+                date_idx = self.all_dates.index(date)
+            except ValueError:
+                return None
 
-            # Get actual price (either from prices file or features[0])
+            # Need seq_len days of history
+            start_idx = date_idx - self.seq_len + 1
+            if start_idx < 0:
+                return None  # Not enough history
+
+            # Gather sequence
+            features_list = []
+            for idx in range(start_idx, date_idx + 1):
+                d = self.all_dates[idx]
+                if d not in self.data[ticker]:
+                    return None  # Missing date in sequence
+                features_list.append(self.data[ticker][d])
+
+            features_seq = torch.stack(features_list)  # (seq_len, num_features)
+
+            # Get actual price (either from prices file or features[-1, 0])
             current_price = self._get_actual_price(ticker, date)
             if current_price is None:
-                current_price = features[0].item()  # Fall back to features
+                current_price = features_seq[-1, 0].item()  # Fall back to features
 
-            return features, current_price
+            return features_seq, current_price
 
     def get_all_features_for_date_batched(self, date: str, tickers: Optional[List[str]] = None) -> Dict[str, Tuple[torch.Tensor, float]]:
         """
-        OPTIMIZED: Get features and prices for ALL tickers on a specific date in a single batch read.
+        OPTIMIZED: Get feature SEQUENCES and prices for ALL tickers on a specific date in a single batch read.
 
         This is MUCH faster than calling get_features_and_price() in a loop!
+        Returns sequences of length seq_len ending at the given date.
 
         Args:
             date: Date to get features for
             tickers: List of tickers to get (if None, uses all test_tickers)
 
         Returns:
-            Dictionary mapping ticker -> (features, price)
+            Dictionary mapping ticker -> (features_sequence, price)
+            features_sequence shape: (seq_len, num_features)
         """
         if tickers is None:
             tickers = self.test_tickers
@@ -522,27 +616,31 @@ class DatasetLoader:
             # Date not found
             return results
 
+        # Need seq_len days of history
+        start_idx = date_idx - self.seq_len + 1
+        if start_idx < 0:
+            return results  # Not enough history
+
         # Read all tickers efficiently
         for ticker in tickers:
             if ticker not in self.h5_file:
                 continue
 
             try:
-                # Read features for this ticker at this date index
-                # Note: Reading h5_file[ticker]['features'][date_idx] is faster than
-                # reading h5_file[ticker]['features'][:] and then indexing
+                # Read feature sequence for this ticker
                 features_2d = self.h5_file[ticker]['features']
                 if date_idx >= features_2d.shape[0]:
                     continue
 
-                features = torch.tensor(features_2d[date_idx], dtype=torch.float32)
+                # Extract sequence: (seq_len, num_features)
+                features_seq = torch.tensor(features_2d[start_idx:date_idx + 1], dtype=torch.float32)
 
                 # Get price
                 current_price = self._get_actual_price(ticker, date)
                 if current_price is None:
-                    current_price = features[0].item()
+                    current_price = features_seq[-1, 0].item()
 
-                results[ticker] = (features, current_price)
+                results[ticker] = (features_seq, current_price)
             except:
                 continue
 
@@ -793,7 +891,7 @@ class ModelPredictor:
         Predict expected returns for a batch of stocks (faster).
 
         Args:
-            features_list: List of feature tensors, each (feature_dim,)
+            features_list: List of feature tensors, each (seq_len, feature_dim)
             horizon_idx: Index of prediction horizon (0=1day, 1=5day, 2=10day, 3=20day)
 
         Returns:
@@ -802,8 +900,8 @@ class ModelPredictor:
         if len(features_list) == 0:
             return [], []
 
-        # Stack into batch and add sequence dimension
-        features_batch = torch.stack(features_list).unsqueeze(1).to(self.device)  # (batch, 1, feature_dim)
+        # Stack into batch - features are already sequences (seq_len, feature_dim)
+        features_batch = torch.stack(features_list).to(self.device)  # (batch, seq_len, feature_dim)
 
         # Forward pass - model returns (predictions, confidence) tuple
         pred, confidence = self.model(features_batch)
@@ -905,7 +1003,7 @@ class EnsemblePredictor:
         For regression mode: averages direct predictions
 
         Args:
-            features_list: List of feature tensors, each (feature_dim,)
+            features_list: List of feature tensors, each (seq_len, feature_dim)
             horizon_idx: Index of prediction horizon (0=1day, 1=5day, 2=10day, 3=20day)
 
         Returns:
@@ -923,8 +1021,8 @@ class EnsemblePredictor:
             all_confidences = []
 
             for predictor in self.predictors:
-                # Stack into batch and add sequence dimension
-                features_batch = torch.stack(features_list).unsqueeze(1).to(self.device)  # (batch, 1, feature_dim)
+                # Stack into batch - features are already sequences (seq_len, feature_dim)
+                features_batch = torch.stack(features_list).to(self.device)  # (batch, seq_len, feature_dim)
 
                 # Forward pass
                 pred, confidence = predictor.model(features_batch)
@@ -956,8 +1054,8 @@ class EnsemblePredictor:
             all_confidences = []
 
             for predictor in self.predictors:
-                # Stack into batch and add sequence dimension
-                features_batch = torch.stack(features_list).unsqueeze(1).to(self.device)  # (batch, 1, feature_dim)
+                # Stack into batch - features are already sequences (seq_len, feature_dim)
+                features_batch = torch.stack(features_list).to(self.device)  # (batch, seq_len, feature_dim)
 
                 # Forward pass
                 pred, confidence = predictor.model(features_batch)
@@ -1736,6 +1834,8 @@ def main():
     # Other args
     parser.add_argument('--initial-capital', type=float, default=100000.0,
                        help='Initial capital for simulation')
+    parser.add_argument('--seq-len', type=int, default=60,
+                       help='Sequence length for feature lookback (must match training, default: 60)')
     parser.add_argument('--batch-size', type=int, default=256,
                        help='Batch size for inference (default: 64)')
     parser.add_argument('--no-preload', action='store_true',
@@ -1772,7 +1872,8 @@ def main():
         num_test_stocks=args.num_test_stocks,
         subset_size=args.subset_size,
         prices_path=args.prices,
-        features_cache_path=args.features_cache
+        features_cache_path=args.features_cache,
+        seq_len=args.seq_len
     )
 
     # Initialize dynamic cluster filter if enabled
@@ -1907,7 +2008,8 @@ def main():
                 num_test_stocks=args.num_test_stocks,
                 subset_size=args.subset_size,
                 prices_path=args.prices,
-                features_cache_path=args.features_cache
+                features_cache_path=args.features_cache,
+                seq_len=args.seq_len
             )
 
             # Preload features if needed

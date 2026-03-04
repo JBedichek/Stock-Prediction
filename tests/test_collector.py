@@ -13,7 +13,7 @@ import sys
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from data_scraping.Stock import stock_info
+from data_scraping.stock_data import stock_info
 import torch
 import os
 

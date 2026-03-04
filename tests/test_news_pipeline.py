@@ -18,7 +18,7 @@ import torch
 from datetime import datetime, timedelta
 from data_scraping.news_scraper import NewsScraperMultiSource, scrape_news_dataset
 from data_scraping.news_embedder import NomicNewsEmbedder, NewsAggregator, create_news_embeddings
-from data_scraping.Stock import test_stock_tickers
+from data_scraping.stock_data import test_stock_tickers
 from utils.utils import save_pickle, pic_load
 
 

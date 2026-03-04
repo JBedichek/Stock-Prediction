@@ -18,7 +18,7 @@ import json
 import sys
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from data_scraping.Stock import a_lot_of_stocks, s_lot_of_stocks
+from data_scraping.stock_data import a_lot_of_stocks, s_lot_of_stocks
 
 
 # Define all fundamental metrics to test

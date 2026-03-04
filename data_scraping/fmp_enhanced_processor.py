@@ -64,9 +64,9 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
         if self.market_indices_data is None:
             return pd.DataFrame()
 
-        # Get stock's daily prices
-        stock_prices = self.raw_data.get('daily_prices')
-        if stock_prices is None or stock_prices.empty:
+        # Get stock's daily prices - prefer yfinance price_data, fallback to raw_data
+        stock_prices = self.price_data if self.price_data is not None and not self.price_data.empty else self.raw_data.get('daily_prices')
+        if stock_prices is None or (hasattr(stock_prices, 'empty') and stock_prices.empty):
             return pd.DataFrame()
 
         stock_df = stock_prices.copy()
@@ -157,8 +157,9 @@ class EnhancedFMPDataProcessor(FMPDataProcessor):
         Returns:
             DataFrame with derived features
         """
-        stock_prices = self.raw_data.get('daily_prices')
-        if stock_prices is None or stock_prices.empty:
+        # Get stock's daily prices - prefer yfinance price_data, fallback to raw_data
+        stock_prices = self.price_data if self.price_data is not None and not self.price_data.empty else self.raw_data.get('daily_prices')
+        if stock_prices is None or (hasattr(stock_prices, 'empty') and stock_prices.empty):
             return pd.DataFrame()
 
         stock_df = stock_prices.copy()

@@ -61,3 +61,14 @@ Thumbs.db
 # Logs
 *.log
 wandb/
+
+# Generated results and cache
+results/
+profiling_results/
+portfolio_cache/
+cluster_results/
+rl_checkpoints*/
+checkpoints/
+
+# Generated images
+*.png

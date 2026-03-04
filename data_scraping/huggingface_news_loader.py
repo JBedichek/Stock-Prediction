@@ -218,7 +218,7 @@ def verify_ticker_coverage(stock_dict: Dict[str, str]) -> None:
 
 if __name__ == '__main__':
     import argparse
-    from data_scraping.Stock import s_lot_of_stocks, a_lot_of_stocks, test_stock_tickers
+    from data_scraping.stock_data import s_lot_of_stocks, a_lot_of_stocks, test_stock_tickers
 
     parser = argparse.ArgumentParser(description='Load news from Hugging Face dataset')
     parser.add_argument('--dataset', type=str, default='test',

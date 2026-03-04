@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 import torch
 import torch.nn.functional as F
-from training.train_new_format import (
+from training.model import (
     SimpleTransformerPredictor,
     compute_confidence_targets,
     convert_price_ratios_to_bins_vectorized

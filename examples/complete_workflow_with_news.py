@@ -26,7 +26,7 @@ from data_scraping.fmp_comprehensive_scraper import scrape_dataset
 from data_scraping.news_scraper import scrape_news_dataset
 from data_scraping.news_embedder import create_news_embeddings
 from data_scraping.fmp_enhanced_processor import process_enhanced_data
-from data_scraping.Stock import s_lot_of_stocks
+from data_scraping.stock_data import s_lot_of_stocks
 from datetime import datetime, timedelta
 
 
@@ -197,7 +197,7 @@ def quick_test_workflow():
     print("QUICK TEST WORKFLOW")
     print("="*80 + "\n")
 
-    from data_scraping.Stock import test_stock_tickers
+    from data_scraping.stock_data import test_stock_tickers
 
     # API key must be provided via command line argument
     import sys

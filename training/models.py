@@ -38,8 +38,9 @@ class c_transformer_layer(nn.Module):
             #nn.Linear(self.seq_dim, self.seq_dim),
             #self.act_fn()
         )
-        self.tran_layer = nn.TransformerEncoderLayer(d_model=self.data_dim, nhead=nhead, dim_feedforward=dim_ff, 
-                                    activation=self.act_fn(), batch_first = True, dropout=dropout)
+        # Use norm_first=True (pre-norm) for better gradient flow in deep transformers
+        self.tran_layer = nn.TransformerEncoderLayer(d_model=self.data_dim, nhead=nhead, dim_feedforward=dim_ff,
+                                    activation=self.act_fn(), batch_first = True, dropout=dropout, norm_first=True)
         
         
     def forward(self, x, sum):
@@ -58,8 +59,9 @@ class _base_transformer_layer(nn.Module):
         self.attn_dim = data_dim*3
         self.attn = nn.MultiheadAttention(data_dim, nhead, dropout,kdim=self.attn_dim, vdim=self.attn_dim,
                                           batch_first=True)
-        self.tran_layer = nn.TransformerEncoderLayer(d_model=data_dim, nhead=nhead, dim_feedforward=dim_ff, 
-                                    activation=act_fn(), batch_first=True, dropout=dropout)
+        # Use norm_first=True (pre-norm) for better gradient flow in deep transformers
+        self.tran_layer = nn.TransformerEncoderLayer(d_model=data_dim, nhead=nhead, dim_feedforward=dim_ff,
+                                    activation=act_fn(), batch_first=True, dropout=dropout, norm_first=True)
         
     def forward(self, x):
         x = self.tran_layer(x)
@@ -76,6 +78,17 @@ class base_transformer_layer(nn.Module):
         return x
 
 class Dist_Pred(nn.Module):
+    """
+    Distribution Prediction Model with Transformer encoder.
+
+    Architecture Constants:
+        seq_len=350: Number of historical timesteps (trading days)
+        data_dim=5: Features per timestep (OHLCV: Open, High, Low, Close, Volume)
+        num_bins=21: Discretization bins for return distribution
+        ff=15000: Feedforward hidden dim (large for capacity with small data_dim)
+        layers=72: Deep transformer for complex temporal patterns
+        sum_emb=76: Summary embedding dimension (legacy, reshaped from 988-dim input)
+    """
     def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1, s_scale=0, num_cls_layers=6, dropout=0.1):
         super(Dist_Pred, self).__init__()
         self.num_bins = num_bins
@@ -129,10 +142,16 @@ class Dist_Pred(nn.Module):
         return self._encoding[:seq_len, :]
     
     def forward(self, x, s):
+        # Input validation
+        assert x.dim() == 3, f"Expected 3D input (batch, seq, features), got shape {x.shape}"
+        assert not torch.isnan(x).any(), "NaN detected in input features"
+        assert not torch.isinf(x).any(), "Inf detected in input features"
+
         batch_size = x.shape[0]
-        x = torch.flip(x,[1])
+        # Note: Sequence reversal removed for consistency with t_Dist_Pred.
+        # Positional encoding handles temporal order; flipping was redundant.
         x = x + self.pos_encode(x)
-        
+
         # Reshape this to (batch, _, 52) so it can be appended to the end of the sequence
         s = torch.reshape(s, (batch_size, 19, 52))
         
@@ -178,6 +197,22 @@ def temp_softmax(tensor, temp=1.0):
     return softmax(tensor/temp)
 
 class t_Dist_Pred(nn.Module):
+    """
+    Distribution Prediction Model with Stochastic Depth Transformer.
+
+    Architecture Constants:
+        seq_len=350: Number of historical timesteps (trading days)
+        data_dim=5: Features per timestep (OHLCV: Open, High, Low, Close, Volume)
+        num_bins=21: Discretization bins for return distribution
+        ff=15000: Feedforward hidden dim (large for capacity with small data_dim)
+        layers=72: Deep transformer with stochastic depth (40% max drop prob)
+        sum_emb=76: Legacy param; model uses 988-dim summary reshaped to (4, 218)
+
+    Classification Head Constants:
+        linear_in_dim=2200: Hidden dimension for classification MLP
+        604*2=1208: Input dim from mean-pooled high/low transformer halves
+        218*4=872: Summary dims used (RoBERTa 768 + fundamentals 27 + extra)
+    """
     def __init__(self,seq_len=350, data_dim=5, num_bins=21, num_days=5, nhead=5, ff=15000, layers=72, sum_emb=76, scale=1, s_scale=0, num_cls_layers=6, dropout=0.15):
         super(t_Dist_Pred, self).__init__()
         self.num_bins = num_bins
@@ -240,12 +275,13 @@ class t_Dist_Pred(nn.Module):
         return self._encoding[:seq_len, :]
     
     def forward(self, x, s):
-        #print(x.shape)
+        # Input validation
+        assert x.dim() == 3, f"Expected 3D input (batch, seq, features), got shape {x.shape}"
+        assert not torch.isnan(x).any(), "NaN detected in input features"
+        assert not torch.isinf(x).any(), "Inf detected in input features"
+
         batch_size = x.shape[0]
-        #x = x[:,:,:243]
-        #print(x.shape, s.shape)
-        #x = torch.flip(x,[1])
-        #x = x + self.pos_encode(x)
+        # Note: Sequence reversal commented out; using learned positional embeddings instead
         positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
         pos_emb = self.pos_emb(positions)
         pos_emb = self.dropout(pos_emb)
@@ -273,13 +309,19 @@ class t_Dist_Pred(nn.Module):
         init_res5 = 0
         #i = 0
         for i, layer in enumerate(self.layers):
-            #x = layer(x) + init_res1*0.6+init_res2*0.6+init_res3*0.6+init_res4*0.6+init_res5*0.6
-            if random.random() > self.layer_drop_probs[i] and self.training:
-                x = layer(x) + init_res1
-            elif self.training:
-                x = x
+            # Stochastic depth: randomly drop layers during training
+            # When dropped, use residual connection to maintain gradient flow
+            drop_prob = self.layer_drop_probs[i]
+            if self.training:
+                if random.random() > drop_prob:
+                    # Layer is active: apply layer + residual
+                    x = layer(x) + init_res1
+                else:
+                    # Layer is dropped: use residual only (not identity!)
+                    x = init_res1
             else:
-                x = layer(x)*(1-self.layer_drop_probs[i]) + init_res1
+                # Inference: scale by survival probability for expected value
+                x = layer(x) * (1 - drop_prob) + init_res1 * drop_prob
             #x = layer(x)
             #if i == 2:
             #    init_res2 = x

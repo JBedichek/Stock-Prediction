@@ -49,7 +49,7 @@ class EmbeddingCacheBuilder:
         checkpoint = torch.load(model_path, map_location=device)
 
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            from training.train_new_format import SimpleTransformerPredictor
+            from training.model import SimpleTransformerPredictor
 
             config = checkpoint.get('config', {})
             state_dict = checkpoint['model_state_dict']

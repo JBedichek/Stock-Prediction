@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
 import random
+import warnings
 from typing import Dict, Tuple, Optional, List
 import numpy as np
 
@@ -52,7 +53,7 @@ class PredictorFeatureExtractor(nn.Module):
                 self.predictor = checkpoint['model']
             elif 'model_state_dict' in checkpoint:
                 # Need to reconstruct the model
-                from training.train_new_format import SimpleTransformerPredictor
+                from training.model import SimpleTransformerPredictor
 
                 config = checkpoint.get('config', {})
                 state_dict = checkpoint['model_state_dict']
@@ -140,11 +141,21 @@ class PredictorFeatureExtractor(nn.Module):
 
         if current_feature_dim != model_input_dim:
             if current_feature_dim < model_input_dim:
-                # Pad with zeros
+                # Pad with zeros - warn about potential information loss
+                warnings.warn(
+                    f"PredictorFeatureExtractor: Padding features from {current_feature_dim} to "
+                    f"{model_input_dim} dims. Zero-padding may break transformer assumptions.",
+                    UserWarning
+                )
                 padding = torch.zeros(batch_size, seq_len, model_input_dim - current_feature_dim, device=device)
                 input_features = torch.cat([input_features, padding], dim=2)
             else:
-                # Truncate
+                # Truncate - warn about feature loss
+                warnings.warn(
+                    f"PredictorFeatureExtractor: Truncating features from {current_feature_dim} to "
+                    f"{model_input_dim} dims. {current_feature_dim - model_input_dim} features discarded!",
+                    UserWarning
+                )
                 input_features = input_features[:, :, :model_input_dim]
 
         # Extract transformer activations using hook

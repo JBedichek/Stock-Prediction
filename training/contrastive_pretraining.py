@@ -5,7 +5,7 @@ import torch.nn as nn
 import pickle
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from data_scraping.Stock import a_lot_of_stocks, stock_info, all_stocks
+from data_scraping.stock_data import a_lot_of_stocks, stock_info, all_stocks
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group

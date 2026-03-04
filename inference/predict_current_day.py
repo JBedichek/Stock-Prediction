@@ -36,7 +36,7 @@ from tqdm import tqdm
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from training.train_new_format import SimpleTransformerPredictor
+from training.model import SimpleTransformerPredictor
 from inference.backtest_simulation import ModelPredictor, EnsemblePredictor
 
 # ===== CPU Optimizations =====

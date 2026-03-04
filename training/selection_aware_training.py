@@ -63,7 +63,7 @@ torch.backends.cudnn.benchmark = True  # Autotune cuDNN algorithms for this inpu
 #    - mode='max-autotune': Triton autotuning for 2-3x inference speedup
 
 from training.hdf5_data_loader import StockDataModule
-from training.train_new_format import (
+from training.model import (
     SimpleTransformerPredictor,
     convert_price_ratios_to_bins_vectorized,
     validate
@@ -279,7 +279,7 @@ def train_on_subset(model: nn.Module,
                     main_loss += F.cross_entropy(pred[:, :, day_idx], targets)
 
                 # Confidence loss
-                from training.train_new_format import compute_confidence_targets
+                from training.model import compute_confidence_targets
                 with torch.no_grad():
                     confidence_targets = compute_confidence_targets(pred, bin_indices)
                 confidence_loss = F.mse_loss(confidence, confidence_targets)
