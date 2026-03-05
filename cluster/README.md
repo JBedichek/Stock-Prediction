@@ -242,6 +242,60 @@ for date in trading_dates:
 
 See [docs/STATIC_VS_DYNAMIC.md](docs/STATIC_VS_DYNAMIC.md) for detailed comparison.
 
+### Top-K Percent Selection (Alternative to Hard Assignment)
+
+Instead of binary cluster membership, you can select the top-k% of stocks closest to best cluster centroids:
+
+**Hard Cluster Assignment (default):**
+- Stocks assigned to nearest cluster centroid
+- Binary: stock is IN or OUT based on cluster membership
+
+**Top-K Percent Selection:**
+- Compute distance from each stock to all best cluster centroids
+- Rank stocks by minimum distance to any best centroid
+- Select top-k% closest stocks
+- More flexible, includes stocks near cluster boundaries
+
+```python
+from cluster import DynamicClusterFilter
+
+# Top-k percent selection (30% closest to best centroids)
+filter = DynamicClusterFilter(
+    model_path='checkpoints/fold_0_best.pt',
+    cluster_dir='cluster_results',
+    best_clusters_file='cluster_results/best_clusters_1d.txt',
+    top_k_percent=0.3
+)
+
+# Hard assignment (original behavior)
+filter = DynamicClusterFilter(
+    model_path='checkpoints/fold_0_best.pt',
+    cluster_dir='cluster_results',
+    best_clusters_file='cluster_results/best_clusters_1d.txt',
+    top_k_percent=None  # Default
+)
+```
+
+**Command line:**
+```bash
+python -m inference.backtest_simulation \
+    --cluster-dir cluster_results \
+    --best-clusters-file cluster_results/best_clusters_1d.txt \
+    --cluster-top-k-percent 0.3
+```
+
+**Recommended values:**
+- Conservative (high quality): `0.1` - `0.2` (10-20%)
+- Balanced: `0.3` - `0.4` (30-40%)
+- Aggressive (more diversity): `0.5` - `0.7` (50-70%)
+
+| Aspect | Hard Assignment | Top-K Percent |
+|--------|----------------|---------------|
+| Selection | Binary (in/out) | Continuous ranking |
+| Flexibility | Fixed by cluster boundaries | Adjustable via percentage |
+| Candidates | Can vary widely per day | Consistent proportion |
+| Use Case | Well-separated clusters | Overlapping clusters |
+
 ---
 
 ## Integration Examples
@@ -366,8 +420,3 @@ cluster/
     └── CACHING_GUIDE.md             # Embedding caching guide
 ```
 
----
-
-## References
-
-- Main documentation: [docs/cluster_top_k_filtering.md](../docs/cluster_top_k_filtering.md)
