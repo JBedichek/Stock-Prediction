@@ -371,4 +371,3 @@ cluster/
 ## References
 
 - Main documentation: [docs/cluster_top_k_filtering.md](../docs/cluster_top_k_filtering.md)
-- Coverage-based selection: [docs/coverage_based_cluster_selection.md](../docs/coverage_based_cluster_selection.md)
