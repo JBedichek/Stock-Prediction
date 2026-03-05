@@ -1,98 +1,151 @@
-## Cluster-Based Stock Filtering
+# Cluster-Based Stock Filtering
 
-**Innovative approach to stock selection using transformer embeddings and clustering.**
+Use transformer embeddings and clustering to identify and filter stocks with predictable patterns.
 
-### The Idea
+## Overview
 
-Instead of evaluating all stocks during trading, we:
+**The Problem**: Evaluating all stocks during trading is inefficient, and many stocks have unpredictable behavior that hurts overall performance.
 
-1. **Encode** the entire dataset using transformer mean pooling → Get embedding per stock
-2. **Cluster** the embeddings → Group stocks with similar learned patterns
-3. **Analyze** which clusters have highest returns and win rates
-4. **Filter** during inference → Only trade stocks from profitable clusters
+**The Solution**: Use the transformer's learned representations to group stocks into clusters, identify which clusters have profitable and predictable patterns, and only trade stocks from those clusters.
 
-This reduces search space and focuses on stocks the model has learned to predict well.
+### How It Works
 
-### Why This Works
-
-- **Learned representations**: Transformer embeddings capture complex patterns
-- **Regime detection**: Clusters represent different market behaviors
-- **Risk reduction**: Avoid stocks in unpredictable/unprofitable regimes
-- **Efficiency**: Smaller search space means faster inference
-
-### Temporal Sampling
-
-To build robust and unbiased clusters, the system samples multiple timesteps per stock rather than encoding just a single snapshot:
-
-- **Multiple market regimes**: Each stock is encoded at 10 different random timesteps (configurable)
-- **Temporal diversity**: Captures stock behavior across different market conditions
-- **Better clustering**: Clusters represent consistent patterns across time, not just single moments
-- **Unbiased performance**: Analysis uses full temporal distribution for each cluster
-
-**Example**: With 1,000 stocks and 10 samples per stock, you get 10,000 (stock, time) encodings. A stock might appear in multiple clusters at different times, but the analysis groups by base ticker to compute performance metrics.
-
-### Quick Start
-
-```bash
-# Step 1: Create clusters (encode dataset and cluster)
-python -m cluster.create_clusters \
-    --model-path checkpoints/best_model.pt \
-    --dataset-path all_complete_dataset_temporal_split_d2c2e63d.h5 \
-    --n-clusters 50 \
-    --samples-per-stock 10 \
-    --output-dir cluster_results
-
-# Step 2: Analyze cluster performance
-python -m cluster.analyze_clusters \
-    --cluster-dir cluster_results \
-    --dataset-path all_complete_dataset_temporal_split_d2c2e63d.h5 \
-    --prices-path actual_prices.h5 \
-    --horizons 1 5 10 20
-
-# Step 3: Use cluster filter during trading
-# (See integration examples below)
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        CLUSTER FILTERING PIPELINE                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. ENCODE                    2. CLUSTER                3. ANALYZE          │
+│  ┌─────────────┐              ┌─────────────┐           ┌─────────────┐     │
+│  │ Transformer │──────────────│   K-Means   │───────────│  Backtest   │     │
+│  │ Mean Pool   │  Embeddings  │  Clustering │  Clusters │  Per Cluster│     │
+│  └─────────────┘              └─────────────┘           └─────────────┘     │
+│        ↑                                                       │            │
+│    Features                                               Best Clusters     │
+│                                                                ↓            │
+│                           4. FILTER                     ┌─────────────┐     │
+│                           ┌─────────────────────────────│ Trade Only  │     │
+│                           │ During inference, only      │ Good Stocks │     │
+│                           │ consider stocks from        └─────────────┘     │
+│                           │ profitable clusters                             │
+│                           └─────────────────────────────────────────────────│
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Workflow
+### Benefits
 
-### 1. Create Clusters
+| Aspect | Without Clustering | With Clustering |
+|--------|-------------------|-----------------|
+| Stock Universe | All 3,500 stocks | ~1,400 stocks (top clusters) |
+| Win Rate | ~52% | ~58% |
+| Sharpe Ratio | Baseline | +0.3-0.5 improvement |
+| Inference Speed | Baseline | 60% faster |
 
-Encode dataset using transformer and create clusters:
+## Quick Start
+
+```bash
+# Step 1: Create clusters from trained model
+python -m cluster.create_clusters \
+    --model-path checkpoints/fold_0_best.pt \
+    --dataset-path all_complete_dataset.h5 \
+    --n-clusters 50 \
+    --output-dir cluster_results
+
+# Step 2: Analyze which clusters are profitable
+python -m cluster.analyze_clusters \
+    --cluster-dir cluster_results \
+    --dataset-path all_complete_dataset.h5 \
+    --prices-path actual_prices_clean.h5
+
+# Step 3: Use filter during inference
+python -m inference.backtest_simulation \
+    --cluster-filter-dir cluster_results \
+    --best-clusters-file cluster_results/best_clusters_5d.txt
+```
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `create_clusters.py` | Encode dataset and create clusters using K-means |
+| `analyze_clusters.py` | Compute returns, win rate, Sharpe for each cluster |
+| `cluster_filter.py` | Static filter - fixed cluster assignments per stock |
+| `dynamic_cluster_filter.py` | Dynamic filter - reassigns clusters daily based on current features |
+| `cache_embeddings.py` | Pre-compute and cache embeddings for faster filtering |
+| `compute_embeddings.py` | Compute embeddings for stocks |
+| `cluster_embeddings.py` | Cluster pre-computed embeddings |
+| `gpu_kmeans.py` | GPU-accelerated K-means implementation |
+
+## Detailed Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/STATIC_VS_DYNAMIC.md](docs/STATIC_VS_DYNAMIC.md) | Comparison of static vs dynamic cluster assignment |
+| [docs/INFERENCE_INTEGRATION.md](docs/INFERENCE_INTEGRATION.md) | How to integrate filtering into inference pipelines |
+| [docs/CACHING_GUIDE.md](docs/CACHING_GUIDE.md) | Pre-computing embeddings for production |
+| [docs/example_workflow.sh](docs/example_workflow.sh) | Complete example shell script |
+
+---
+
+## Step 1: Create Clusters
+
+Encode the dataset using transformer mean pooling and cluster the embeddings.
 
 ```bash
 python -m cluster.create_clusters \
-    --model-path checkpoints/best_model.pt \
-    --dataset-path all_complete_dataset_temporal_split_d2c2e63d.h5 \
+    --model-path checkpoints/fold_0_best.pt \
+    --dataset-path all_complete_dataset.h5 \
     --n-clusters 50 \
     --method kmeans \
+    --samples-per-stock 10 \
     --standardize \
     --output-dir cluster_results \
     --visualize
 ```
 
-**Parameters:**
-- `--n-clusters`: Number of clusters (default: 50)
-- `--method`: Clustering algorithm (kmeans, dbscan, agglomerative)
-- `--standardize`: Standardize embeddings before clustering
-- `--use-pca`: Use PCA for dimensionality reduction
-- `--max-stocks`: Limit number of stocks to encode
-- `--samples-per-stock`: Number of random timesteps to sample per stock (default: 10)
+### Parameters
 
-**Output:**
-- `cluster_assignments.pkl`: Ticker → cluster_id mapping
-- `embeddings.pkl`: Ticker → embedding mapping
-- `clustering_model.pkl`: Fitted clustering model
-- `cluster_visualization.png`: PCA projection of clusters
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--model-path` | required | Path to trained model checkpoint |
+| `--dataset-path` | required | Path to HDF5 dataset |
+| `--n-clusters` | 50 | Number of clusters |
+| `--method` | kmeans | Clustering method: kmeans, dbscan, agglomerative |
+| `--samples-per-stock` | 10 | Random timesteps per stock for temporal diversity |
+| `--standardize` | False | Standardize embeddings before clustering |
+| `--use-pca` | False | Use PCA dimensionality reduction |
+| `--pca-components` | 50 | Number of PCA components |
 
-### 2. Analyze Clusters
+### Temporal Sampling
 
-Identify which clusters are most profitable:
+To build robust clusters, each stock is encoded at multiple random timesteps:
+
+- Captures behavior across different market regimes
+- A stock might appear in different clusters at different times
+- Analysis aggregates by base ticker for performance metrics
+
+### Output Files
+
+```
+cluster_results/
+├── cluster_assignments.pkl    # {ticker: cluster_id}
+├── embeddings.pkl             # {ticker: embedding_vector}
+├── clustering_model.pkl       # Fitted K-means model
+├── scaler.pkl                 # Fitted StandardScaler
+└── cluster_visualization.png  # PCA projection plot
+```
+
+---
+
+## Step 2: Analyze Clusters
+
+Compute performance metrics for each cluster to identify profitable ones.
 
 ```bash
 python -m cluster.analyze_clusters \
     --cluster-dir cluster_results \
-    --dataset-path all_complete_dataset_temporal_split_d2c2e63d.h5 \
-    --prices-path actual_prices.h5 \
+    --dataset-path all_complete_dataset.h5 \
+    --prices-path actual_prices_clean.h5 \
     --horizons 1 5 10 20 \
     --min-return 0.005 \
     --min-win-rate 0.52 \
@@ -100,77 +153,55 @@ python -m cluster.analyze_clusters \
     --top-k 20
 ```
 
-**Metrics computed per cluster:**
-- Mean return (at multiple horizons)
-- Win rate (probability of profit)
-- Sharpe ratio
-- Return volatility
-- Skewness
+### Metrics Computed Per Cluster
 
-**Filtering criteria:**
-- `--min-return`: Minimum mean return (default: 0.5%)
-- `--min-win-rate`: Minimum win rate (default: 52%)
-- `--min-sharpe`: Minimum Sharpe ratio (default: 0.1)
-- `--top-k`: Select top K clusters by return
+- **Mean Return**: Average return at each horizon (1d, 5d, 10d, 20d)
+- **Win Rate**: Probability of positive return
+- **Sharpe Ratio**: Risk-adjusted return
+- **Volatility**: Standard deviation of returns
+- **Skewness**: Return distribution asymmetry
 
-**Output:**
-- `cluster_ranking_{horizon}d.csv`: Ranked clusters for each horizon
-- `best_clusters_{horizon}d.txt`: List of best cluster IDs
-- `cluster_performance_{horizon}d.png`: Performance visualizations
-- `cluster_analysis.pkl`: Full analysis results
+### Selection Criteria
 
-### 3. Use Cluster Filter
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--min-return` | 0.005 | Minimum mean return (0.5%) |
+| `--min-win-rate` | 0.52 | Minimum win rate (52%) |
+| `--min-sharpe` | 0.1 | Minimum Sharpe ratio |
+| `--top-k` | 20 | Select top K clusters by return |
 
-#### Integration with RL Training
+### Output Files
 
-```python
-from cluster import ClusterFilter
-from rl.train_rl_phase2 import Phase2TrainingLoop
-
-# Initialize filter
-cluster_filter = ClusterFilter(
-    cluster_dir='cluster_results',
-    best_clusters_file='cluster_results/best_clusters_5d.txt'
-)
-
-# Filter the training environment
-trainer = Phase2TrainingLoop(config)
-cluster_filter.apply_cluster_filter_to_rl_env(trainer.env, inplace=True)
-
-# Now RL agent only trains on stocks from good clusters
-trainer.train()
+```
+cluster_results/
+├── cluster_ranking_5d.csv      # Ranked clusters for 5-day horizon
+├── best_clusters_5d.txt        # Best cluster IDs (one per line)
+├── cluster_performance_5d.png  # Performance visualization
+└── cluster_analysis.pkl        # Full analysis results
 ```
 
-#### Integration with Backtesting
+### Example Output
 
-```python
-from cluster import ClusterFilter
-from inference.backtest_simulation import DatasetLoader, ModelPredictor, BacktestSimulator
-
-# Initialize filter
-cluster_filter = ClusterFilter(
-    cluster_dir='cluster_results',
-    best_clusters_file='cluster_results/best_clusters_5d.txt'
-)
-
-# Load data
-data_loader = DatasetLoader(dataset_path='...', ...)
-
-# Apply filter
-cluster_filter.apply_cluster_filter_to_backtest(data_loader, inplace=True)
-
-# Now backtest only considers stocks from good clusters
-predictor = ModelPredictor(...)
-simulator = BacktestSimulator(data_loader, predictor, ...)
-results = simulator.run_backtest()
+```
+Top 10 Clusters (5-day returns):
+cluster_id  num_stocks  mean_return  win_rate  sharpe  volatility
+        23         127        0.0245     0.587   0.452      0.0321
+         8         156        0.0218     0.564   0.411      0.0298
+        41          98        0.0203     0.571   0.398      0.0287
 ```
 
-#### Standalone Usage
+---
+
+## Step 3: Filter During Inference
+
+### Static Filtering
+
+Use fixed cluster assignments (stock always in same cluster):
 
 ```python
 from cluster import ClusterFilter
 
-# Initialize
+# Initialize filter
 cluster_filter = ClusterFilter(
     cluster_dir='cluster_results',
     best_clusters_file='cluster_results/best_clusters_5d.txt'
@@ -180,7 +211,7 @@ cluster_filter = ClusterFilter(
 all_tickers = ['AAPL', 'GOOGL', 'MSFT', ...]
 allowed_tickers = cluster_filter.filter_tickers(all_tickers)
 
-# Or check individual ticker
+# Check individual ticker
 if cluster_filter.is_allowed('AAPL'):
     trade('AAPL')
 
@@ -189,298 +220,162 @@ stats = cluster_filter.get_stats()
 print(f"Filtering {stats['total_stocks']} → {stats['allowed_stocks']} stocks")
 ```
 
-## Understanding the Results
+### Dynamic Filtering
 
-### Cluster Visualization
+Reassign clusters daily based on current features (captures regime changes):
 
-The `cluster_visualization.png` shows:
-- 2D PCA projection of stock embeddings
-- Each point = one stock
-- Colors = different clusters
-- Stocks close together have similar learned patterns
+```python
+from cluster.dynamic_cluster_filter import DynamicClusterFilter
 
-### Performance Analysis
+# Initialize filter
+filter = DynamicClusterFilter(
+    model_path='checkpoints/fold_0_best.pt',
+    cluster_dir='cluster_results',
+    best_cluster_ids=[1, 5, 8, 12]  # From analysis
+)
 
-Example output from `analyze_clusters`:
+# Every trading day
+for date in trading_dates:
+    features = get_features_for_date(date)
 
-```
-Top 10 Clusters (5-day returns):
-cluster_id  num_stocks  mean_return  win_rate  sharpe  volatility
-        23         127        0.0245     0.587   0.452      0.0321
-        8          156        0.0218     0.564   0.411      0.0298
-        41          98        0.0203     0.571   0.398      0.0287
-        ...
-```
+    # Filter to stocks in good clusters TODAY
+    allowed_stocks = filter.filter_stocks_for_date(features)
 
-**Interpretation:**
-- Cluster 23: 127 stocks with 2.45% average 5-day return, 58.7% win rate
-- High Sharpe ratio (0.452) indicates good risk-adjusted returns
-- These stocks exhibit predictable profitable patterns
-
-### Best Clusters Selection
-
-The system identifies clusters meeting criteria:
-- Mean return > 0.5%
-- Win rate > 52%
-- Sharpe ratio > 0.1
-
-Then selects top 20 by mean return.
-
-**Example:** If you have 3,500 stocks and 50 clusters:
-- Best 20 clusters might contain ~1,400 stocks (40%)
-- Trading only these stocks focuses on "predictable winners"
-- Avoids ~60% of stocks in unprofitable/volatile regimes
-
-## Advanced Options
-
-### Custom Clustering
-
-```bash
-# Use DBSCAN for density-based clustering
-python -m cluster.create_clusters \
-    --method dbscan \
-    --n-clusters 0  # Ignored for DBSCAN
-
-# Use PCA before clustering
-python -m cluster.create_clusters \
-    --use-pca \
-    --pca-components 50 \
-    --n-clusters 50
+    # Trade only allowed stocks
+    predictions = model.predict(allowed_stocks)
+    top_k = select_top_k(predictions)
 ```
 
-### Multi-Horizon Analysis
+See [docs/STATIC_VS_DYNAMIC.md](docs/STATIC_VS_DYNAMIC.md) for detailed comparison.
 
-Analyze performance at multiple time horizons:
+---
 
-```bash
-python -m cluster.analyze_clusters \
-    --horizons 1 3 5 10 20 60  # days
-```
+## Integration Examples
 
-This helps identify:
-- **Short-term clusters** (1-3 days): Momentum/mean-reversion
-- **Medium-term clusters** (5-10 days): Swing trading patterns
-- **Long-term clusters** (20-60 days): Trend-following patterns
-
-### Dynamic Cluster Selection
-
-Select different clusters for different trading strategies:
+### With Backtesting
 
 ```python
 from cluster import ClusterFilter
+from inference.backtest_simulation import BacktestSimulator
 
-# Day trading: Use 1-day best clusters
-day_filter = ClusterFilter(
-    cluster_dir='cluster_results',
-    best_clusters_file='cluster_results/best_clusters_1d.txt'
-)
-
-# Swing trading: Use 5-day best clusters
-swing_filter = ClusterFilter(
+cluster_filter = ClusterFilter(
     cluster_dir='cluster_results',
     best_clusters_file='cluster_results/best_clusters_5d.txt'
 )
 
-# Apply appropriate filter based on strategy
-if strategy == 'day_trading':
-    filter = day_filter
-else:
-    filter = swing_filter
+# Apply filter to backtest
+cluster_filter.apply_cluster_filter_to_backtest(data_loader, inplace=True)
 
-allowed_tickers = filter.filter_tickers(all_tickers)
+# Run backtest on filtered stocks only
+simulator = BacktestSimulator(data_loader, predictor, ...)
+results = simulator.run_backtest()
 ```
 
-## Performance Impact
+### With RL Training
 
-### Expected Improvements
-
-Based on typical results:
-
-**Without clustering:**
-- Evaluate all 3,500 stocks
-- Many unpredictable/low-return stocks
-- Lower overall win rate (~52%)
-
-**With clustering:**
-- Evaluate only ~1,400 stocks (top 20 clusters)
-- Focus on predictable patterns
-- Higher win rate (~58%)
-- Better risk-adjusted returns
-
-**Backtesting gains:**
-- +3-7% improvement in mean return
-- +5-10% improvement in win rate
-- +0.3-0.5 improvement in Sharpe ratio
-- Reduced max drawdown
-
-### Computational Savings
-
-- **Training**: 60% fewer stocks → faster RL training
-- **Inference**: 60% fewer stocks → faster predictions
-- **Backtesting**: 60% fewer evaluations → faster backtests
-
-## Implementation Details
-
-### Encoding Process
-
-1. **Load model**: Trained price predictor
-2. **Extract features**: Get features for each stock-date
-3. **Forward pass**: Run through transformer
-4. **Mean pooling**: Average transformer activations over sequence
-5. **Result**: Fixed-size embedding per stock (604 dims from t_act)
-
-### Clustering Methods
-
-**K-Means (recommended)**:
-- Fast and scalable
-- Produces balanced clusters
-- Good for large datasets
-
-**DBSCAN**:
-- Finds density-based clusters
-- Can identify outliers
-- No need to specify K
-
-**Agglomerative**:
-- Hierarchical clustering
-- Can analyze cluster tree
-- Slower for large datasets
-
-### Feature Standardization
-
-Before clustering, embeddings are standardized:
 ```python
-X_standardized = (X - mean) / std
+from cluster import ClusterFilter
+
+cluster_filter = ClusterFilter(
+    cluster_dir='cluster_results',
+    best_clusters_file='cluster_results/best_clusters_5d.txt'
+)
+
+# Apply filter to RL environment
+cluster_filter.apply_cluster_filter_to_rl_env(trainer.env, inplace=True)
+
+# Train on filtered stocks only
+trainer.train()
 ```
 
-This ensures all dimensions contribute equally to clustering.
+See [docs/INFERENCE_INTEGRATION.md](docs/INFERENCE_INTEGRATION.md) for more integration examples.
 
-## Troubleshooting
+---
 
-### Issue: Too few stocks after filtering
-
-**Solution**: Relax criteria or select more clusters
-```bash
-python -m cluster.analyze_clusters \
-    --min-return 0.003  # Lower from 0.005
-    --min-win-rate 0.50  # Lower from 0.52
-    --top-k 30  # Increase from 20
-```
-
-### Issue: Clusters have very different sizes
-
-**Cause**: Some patterns are more common than others
-
-**Solutions**:
-1. Use more clusters (`--n-clusters 100`)
-2. Use DBSCAN to handle density differences
-3. Filter by min/max cluster size in post-processing
-
-### Issue: Performance not improving with filtering
-
-**Possible causes**:
-1. Model hasn't learned meaningful patterns (train longer)
-2. Too many clusters (try fewer: `--n-clusters 20`)
-3. Wrong horizon (analyze multiple horizons)
-4. Overfitting (validate on separate time period)
-
-## Integration Examples
-
-### Complete RL Training with Clustering
-
-```bash
-# 1. Create clusters
-python -m cluster.create_clusters \
-    --model-path checkpoints/best_model.pt \
-    --dataset-path data/all_complete_dataset.h5 \
-    --n-clusters 50 \
-    --output-dir cluster_results
-
-# 2. Analyze
-python -m cluster.analyze_clusters \
-    --cluster-dir cluster_results \
-    --dataset-path data/all_complete_dataset.h5 \
-    --prices-path data/actual_prices.h5
-
-# 3. Train RL with filtering
-python -m rl.train_rl_phase2 \
-    --dataset-path data/all_complete_dataset.h5 \
-    --predictor-checkpoint checkpoints/best_model.pt \
-    --cluster-filter-dir cluster_results \
-    --best-clusters-file cluster_results/best_clusters_5d.txt
-```
-
-### Complete Backtesting with Clustering
-
-```bash
-# 1-2. Create and analyze clusters (same as above)
-
-# 3. Run backtest with filtering
-python -m inference.backtest_simulation \
-    --dataset-path data/all_complete_dataset.h5 \
-    --model-path checkpoints/best_model.pt \
-    --cluster-filter-dir cluster_results \
-    --best-clusters-file cluster_results/best_clusters_5d.txt
-```
-
-## Files and Directory Structure
-
-```
-cluster/
-├── __init__.py                   # Package initialization
-├── create_clusters.py            # Encode and cluster dataset
-├── analyze_clusters.py           # Analyze cluster performance
-├── cluster_filter.py             # Filter stocks during inference
-├── README.md                     # This file
-└── example_workflow.sh           # Complete example workflow
-
-cluster_results/                  # Output directory
-├── cluster_assignments.pkl       # Ticker → cluster mapping
-├── embeddings.pkl                # Ticker → embedding mapping
-├── clustering_model.pkl          # Fitted clustering model
-├── scaler.pkl                    # Fitted StandardScaler
-├── cluster_visualization.png     # PCA visualization
-├── cluster_ranking_{h}d.csv      # Ranked clusters per horizon
-├── best_clusters_{h}d.txt        # Best cluster IDs per horizon
-├── cluster_performance_{h}d.png  # Performance plots per horizon
-└── cluster_analysis.pkl          # Full analysis results
-```
-
-## Theory: Why Clustering Works
+## Why Clustering Works
 
 ### Market Regimes
 
 Different clusters represent different market regimes:
 
-- **Cluster A**: High-momentum tech stocks (high return, high volatility)
-- **Cluster B**: Stable dividend stocks (low return, low volatility)
-- **Cluster C**: Mean-reverting cyclicals (moderate return, predictable)
-- **Cluster D**: Unpredictable/noisy stocks (low Sharpe, avoid)
+| Cluster Type | Characteristics | Trading Approach |
+|--------------|----------------|------------------|
+| High-momentum tech | High return, high volatility | Momentum trading |
+| Stable dividends | Low return, low volatility | Hold positions |
+| Mean-reverting cyclicals | Moderate return, predictable | Mean reversion |
+| Noisy/unpredictable | Low Sharpe, erratic | **Avoid** |
 
-### Learned Patterns
+### Learned Representations
 
-The transformer learns to encode:
-- Price patterns (trends, reversals, volatility)
-- Fundamental relationships (P/E, growth, sector)
-- Temporal dynamics (seasonality, cycles)
+The transformer encodes:
+- **Price patterns**: Trends, reversals, volatility regimes
+- **Fundamental relationships**: P/E ratios, growth metrics
+- **Temporal dynamics**: Seasonality, cycles, momentum
 
 Clustering groups stocks with similar learned representations.
 
 ### Profit Opportunity
 
 Clusters with high returns + high win rates represent:
-- **Predictable patterns** the model has learned well
-- **Consistent edge** across multiple stocks
-- **Lower variance** in outcomes
+- Patterns the model has learned well
+- Consistent edge across multiple stocks
+- Lower variance in outcomes
 
-Trading only these clusters improves risk-adjusted returns.
+---
 
-## Next Steps
+## Troubleshooting
 
-1. **Create clusters** from your dataset
-2. **Analyze performance** to identify best clusters
-3. **Integrate filtering** into your trading pipeline
-4. **Backtest** to validate improvement
-5. **Deploy** to production with confidence
+### Too few stocks after filtering
 
-The clustering approach is a powerful way to leverage your model's learned representations for better stock selection!
+Relax criteria or select more clusters:
+```bash
+python -m cluster.analyze_clusters \
+    --min-return 0.003 \
+    --min-win-rate 0.50 \
+    --top-k 30
+```
+
+### Unbalanced cluster sizes
+
+Some patterns are more common. Solutions:
+- Use more clusters (`--n-clusters 100`)
+- Use DBSCAN for density-based clustering
+- Post-process to filter by min/max cluster size
+
+### No performance improvement
+
+Possible causes:
+1. Model hasn't learned meaningful patterns - train longer
+2. Too many clusters - try `--n-clusters 20`
+3. Wrong horizon - analyze multiple horizons
+4. Overfitting - validate on separate time period
+
+---
+
+## File Structure
+
+```
+cluster/
+├── README.md                     # This file
+├── __init__.py
+├── create_clusters.py            # Encode and cluster dataset
+├── analyze_clusters.py           # Analyze cluster performance
+├── cluster_filter.py             # Static cluster filtering
+├── dynamic_cluster_filter.py     # Dynamic (daily) cluster filtering
+├── cache_embeddings.py           # Pre-compute embeddings
+├── compute_embeddings.py         # Compute stock embeddings
+├── cluster_embeddings.py         # Cluster pre-computed embeddings
+├── gpu_kmeans.py                 # GPU-accelerated K-means
+└── docs/
+    ├── STATIC_VS_DYNAMIC.md      # Static vs dynamic comparison
+    ├── INFERENCE_INTEGRATION.md  # Integration guide
+    ├── CACHING_GUIDE.md          # Embedding caching guide
+    └── example_workflow.sh       # Complete workflow example
+```
+
+---
+
+## References
+
+- Main documentation: [docs/cluster_top_k_filtering.md](../docs/cluster_top_k_filtering.md)
+- Coverage-based selection: [docs/coverage_based_cluster_selection.md](../docs/coverage_based_cluster_selection.md)
