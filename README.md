@@ -277,25 +277,45 @@ python sanity_checks/feature_ir_analysis.py \
 
 ## Reinforcement Learning (Experimental)
 
-The `rl/` directory contains experimental reinforcement learning approaches for trading.
+The `rl/` directory contains experimental reinforcement learning approaches for trading, organized into submodules.
+
+### Structure
+
+```
+rl/
+├── actor_critic/    # Actor-Critic approach
+├── dqn/             # Deep Q-Network approach
+├── core/            # Shared components (environment, networks)
+├── utils/           # Utility functions
+├── evaluation/      # Evaluation metrics and tools
+└── docs/            # General RL documentation
+```
 
 ### Key Scripts
 
 | Script | Description |
 |--------|-------------|
-| `rl/train_actor_critic.py` | Actor-Critic training for portfolio management |
-| `rl/train_dqn_simple.py` | Simplified DQN training |
-| `rl/rl_environment.py` | Trading environment implementation |
-| `rl/rl_components.py` | Neural network architectures |
-| `rl/inference_actor_critic.py` | Run inference with trained RL agent |
+| `rl/actor_critic/train_actor_critic.py` | Actor-Critic training for portfolio management |
+| `rl/actor_critic/inference_actor_critic.py` | Run inference with trained AC agent |
+| `rl/dqn/train_dqn_simple.py` | Simplified DQN training |
+| `rl/core/rl_environment.py` | Trading environment implementation |
+| `rl/core/rl_components.py` | Neural network architectures |
 
 ### Train Actor-Critic
 
 ```bash
-python -m rl.train_actor_critic \
+python -m rl.actor_critic.train_actor_critic \
     --data all_complete_dataset.h5 \
     --prices actual_prices_clean.h5 \
     --predictor-checkpoint checkpoints/walk_forward/fold_0_best.pt
+```
+
+### Train DQN
+
+```bash
+python -m rl.dqn.train_dqn_simple \
+    --data all_complete_dataset.h5 \
+    --prices actual_prices_clean.h5
 ```
 
 See [rl/docs/README.md](rl/docs/README.md) for detailed RL documentation.
@@ -382,11 +402,8 @@ The following scripts may be outdated or experimental. Contact maintainers befor
 
 | Script | Status | Notes |
 |--------|--------|-------|
-| `training/contrastive_pretraining.py` | Experimental | Contrastive learning approach |
 | `training/selection_aware_training.py` | Experimental | Alternative training strategy |
-| `training/models.py` | Legacy | Use `training/model.py` instead |
-| `rl/diagnose_*.py` | Debug | Debugging scripts |
-| `rl/train_rl.py` | Legacy | Use `train_actor_critic.py` or `train_dqn_simple.py` |
+| `training/new_data_loader.py` | Legacy | May be superseded by `hdf5_data_loader.py` |
 
 ---
 
