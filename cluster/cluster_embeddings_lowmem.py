@@ -1,12 +1,16 @@
 """
-Cluster Embeddings
+Cluster Embeddings (Low-Memory Workflow)
 
-Takes pre-computed embeddings and creates clusters using various clustering algorithms.
+This is part of a two-step workflow for datasets too large to fit in memory:
+  1. compute_embeddings_lowmem.py - Encode stocks and save embeddings to disk
+  2. cluster_embeddings_lowmem.py - Load embeddings and cluster them
+
+For smaller datasets, use create_clusters.py which does both steps in one pass.
 
 Process:
 1. Load embeddings from disk
 2. Optionally standardize and apply PCA
-3. Cluster the embeddings using K-means or other methods
+3. Cluster the embeddings using K-means or other methods (GPU-accelerated)
 4. Save cluster assignments and centroids
 5. Optionally visualize clusters
 """

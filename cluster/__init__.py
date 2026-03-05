@@ -15,11 +15,13 @@ This reduces the search space and focuses on stocks with profitable patterns.
 from .create_clusters import ClusterEncoder, create_clusters_from_dataset
 from .analyze_clusters import ClusterAnalyzer, analyze_cluster_performance
 from .cluster_filter import ClusterFilter
+from .dynamic_cluster_filter import DynamicClusterFilter
 
 __all__ = [
     'ClusterEncoder',
     'create_clusters_from_dataset',
     'ClusterAnalyzer',
     'analyze_cluster_performance',
-    'ClusterFilter'
+    'ClusterFilter',
+    'DynamicClusterFilter'
 ]

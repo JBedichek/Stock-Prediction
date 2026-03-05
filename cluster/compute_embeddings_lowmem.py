@@ -1,7 +1,11 @@
 """
-Compute Embeddings from Dataset
+Compute Embeddings from Dataset (Low-Memory Workflow)
 
-Encodes the entire dataset using transformer mean pooling and saves the embeddings.
+This is part of a two-step workflow for datasets too large to fit in memory:
+  1. compute_embeddings_lowmem.py - Encode stocks and save embeddings to disk
+  2. cluster_embeddings_lowmem.py - Load embeddings and cluster them
+
+For smaller datasets, use create_clusters.py which does both steps in one pass.
 
 Process:
 1. Load trained price predictor

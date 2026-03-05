@@ -1,45 +1,40 @@
 # Cluster-Based Stock Filtering
 
-Use transformer embeddings and clustering to identify and filter stocks with predictable patterns.
+The idea here is to use the mean pooled transformer embeddings to build a set of k-means cluster, then analyze clusters of latent representation to find "favorable" clusters which fulfiill either one of two criteria:  
+
+1. High return (mean, median return of stocks assigned to this cluster)
+2. Predictability (model attains comparitively lower losses on predictions from within this cluster)
+
+These two qualities are chosen because of their expected effect on trading.
+
+This process can sucessfully identify clusters of high value, however it is dependent on the quality of the representation of the transformer.  The transfer of knowledge from past stock movements to future ones is difficult for classical models like the ones used here (At least within the scope of what I've tried), so this is not as magic a bullet as some of the cluster stats may indicate, because the clustering is "trained" on past data and doesn't generalize perfectly.  
 
 ## Overview
 
-**The Problem**: Evaluating all stocks during trading is inefficient, and many stocks have unpredictable behavior that hurts overall performance.
-
-**The Solution**: Use the transformer's learned representations to group stocks into clusters, identify which clusters have profitable and predictable patterns, and only trade stocks from those clusters.
 
 ### How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        CLUSTER FILTERING PIPELINE                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  1. ENCODE                    2. CLUSTER                3. ANALYZE          │
-│  ┌─────────────┐              ┌─────────────┐           ┌─────────────┐     │
-│  │ Transformer │──────────────│   K-Means   │───────────│  Backtest   │     │
-│  │ Mean Pool   │  Embeddings  │  Clustering │  Clusters │  Per Cluster│     │
-│  └─────────────┘              └─────────────┘           └─────────────┘     │
-│        ↑                                                       │            │
-│    Features                                               Best Clusters     │
-│                                                                ↓            │
-│                           4. FILTER                     ┌─────────────┐     │
-│                           ┌─────────────────────────────│ Trade Only  │     │
-│                           │ During inference, only      │ Good Stocks │     │
-│                           │ consider stocks from        └─────────────┘     │
-│                           │ profitable clusters                             │
-│                           └─────────────────────────────────────────────────│
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         CLUSTER FILTERING PIPELINE                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. ENCODE                    2. CLUSTER                 3. ANALYZE          │
+│  ┌─────────────┐              ┌─────────────┐            ┌─────────────┐     │
+│  │ Transformer │──────────────│   K-Means   │────────────│  Backtest   │     │
+│  │ Mean Pool   │  Embeddings  │  Clustering │  Clusters  │  Per Cluster│     │
+│  └─────────────┘              └─────────────┘            └─────────────┘     │
+│        ↑                                                        │            │
+│    Features                                                Best Clusters     │
+│                                                                 ↓            │
+│                                                          ┌───────────────┐   │
+│  4. FILTER                                               │Cache centroids│   │
+│  During inference, assign stocks to nearest   ──────────>│ + best cluster│   │
+│  centroid and filter to best clusters                    │     IDs       │   │
+│                                                          └───────────────┘   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
-
-### Benefits
-
-| Aspect | Without Clustering | With Clustering |
-|--------|-------------------|-----------------|
-| Stock Universe | All 3,500 stocks | ~1,400 stocks (top clusters) |
-| Win Rate | ~52% | ~58% |
-| Sharpe Ratio | Baseline | +0.3-0.5 improvement |
-| Inference Speed | Baseline | 60% faster |
 
 ## Quick Start
 
@@ -67,13 +62,13 @@ python -m inference.backtest_simulation \
 
 | Script | Description |
 |--------|-------------|
-| `create_clusters.py` | Encode dataset and create clusters using K-means |
+| `create_clusters.py` | Encode dataset and create clusters using K-means (all-in-one) |
 | `analyze_clusters.py` | Compute returns, win rate, Sharpe for each cluster |
 | `cluster_filter.py` | Static filter - fixed cluster assignments per stock |
 | `dynamic_cluster_filter.py` | Dynamic filter - reassigns clusters daily based on current features |
 | `cache_embeddings.py` | Pre-compute and cache embeddings for faster filtering |
-| `compute_embeddings.py` | Compute embeddings for stocks |
-| `cluster_embeddings.py` | Cluster pre-computed embeddings |
+| `compute_embeddings_lowmem.py` | Compute embeddings only (for large datasets - low memory workflow) |
+| `cluster_embeddings_lowmem.py` | Cluster pre-computed embeddings (second step of low-memory workflow) |
 | `gpu_kmeans.py` | GPU-accelerated K-means implementation |
 
 ## Detailed Documentation
@@ -83,7 +78,6 @@ python -m inference.backtest_simulation \
 | [docs/STATIC_VS_DYNAMIC.md](docs/STATIC_VS_DYNAMIC.md) | Comparison of static vs dynamic cluster assignment |
 | [docs/INFERENCE_INTEGRATION.md](docs/INFERENCE_INTEGRATION.md) | How to integrate filtering into inference pipelines |
 | [docs/CACHING_GUIDE.md](docs/CACHING_GUIDE.md) | Pre-computing embeddings for production |
-| [docs/example_workflow.sh](docs/example_workflow.sh) | Complete example shell script |
 
 ---
 
@@ -358,19 +352,18 @@ Possible causes:
 cluster/
 ├── README.md                     # This file
 ├── __init__.py
-├── create_clusters.py            # Encode and cluster dataset
-├── analyze_clusters.py           # Analyze cluster performance
-├── cluster_filter.py             # Static cluster filtering
-├── dynamic_cluster_filter.py     # Dynamic (daily) cluster filtering
-├── cache_embeddings.py           # Pre-compute embeddings
-├── compute_embeddings.py         # Compute stock embeddings
-├── cluster_embeddings.py         # Cluster pre-computed embeddings
-├── gpu_kmeans.py                 # GPU-accelerated K-means
+├── create_clusters.py               # Encode and cluster dataset (all-in-one)
+├── analyze_clusters.py              # Analyze cluster performance
+├── cluster_filter.py                # Static cluster filtering
+├── dynamic_cluster_filter.py        # Dynamic (daily) cluster filtering
+├── cache_embeddings.py              # Pre-compute embeddings for backtesting
+├── compute_embeddings_lowmem.py     # Compute embeddings only (low-memory workflow)
+├── cluster_embeddings_lowmem.py     # Cluster pre-computed embeddings (low-memory workflow)
+├── gpu_kmeans.py                    # GPU-accelerated K-means
 └── docs/
-    ├── STATIC_VS_DYNAMIC.md      # Static vs dynamic comparison
-    ├── INFERENCE_INTEGRATION.md  # Integration guide
-    ├── CACHING_GUIDE.md          # Embedding caching guide
-    └── example_workflow.sh       # Complete workflow example
+    ├── STATIC_VS_DYNAMIC.md         # Static vs dynamic comparison
+    ├── INFERENCE_INTEGRATION.md     # Integration guide
+    └── CACHING_GUIDE.md             # Embedding caching guide
 ```
 
 ---
