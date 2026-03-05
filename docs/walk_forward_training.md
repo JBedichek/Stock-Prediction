@@ -360,3 +360,213 @@ The summary includes a t-test against zero returns:
 - High variance across folds: Model may be overfitting
 - Negative later folds: Model not adapting to regime changes
 - Sharpe < 0.5 with high returns: Too much risk
+
+## Complete Argument Reference
+
+This section documents every command-line argument available in `walk_forward_training.py`.
+
+### Data Paths
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--data` | str | **required** | Path to HDF5 dataset containing features. Must have structure `{ticker}/features` and `{ticker}/dates`. |
+| `--prices` | str | None | Path to actual prices HDF5 for backtesting. If not provided, uses prices from the main dataset. Should have `{ticker}/prices` and `{ticker}/dates`. |
+
+### Walk-Forward Configuration
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--num-folds` | int | 10 | Number of temporal folds for cross-validation. More folds = more evaluation periods but less test data per fold. |
+| `--mode` | str | expanding | Window mode: `expanding` (growing training window) or `sliding` (fixed-size window that moves forward). |
+| `--min-train-months` | int | 160 | Minimum training period in months. For expanding mode, this is the initial training size. For sliding mode, this is the fixed window size. |
+| `--test-months` | int | 6 | Test period per fold in months. Each fold evaluates on this many months of out-of-sample data. |
+| `--gap-days` | int | 5 | Gap between train and test periods (in trading days). Prevents data leakage from features that use future information. |
+| `--no-auto-span` | flag | False | Disable automatic date span calculation. When enabled, uses fixed `--min-train-months` and `--test-months` instead of auto-spanning the full dataset. |
+| `--initial-train-fraction` | float | 0.5 | Fraction of data for initial training when auto-span is enabled. The remaining data is divided into test folds. |
+
+### Model Architecture
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--hidden-dim` | int | 1024 | Hidden dimension of the transformer. Controls model capacity. Larger = more expressive but slower and more memory. |
+| `--num-layers` | int | 4 | Number of transformer encoder layers. Depth of the model. |
+| `--num-heads` | int | 8 | Number of attention heads. Must evenly divide `hidden-dim`. More heads = more parallel attention patterns. |
+| `--dropout` | float | 0.1 | Dropout rate for regularization. Applied after attention and feedforward layers. |
+| `--pred-mode` | str | regression | Prediction mode: `classification` (predict distribution over return bins) or `regression` (predict raw returns). Classification is generally more stable. |
+
+### Training Configuration
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--epochs-per-fold` | int | 1 | Number of training epochs per fold. More epochs = more training but risk of overfitting. |
+| `--batch-size` | int | 128 | Batch size per GPU. Actual batch size with gradient accumulation = `batch_size × gradient_accumulation_steps`. |
+| `--lr` | float | 1e-4 | Learning rate for AdamW optimizer. Lower values = more stable but slower convergence. |
+| `--seq-len` | int | 1536 | Sequence length (number of historical days). Longer = more context but more memory and slower training. |
+| `--gradient-accumulation-steps` | int | 4 | Accumulate gradients over N steps before optimizer update. Effective batch size = `batch_size × N`. Useful for large effective batches on limited GPU memory. |
+| `--early-stopping-patience` | int | 3 | Stop training if validation loss doesn't improve for N epochs. Set to 0 to disable early stopping. |
+| `--data-fraction` | float | 1.0 | Fraction of training data to use (0.0-1.0). Useful for fast experiments with subset of data. |
+
+### Adaptive Batch Size
+
+These arguments control automatic gradient accumulation increase when training plateaus.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--adaptive-batch-size` | flag | False | Enable adaptive batch size: automatically increase gradient accumulation when loss plateaus. |
+| `--plateau-patience` | int | 15 | Number of optimizer steps without improvement before increasing batch size. |
+| `--plateau-threshold` | float | 0.001 | Minimum relative improvement (0.1%) to count as "not plateaued". |
+| `--max-grad-accum` | int | 32 | Maximum gradient accumulation steps. Adaptive batch size won't exceed this. |
+
+### Ranking Loss
+
+These arguments control auxiliary ranking losses that help the model learn cross-sectional stock ranking.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--ranking-loss-weight` | float | 0.0 | Weight for ranking loss (0.0 = disabled). When > 0, adds ranking loss to primary CE/MSE loss. |
+| `--ranking-loss-type` | str | pairwise | Type of ranking loss: `pairwise` (margin-based), `listnet` (distribution-based), or `correlation` (directly optimizes IC). See [ListNet documentation](listnet_loss.md). |
+| `--ranking-margin` | float | 0.01 | Margin for pairwise ranking loss. Minimum score difference required for correctly ordered pairs. |
+| `--ranking-only` | flag | False | Train with ONLY ranking loss (no cross-entropy/MSE). Directly optimizes for stock ranking rather than return prediction. |
+
+### Monte Carlo Validation
+
+Monte Carlo validation runs after each fold to estimate strategy robustness across random stock subsets.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--no-monte-carlo` | flag | False | Disable Monte Carlo validation (enabled by default). |
+| `--mc-trials` | int | 50 | Number of Monte Carlo trials per fold. More trials = more reliable estimates but slower. |
+| `--mc-stocks` | int | 120 | Number of stocks to randomly sample per trial. |
+| `--mc-top-ks` | int[] | [1,2,3,4,5,10,15,20,30,50] | Top-k values to test in Monte Carlo. Tests strategy performance for different portfolio sizes. |
+
+### Progressive Evaluation
+
+These arguments control evaluation and logging during training.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--eval-every-n-steps` | int | 100 | Evaluate on validation set every N optimizer steps. Set to 0 to disable progressive evaluation. |
+| `--loss-smoothing-window` | int | 50 | EMA window size for smoothed loss curves in plots. |
+| `--save-loss-curves-every` | int | 100 | Save loss curve PNG every N steps. Set to 0 to only save at end of training. |
+
+### Incremental Training
+
+Incremental training reuses the previous fold's model weights instead of training from scratch.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--incremental` | flag | False | Enable incremental training. Loads previous fold checkpoint and fine-tunes on new data. |
+| `--incremental-epochs` | int | 2 | Number of epochs for incremental training. Typically fewer than full training since starting from pretrained weights. |
+| `--incremental-data-fraction` | float | 1.0 | Fraction of new data to use in incremental training (0.0-1.0). |
+
+### Checkpoint Saving
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--save-intermediate-checkpoints` | flag | False | Save checkpoints at regular intervals throughout training. Useful for analyzing training progression. |
+| `--checkpoint-every-n-epochs` | int | 1 | Save intermediate checkpoint every N epochs (when `--save-intermediate-checkpoints` is enabled). |
+| `--checkpoint-dir` | str | checkpoints/walk_forward | Directory to save model checkpoints. Automatically appended with loss type and seed. |
+| `--output` | str | walk_forward_training_results.pt | Output file for training results (PyTorch format). JSON version saved alongside. |
+
+### Evaluation Configuration
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--top-k` | int | 25 | Number of top stocks to select for portfolio. Affects both backtesting and turnover calculations. |
+| `--horizon-idx` | int | 0 | Prediction horizon index to use for ranking (0=1-day, 1=5-day, 2=10-day, 3=20-day). |
+| `--confidence-percentile` | float | 0.6 | Minimum confidence percentile for stock selection. Stocks below this confidence are filtered out. |
+| `--subset-size` | int | 512 | Number of stocks to evaluate per day in backtesting. Reduces computation for large universes. |
+| `--num-test-stocks` | int | 1000 | Maximum number of stocks to include in test set per fold. |
+| `--max-eval-dates` | int | 60 | Maximum evaluation dates for principled evaluation. Randomly sampled if test period has more dates. |
+
+### Transaction Costs
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--transaction-cost-bps` | float | 10.0 | Transaction cost in basis points per round-trip trade. 10 bps = 0.1%. See [Transaction Costs documentation](transaction_costs.md). Typical values: 5-20 bps (large-cap), 20-50 bps (mid-cap), 50-100+ bps (small-cap). |
+
+### System Configuration
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--device` | str | cuda | Device for training: `cuda`, `cpu`, or specific GPU like `cuda:0`. |
+| `--seed` | int | 42 | Master random seed for full reproducibility. Controls all randomness (PyTorch, NumPy, Python random). |
+| `--no-preload` | flag | False | Disable data preloading. Streams from HDF5 instead. Saves memory but slower. Use for large `--seq-len`. |
+| `--num-workers` | int | 4 | Number of DataLoader workers for parallel data loading. Set to 0 for debugging hangs. |
+| `--no-compile` | flag | False | Disable `torch.compile()`. Useful for debugging or when compilation fails. |
+| `--compile-mode` | str | default | `torch.compile` mode: `default`, `reduce-overhead`, `max-autotune`, or `max-autotune-no-cudagraphs`. |
+| `--ddp` | flag | False | Enable Distributed Data Parallel for multi-GPU training. Must be launched with `torchrun`. |
+
+### Baseline Model Comparison
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--compare-models` | flag | False | Train and evaluate baseline models (Ridge, LightGBM, MLP) for comparison against transformer. |
+| `--baseline-max-samples` | int | 50000 | Maximum training samples for baseline models. Limits memory usage for tree-based models. |
+
+## Argument Interactions and Tips
+
+### Effective Batch Size
+
+The effective batch size is:
+```
+effective_batch = batch_size × gradient_accumulation_steps × num_gpus
+```
+
+For stable training, aim for effective batch sizes of 256-1024.
+
+### Memory vs Speed Trade-offs
+
+| Goal | Adjustments |
+|------|-------------|
+| Reduce memory | Lower `--batch-size`, increase `--gradient-accumulation-steps`, enable `--no-preload`, reduce `--seq-len` |
+| Faster training | Increase `--batch-size`, use `--ddp` with multiple GPUs, enable `torch.compile` (default) |
+| Faster experiments | Use `--data-fraction 0.1`, reduce `--epochs-per-fold`, reduce `--num-folds` |
+
+### Checkpoint Directory Naming
+
+The checkpoint directory is automatically extended based on configuration:
+```
+{checkpoint_dir}_{loss_type}_seed{seed}
+```
+
+Examples:
+- `checkpoints/walk_forward_ce_seed42` - Classification with CE loss
+- `checkpoints/walk_forward_mse_seed42` - Regression with MSE loss
+- `checkpoints/walk_forward_ce+listnet_seed42` - CE + ListNet ranking loss
+- `checkpoints/walk_forward_listnet_seed42` - Ranking-only with ListNet
+
+### Recommended Configurations
+
+**Quick Test Run:**
+```bash
+python -m training.walk_forward_training \
+    --data data.h5 --num-folds 2 --epochs-per-fold 1 \
+    --data-fraction 0.1 --no-monte-carlo
+```
+
+**Standard Training:**
+```bash
+python -m training.walk_forward_training \
+    --data data.h5 --prices prices.h5 \
+    --num-folds 10 --epochs-per-fold 5 \
+    --hidden-dim 512 --num-layers 4 \
+    --batch-size 128 --gradient-accumulation-steps 4
+```
+
+**Production Training:**
+```bash
+torchrun --nproc_per_node=4 -m training.walk_forward_training \
+    --data data.h5 --prices prices.h5 \
+    --num-folds 10 --epochs-per-fold 10 \
+    --hidden-dim 768 --num-layers 6 \
+    --batch-size 64 --gradient-accumulation-steps 8 \
+    --ranking-loss-type listnet --ranking-loss-weight 0.1 \
+    --transaction-cost-bps 15 \
+    --ddp --compare-models
+```
+
+**Ablation Study:**
+```bash
+./sanity_checks/ablate.sh hidden-dim "256 512 768 1024" "0 1 2"
+```
