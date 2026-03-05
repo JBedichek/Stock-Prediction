@@ -77,7 +77,7 @@ Stock-Prediction/
 
 | Document | Description |
 |----------|-------------|
-| [rl/README.md](rl/README.md) | Reinforcement learning for trading |
+| [rl/docs/README.md](rl/docs/README.md) | Reinforcement learning for trading |
 | [docs/cluster_top_k_filtering.md](docs/cluster_top_k_filtering.md) | Cluster-based stock filtering |
 | [docs/coverage_based_cluster_selection.md](docs/coverage_based_cluster_selection.md) | Diversified cluster selection |
 
@@ -298,7 +298,7 @@ python -m rl.train_actor_critic \
     --predictor-checkpoint checkpoints/walk_forward/fold_0_best.pt
 ```
 
-See [rl/README.md](rl/README.md) for detailed RL documentation.
+See [rl/docs/README.md](rl/docs/README.md) for detailed RL documentation.
 
 ---
 
