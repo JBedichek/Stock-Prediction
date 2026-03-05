@@ -1700,6 +1700,7 @@ class WalkForwardTrainer:
         epochs_per_fold: int = 10,
         batch_size: int = 64,
         learning_rate: float = 1e-4,
+        weight_decay: float = 0.1,
         seq_len: int = 60,
         # Evaluation config
         top_k: int = 5,
@@ -1774,6 +1775,7 @@ class WalkForwardTrainer:
         self.epochs_per_fold = epochs_per_fold
         self.batch_size = batch_size
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
         self.seq_len = seq_len
         self.preload_data = preload_data
         self.num_workers = num_workers
@@ -2681,7 +2683,7 @@ class WalkForwardTrainer:
         )
 
         # Setup optimizer (no mixed precision for simplicity)
-        optimizer = AdamW(model.parameters(), lr=self.learning_rate, weight_decay=0.1)
+        optimizer = AdamW(model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
         # Compute bin edges if classification
         if self.pred_mode == 'classification':
@@ -3934,6 +3936,8 @@ def main():
                        help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=0.1,
+                       help='Weight decay for AdamW optimizer')
     parser.add_argument('--seq-len', type=int, default=1536,
                        help='Sequence length')
     parser.add_argument('--gradient-accumulation-steps', type=int, default=4,
@@ -4069,6 +4073,7 @@ def main():
         epochs_per_fold=args.epochs_per_fold,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        weight_decay=args.weight_decay,
         seq_len=args.seq_len,
         top_k=args.top_k,
         horizon_idx=args.horizon_idx,
