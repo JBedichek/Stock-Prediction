@@ -4,16 +4,10 @@ This repo contains a set of experimental stock prediction programs, complete wit
 
 All models use the same architecture, a transformer encoder, either with a classification head or a scalar score head. See [`SimpleTransformerPredictor`](https://github.com/JBedichek/Stock-Prediction/blob/main/training/model.py#L154) for the full implementation.
 
-In direct and relative price prediction modes (i.e., not RL), models trade by processing a set of stocks, sorting their predictions from lowest to highest, and simply choosing the top-k highest prediction stocks to trade. These predictions correspond to price changes (direct prediction) or ranking-aware affinity scores (relative prediction).
+In direct and relative price prediction modes (i.e., not RL), models trade by processing a set of stocks, sorting their predictions from lowest to highest, and simply choosing the top-k highest prediction stocks to trade. These predictions correspond to price changes (direct prediction) or ranking-aware affinity scores (relative prediction).  See these docs for direct vs relative prediction design for the head and loss function.
 
-**Key prediction approaches:**
-
-| Approach | Loss Function | Output | Documentation |
-|----------|---------------|--------|---------------|
-| **Direct Prediction** | Cross-entropy on binned returns | Class probabilities for return bins | [training/docs/BINNING_EXPLAINED.md](training/docs/BINNING_EXPLAINED.md) - Explains adaptive binning where return thresholds are learned from data to create balanced classes |
-| **Relative Prediction** | ListNet ranking loss | Ranking scores | [docs/listnet_loss.md](docs/listnet_loss.md) - Explains the ListNet loss which optimizes for correct relative ordering rather than absolute return prediction |
-
-
+[docs/listnet_loss.md](docs/listnet_loss.md) - Explains the ListNet loss which optimizes for correct relative ordering rather than absolute return prediction
+[training/docs/BINNING_EXPLAINED.md](training/docs/BINNING_EXPLAINED.md) - Explains adaptive binning where return thresholds are learned from data to create balanced classes 
 
 
 
@@ -23,27 +17,6 @@ In direct and relative price prediction modes (i.e., not RL), models trade by pr
 
 See [GETTING_STARTED.md](GETTING_STARTED.md) for detailed setup instructions and [WALK_FORWARD_DEMO.md](WALK_FORWARD_DEMO.md) for a walkthrough.
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Download data from Hugging Face
-python scripts/download_data.py --repo-id JamesBedichek/stock-prediction-data
-
-# Train a model with walk-forward validation
-python -m training.walk_forward_training \
-    --data all_complete_dataset.h5 \
-    --prices actual_prices_clean.h5 \
-    --num-folds 10
-
-# Evaluate checkpoints
-python -m inference.principled_evaluation \
-    --checkpoint-dir checkpoints/walk_forward \
-    --data all_complete_dataset.h5 \
-    --prices actual_prices_clean.h5
-```
-
----
 
 ## Project Structure
 
@@ -204,7 +177,7 @@ python -m training.walk_forward_training \
     --seed 42
 ```
 
-### Training with Ranking Loss (Recommended)
+### Training with Ranking Loss
 
 ```bash
 python -m training.walk_forward_training \
