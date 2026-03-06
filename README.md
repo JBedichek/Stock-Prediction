@@ -2,42 +2,7 @@
 
 This repo contains a set of experimental stock prediction programs, complete with rigorous evaluation protocols and daily deployment capabilities. The programs are fundamentally deep-learning based with transformer classifiers and scorers. Two RL frameworks (DQN and Actor-Critic) are implemented, direct price prediction, relative price prediction, along with an experimental cluster filtering algorithm. Walk-forward training is also implemented with tests for score correlation statistical significance, and trading simulations on future data.
 
-All models use the same architecture, a transformer encoder, either with a classification head or a scalar score head. The model is defined in [`training/model.py`](training/model.py):
-
-```python
-class SimpleTransformerPredictor(nn.Module):
-    def __init__(self,
-                 input_dim: int,
-                 hidden_dim: int = 512,
-                 num_layers: int = 6,
-                 num_heads: int = 8,
-                 dropout: float = 0.1,
-                 num_pred_days: int = 4,
-                 pred_mode: str = 'regression'):  # or 'classification'
-
-        # Input projection: features -> hidden_dim
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-
-        # Transformer encoder with pre-norm
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-
-        # Prediction head (classification or regression)
-        self.pred_head = nn.Linear(hidden_dim, num_bins if classification else num_pred_days)
-```
+All models use the same architecture, a transformer encoder, either with a classification head or a scalar score head. See [`SimpleTransformerPredictor`](https://github.com/JBedichek/Stock-Prediction/blob/main/training/model.py#L154) for the full implementation.
 
 In direct and relative price prediction modes (i.e., not RL), models trade by processing a set of stocks, sorting their predictions from lowest to highest, and simply choosing the top-k highest prediction stocks to trade. These predictions correspond to price changes (direct prediction) or ranking-aware affinity scores (relative prediction).
 
