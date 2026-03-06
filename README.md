@@ -1,18 +1,58 @@
 # Stock Prediction
 
-A transformer-based stock prediction system using walk-forward validation for realistic backtesting. The system predicts cross-sectional stock rankings and evaluates performance using Information Coefficient (IC), Information Ratio (IR), and simulated portfolio returns.
+This repo contains a set of experimental stock prediction programs, complete with rigorous evaluation protocols and daily deployment capabilities. The programs are fundamentally deep-learning based with transformer classifiers and scorers. Two RL frameworks (DQN and Actor-Critic) are implemented, direct price prediction, relative price prediction, along with an experimental cluster filtering algorithm. Walk-forward training is also implemented with tests for score correlation statistical significance, and trading simulations on future data.
 
-## Features
+All models use the same architecture, a transformer encoder, either with a classification head or a scalar score head. The model is defined in [`training/model.py`](training/model.py):
 
-- **Walk-Forward Training**: Time-series cross-validation that prevents look-ahead bias by ensuring training data always precedes test data chronologically
-- **Transformer Architecture**: Attention-based model (`SimpleTransformerPredictor`) for temporal feature processing with configurable depth and width
-- **Multi-Horizon Predictions**: Predicts returns for 1, 5, 10, and 20-day horizons simultaneously
-- **Ranking Loss**: ListNet and pairwise ranking losses for learning relative stock orderings rather than absolute returns
-- **Comprehensive Evaluation**: IC, IR, Sharpe ratio, turnover, win rate, and transaction cost modeling
-- **Ablation Framework**: Systematic hyperparameter testing with deterministic seeding and statistical significance testing
-- **Baseline Comparisons**: Compare transformer against Ridge regression, LightGBM, and MLP models
-- **Multi-GPU Support**: Distributed training with PyTorch DDP for large-scale experiments
-- **Monte Carlo Validation**: Robust evaluation using random stock sampling across multiple trials
+```python
+class SimpleTransformerPredictor(nn.Module):
+    def __init__(self,
+                 input_dim: int,
+                 hidden_dim: int = 512,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 dropout: float = 0.1,
+                 num_pred_days: int = 4,
+                 pred_mode: str = 'regression'):  # or 'classification'
+
+        # Input projection: features -> hidden_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        # Transformer encoder with pre-norm
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        # Prediction head (classification or regression)
+        self.pred_head = nn.Linear(hidden_dim, num_bins if classification else num_pred_days)
+```
+
+In direct and relative price prediction modes (i.e., not RL), models trade by processing a set of stocks, sorting their predictions from lowest to highest, and simply choosing the top-k highest prediction stocks to trade. These predictions correspond to price changes (direct prediction) or ranking-aware affinity scores (relative prediction).
+
+**Key prediction approaches:**
+
+| Approach | Loss Function | Output | Documentation |
+|----------|---------------|--------|---------------|
+| **Direct Prediction** | Cross-entropy on binned returns | Class probabilities for return bins | [training/docs/BINNING_EXPLAINED.md](training/docs/BINNING_EXPLAINED.md) - Explains adaptive binning where return thresholds are learned from data to create balanced classes |
+| **Relative Prediction** | ListNet ranking loss | Ranking scores | [docs/listnet_loss.md](docs/listnet_loss.md) - Explains the ListNet loss which optimizes for correct relative ordering rather than absolute return prediction |
+
+
+
+
+
+
 
 ## Quick Start
 
@@ -92,7 +132,7 @@ Stock-Prediction/
 | Document | Description |
 |----------|-------------|
 | [GETTING_STARTED.md](GETTING_STARTED.md) | Installation, dependencies, and initial setup |
-| [WALK_FORWARD_DEMO.md](WALK_FORWARD_DEMO.md) | Step-by-step walkthrough of training and evaluation |
+| [WALK_FORWARD_DEMO.md](WALK_FORWARD_DEMO.md) | Step-by-step walkthrough setup, walk forward training and evaluation |
 
 ### Core Documentation (docs/)
 
