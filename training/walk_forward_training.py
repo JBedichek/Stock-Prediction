@@ -61,6 +61,12 @@ from training.model import (
     compute_confidence_targets,
     compute_expected_value
 )
+from training.multimodal_model import (
+    MultiModalStockPredictor,
+    FeatureConfig,
+    ContrastiveMultiModalModel,
+    pretrain_contrastive,
+)
 from inference.backtest_simulation import (
     DatasetLoader, ModelPredictor, TradingSimulator
 )
@@ -1204,10 +1210,20 @@ class TemporalFoldDataset(torch.utils.data.Dataset):
             num_dates = len(dates)
 
             # Get valid trading days for this ticker from prices file
-            if self.prices_h5f is not None and ticker in self.prices_h5f:
+            if self.prices_h5f is not None:
+                if ticker not in self.prices_h5f:
+                    # Skip tickers that don't exist in prices file
+                    continue
                 trading_days = set(d.decode('utf-8') for d in self.prices_h5f[ticker]['dates'][:])
+                trading_days_list = sorted(trading_days)
+                # Build index lookup for fast trading day position lookup
+                trading_day_idx = {d: i for i, d in enumerate(trading_days_list)}
+                max_trading_idx = len(trading_days_list) - 1 - max(self.pred_days)
             else:
                 trading_days = None  # No filtering if no prices file
+                trading_days_list = None
+                trading_day_idx = None
+                max_trading_idx = float('inf')
 
             # Find valid sequence positions within date range
             for i in range(self.seq_len, num_dates - self.min_future_days):
@@ -1220,17 +1236,10 @@ class TemporalFoldDataset(torch.utils.data.Dataset):
                         skipped_no_price += 1
                         continue
 
-                    # Also verify future dates have prices for target computation
-                    if trading_days is not None:
-                        future_dates_valid = True
-                        for days_ahead in self.pred_days:
-                            future_idx = i - 1 + days_ahead
-                            if future_idx < num_dates:
-                                future_date = dates[future_idx]
-                                if future_date not in trading_days:
-                                    future_dates_valid = False
-                                    break
-                        if not future_dates_valid:
+                    # Verify enough future TRADING days exist for target computation
+                    if trading_day_idx is not None:
+                        current_trading_idx = trading_day_idx.get(seq_end_date)
+                        if current_trading_idx is None or current_trading_idx > max_trading_idx:
                             skipped_no_price += 1
                             continue
 
@@ -1296,6 +1305,23 @@ class TemporalFoldDataset(torch.utils.data.Dataset):
         price_lookup = self._load_ticker_prices(ticker)
         return price_lookup.get(date_str, None)
 
+    def _get_trading_dates(self, ticker: str) -> list:
+        """Get sorted list of trading dates for a ticker.
+
+        Cached for efficiency.
+        """
+        cache_key = f"_trading_dates_{ticker}"
+        if hasattr(self, cache_key):
+            return getattr(self, cache_key)
+
+        if self.prices_h5f is None or ticker not in self.prices_h5f:
+            return []
+
+        grp = self.prices_h5f[ticker]
+        trading_dates = sorted([d.decode('utf-8') for d in grp['dates'][:]])
+        setattr(self, cache_key, trading_dates)
+        return trading_dates
+
     def _preload_data(self):
         """Preload all sequences into memory for faster training."""
         print(f"    Preloading {len(self.sequences)} sequences into memory...")
@@ -1335,18 +1361,30 @@ class TemporalFoldDataset(torch.utils.data.Dataset):
                     current_price = 1.0
                     future_prices = [1.0] * len(self.pred_days)
                 else:
-                    # Get actual future prices
-                    future_prices = []
-                    for days_ahead in self.pred_days:
-                        future_idx = end_idx - 1 + days_ahead
-                        if future_idx < len(dates):
-                            future_date = dates[future_idx]
-                            future_price = self._get_actual_price(ticker, future_date)
-                            if future_price is None or np.isnan(future_price):
-                                future_price = current_price  # Forward-fill
-                        else:
-                            future_price = current_price  # No future data available
-                        future_prices.append(future_price)
+                    # Get sorted trading dates for this ticker to compute TRADING day offsets
+                    trading_dates = self._get_trading_dates(ticker)
+
+                    # Find current date's position in trading dates
+                    try:
+                        current_trading_idx = trading_dates.index(current_date)
+                    except ValueError:
+                        # Current date not in trading dates
+                        current_price = 1.0
+                        future_prices = [1.0] * len(self.pred_days)
+                        current_trading_idx = -1
+
+                    if current_trading_idx >= 0:
+                        future_prices = []
+                        for days_ahead in self.pred_days:
+                            future_trading_idx = current_trading_idx + days_ahead
+                            if future_trading_idx < len(trading_dates):
+                                future_date = trading_dates[future_trading_idx]
+                                future_price = self._get_actual_price(ticker, future_date)
+                                if future_price is None or np.isnan(future_price):
+                                    future_price = current_price
+                            else:
+                                future_price = current_price
+                            future_prices.append(future_price)
             else:
                 # Fallback to normalized features (INCORRECT but backwards-compatible)
                 current_price = seq_features[-1, 0]
@@ -1422,17 +1460,30 @@ class TemporalFoldDataset(torch.utils.data.Dataset):
                 current_price = 1.0
                 future_prices = [1.0] * len(self.pred_days)
             else:
-                future_prices = []
-                for days_ahead in self.pred_days:
-                    future_idx = end_idx - 1 + days_ahead
-                    if future_idx < len(dates):
-                        future_date = dates[future_idx]
-                        future_price = self._get_actual_price(ticker, future_date)
-                        if future_price is None or np.isnan(future_price):
+                # Get sorted trading dates for this ticker to compute TRADING day offsets
+                trading_dates = self._get_trading_dates(ticker)
+
+                # Find current date's position in trading dates
+                try:
+                    current_trading_idx = trading_dates.index(current_date)
+                except ValueError:
+                    # Current date not in trading dates - shouldn't happen if filtered correctly
+                    current_price = 1.0
+                    future_prices = [1.0] * len(self.pred_days)
+                    current_trading_idx = -1
+
+                if current_trading_idx >= 0:
+                    future_prices = []
+                    for days_ahead in self.pred_days:
+                        future_trading_idx = current_trading_idx + days_ahead
+                        if future_trading_idx < len(trading_dates):
+                            future_date = trading_dates[future_trading_idx]
+                            future_price = self._get_actual_price(ticker, future_date)
+                            if future_price is None or np.isnan(future_price):
+                                future_price = current_price
+                        else:
                             future_price = current_price
-                    else:
-                        future_price = current_price
-                    future_prices.append(future_price)
+                        future_prices.append(future_price)
         else:
             # Fallback to normalized features (INCORRECT)
             current_price = features[-1, 0].item()
@@ -1691,11 +1742,18 @@ class WalkForwardTrainer:
         auto_span: bool = True,  # Auto-calculate train/test periods to span entire dataset
         initial_train_fraction: float = 0.5,  # Fraction of data for initial training (when auto_span=True)
         # Model config
+        model_type: str = 'transformer',  # 'transformer' or 'multimodal'
         hidden_dim: int = 512,
         num_layers: int = 6,
         num_heads: int = 8,
         dropout: float = 0.1,
         pred_mode: str = 'classification',
+        # Contrastive pretraining config
+        contrastive_pretrain: bool = False,  # Enable contrastive pretraining
+        contrastive_epochs: int = 5,  # Epochs for contrastive pretraining
+        contrastive_lr: float = 1e-4,  # Learning rate for contrastive pretraining
+        contrastive_temperature: float = 0.1,  # Temperature for InfoNCE loss
+        freeze_encoder_after_pretrain: bool = True,  # Freeze encoder during finetuning
         # Training config
         epochs_per_fold: int = 10,
         batch_size: int = 64,
@@ -1765,11 +1823,19 @@ class WalkForwardTrainer:
         self.initial_train_fraction = initial_train_fraction
 
         # Model config
+        self.model_type = model_type
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.dropout = dropout
         self.pred_mode = pred_mode
+
+        # Contrastive pretraining config
+        self.contrastive_pretrain = contrastive_pretrain
+        self.contrastive_epochs = contrastive_epochs
+        self.contrastive_lr = contrastive_lr
+        self.contrastive_temperature = contrastive_temperature
+        self.freeze_encoder_after_pretrain = freeze_encoder_after_pretrain
 
         # Training config
         self.epochs_per_fold = epochs_per_fold
@@ -2000,7 +2066,7 @@ class WalkForwardTrainer:
 
         return folds
 
-    def _create_model(self, compile_model: bool = True) -> SimpleTransformerPredictor:
+    def _create_model(self, compile_model: bool = True):
         """Create a fresh model for training."""
         # Determine device for this process
         if self.use_ddp:
@@ -2009,15 +2075,44 @@ class WalkForwardTrainer:
         else:
             device = self.device
 
-        model = SimpleTransformerPredictor(
-            input_dim=self.input_dim,
-            hidden_dim=self.hidden_dim,
-            num_layers=self.num_layers,
-            num_heads=self.num_heads,
-            dropout=self.dropout,
-            num_pred_days=4,
-            pred_mode=self.pred_mode
-        )
+        if self.model_type == 'multimodal':
+            if self.contrastive_pretrain:
+                # Contrastive learning wrapper for multimodal model
+                model = ContrastiveMultiModalModel(
+                    feature_config=FeatureConfig(),
+                    hidden_dim=self.hidden_dim,
+                    projection_dim=128,
+                    num_technical_layers=self.num_layers,
+                    num_technical_heads=self.num_heads,
+                    num_pred_days=4,
+                    pred_mode=self.pred_mode,
+                    dropout=self.dropout,
+                    max_seq_len=self.seq_len,
+                    temperature=self.contrastive_temperature,
+                )
+            else:
+                # Multi-modal model with separate encoders for each feature type
+                model = MultiModalStockPredictor(
+                    feature_config=FeatureConfig(),
+                    hidden_dim=self.hidden_dim,
+                    num_technical_layers=self.num_layers,
+                    num_technical_heads=self.num_heads,
+                    num_pred_days=4,
+                    pred_mode=self.pred_mode,
+                    dropout=self.dropout,
+                    max_seq_len=self.seq_len,
+                )
+        else:
+            # Default: single-stream transformer
+            model = SimpleTransformerPredictor(
+                input_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                num_layers=self.num_layers,
+                num_heads=self.num_heads,
+                dropout=self.dropout,
+                num_pred_days=4,
+                pred_mode=self.pred_mode
+            )
         model = model.to(device)
 
         # Ensure all parameters require grad
@@ -2178,15 +2273,24 @@ class WalkForwardTrainer:
 
             ax2.legend(loc='upper right')
 
-            # Set y-axis limits
+            # Set y-axis limits with minimum range to avoid misleading micro-variations
             if len(step_val_losses) > 1:
                 y_min, y_max = min(step_val_losses), max(step_val_losses)
+                y_range = y_max - y_min
+                # Ensure minimum visible range of 10% of the mean value
+                min_range = np.mean(step_val_losses) * 0.1
+                if y_range < min_range:
+                    y_center = (y_min + y_max) / 2
+                    y_min = y_center - min_range / 2
+                    y_max = y_center + min_range / 2
                 margin = (y_max - y_min) * 0.1
                 ax2.set_ylim(y_min - margin, y_max + margin)
 
         ax2.set_xlabel('Optimizer Step')
         ax2.set_ylabel('Validation Loss')
         ax2.set_title('Validation Loss at Checkpoints')
+        # Disable scientific notation offset to show actual values
+        ax2.ticklabel_format(useOffset=False, style='plain', axis='y')
         ax2.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -2682,6 +2786,76 @@ class WalkForwardTrainer:
             worker_init_fn=worker_init_fn if num_workers > 0 else None
         )
 
+        # =====================================================================
+        # Contrastive Pretraining Phase (if enabled)
+        # =====================================================================
+        if self.contrastive_pretrain and self.model_type == 'multimodal':
+            if is_main_process():
+                print(f"\n  {'='*60}")
+                print(f"  CONTRASTIVE PRETRAINING PHASE")
+                print(f"  {'='*60}")
+                print(f"  Epochs: {self.contrastive_epochs}, LR: {self.contrastive_lr}")
+                print(f"  Temperature: {self.contrastive_temperature}")
+
+            # Contrastive pretraining uses its own optimizer
+            contrastive_optimizer = AdamW(
+                model.parameters(),
+                lr=self.contrastive_lr,
+                weight_decay=0.01
+            )
+            contrastive_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                contrastive_optimizer,
+                T_max=self.contrastive_epochs
+            )
+
+            model.train()
+            for epoch in range(self.contrastive_epochs):
+                total_contrastive_loss = 0.0
+                num_batches = 0
+
+                for batch_idx, (features, _targets) in enumerate(train_loader):
+                    features = features.to(device).float()
+
+                    contrastive_optimizer.zero_grad()
+
+                    # Compute contrastive loss (model must be ContrastiveMultiModalModel)
+                    loss = model.compute_contrastive_loss(features)
+                    loss.backward()
+
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                    contrastive_optimizer.step()
+
+                    total_contrastive_loss += loss.item()
+                    num_batches += 1
+
+                    if is_main_process() and (batch_idx + 1) % 100 == 0:
+                        avg_loss = total_contrastive_loss / num_batches
+                        print(f"    Epoch {epoch+1}/{self.contrastive_epochs} | "
+                              f"Batch {batch_idx+1} | Contrastive Loss: {avg_loss:.4f}")
+
+                contrastive_scheduler.step()
+
+                if is_main_process():
+                    avg_loss = total_contrastive_loss / max(num_batches, 1)
+                    print(f"  Contrastive Epoch {epoch+1}/{self.contrastive_epochs} | "
+                          f"Avg Loss: {avg_loss:.4f}")
+
+            # Freeze encoder after pretraining if configured
+            if self.freeze_encoder_after_pretrain:
+                if is_main_process():
+                    print(f"\n  Freezing encoder for finetuning phase...")
+                model.freeze_encoder()
+            else:
+                if is_main_process():
+                    print(f"\n  Encoder NOT frozen - full model finetuning")
+
+            if is_main_process():
+                print(f"  {'='*60}")
+                print(f"  CONTRASTIVE PRETRAINING COMPLETE")
+                print(f"  {'='*60}\n")
+
         # Setup optimizer (no mixed precision for simplicity)
         optimizer = AdamW(model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
@@ -2714,7 +2888,7 @@ class WalkForwardTrainer:
         global_step = 0         # Total optimizer steps across all epochs
 
         # Quick validation loss function for progressive evaluation
-        def quick_val_loss(max_batches=10):
+        def quick_val_loss(max_batches=100):
             """Quick validation loss on subset of data."""
             model.eval()
             val_losses_tmp = []
@@ -2896,7 +3070,7 @@ class WalkForwardTrainer:
 
                     # Periodic validation evaluation
                     if self.eval_every_n_steps > 0 and global_step % self.eval_every_n_steps == 0:
-                        val_loss = quick_val_loss(max_batches=10)
+                        val_loss = quick_val_loss(max_batches=100)
                         step_val_losses.append(val_loss)
                         step_eval_points.append(global_step)
 
@@ -3917,6 +4091,9 @@ def main():
                        help='Fraction of data for initial training when auto-span is enabled (default: 0.5)')
 
     # Model config
+    parser.add_argument('--model-type', type=str, default='transformer',
+                       choices=['transformer', 'multimodal'],
+                       help='Model architecture: transformer (single-stream) or multimodal (separate encoders)')
     parser.add_argument('--hidden-dim', type=int, default=1024,
                        help='Hidden dimension')
     parser.add_argument('--num-layers', type=int, default=4,
@@ -3928,6 +4105,18 @@ def main():
     parser.add_argument('--pred-mode', type=str, default='regression',
                        choices=['classification', 'regression'],
                        help='Prediction mode')
+
+    # Contrastive pretraining config
+    parser.add_argument('--contrastive-pretrain', action='store_true',
+                       help='Enable contrastive pretraining before supervised training')
+    parser.add_argument('--contrastive-epochs', type=int, default=5,
+                       help='Number of epochs for contrastive pretraining')
+    parser.add_argument('--contrastive-lr', type=float, default=1e-4,
+                       help='Learning rate for contrastive pretraining')
+    parser.add_argument('--contrastive-temperature', type=float, default=0.1,
+                       help='Temperature for InfoNCE loss (lower = harder negatives)')
+    parser.add_argument('--no-freeze-encoder', action='store_true',
+                       help='Do NOT freeze encoder after contrastive pretraining (default: freeze)')
 
     # Training config
     parser.add_argument('--epochs-per-fold', type=int, default=1,
@@ -4065,11 +4254,18 @@ def main():
         gap_days=args.gap_days,
         auto_span=not args.no_auto_span,
         initial_train_fraction=args.initial_train_fraction,
+        model_type=args.model_type,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         dropout=args.dropout,
         pred_mode=args.pred_mode,
+        # Contrastive pretraining
+        contrastive_pretrain=args.contrastive_pretrain,
+        contrastive_epochs=args.contrastive_epochs,
+        contrastive_lr=args.contrastive_lr,
+        contrastive_temperature=args.contrastive_temperature,
+        freeze_encoder_after_pretrain=not args.no_freeze_encoder,
         epochs_per_fold=args.epochs_per_fold,
         batch_size=args.batch_size,
         learning_rate=args.lr,
