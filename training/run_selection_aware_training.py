@@ -4,12 +4,19 @@ Quick runner for selection-aware training.
 
 Usage:
     python training/run_selection_aware_training.py
+    python training/run_selection_aware_training.py --device cuda:1
 """
 
+import argparse
 import subprocess
 import sys
 
 def main():
+    parser = argparse.ArgumentParser(description='Run selection-aware training')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to train on (e.g., cuda, cuda:0, cuda:1, cpu)')
+    args = parser.parse_args()
+
     cmd = [
         sys.executable,
         'training/selection_aware_training.py',
@@ -28,10 +35,11 @@ def main():
         '--val-every', '5',
         '--use-amp',
         '--compile',  # Enable torch.compile for faster inference
-        '--use-wandb'
+        '--use-wandb',
+        '--device', args.device,
     ]
 
-    print("🚀 Running selection-aware training...")
+    print("Running selection-aware training...")
     print(f"Command: {' '.join(cmd)}\n")
 
     subprocess.run(cmd)

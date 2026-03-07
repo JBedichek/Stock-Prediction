@@ -1,28 +1,35 @@
 #!/bin/bash
-# Generic ablation study launcher
+# Generic ablation study launcher (multimodal + classification)
 #
 # Usage:
 #   ./sanity_checks/ablate.sh num-layers "2 4 6" "0 1 2"
 #   ./sanity_checks/ablate.sh lr "1e-5 5e-5 1e-4" "0 1 2"
 #   ./sanity_checks/ablate.sh hidden-dim "256 512 1024" "0 1 2"
+#
+# Default config: multimodal model, classification mode, seq-len 512
 
 set -e
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 <param-name> \"<values>\" \"<gpus>\""
+    echo "Usage: $0 <param-name> \"<values>\" \"<gpus>\" [suffix]"
     echo ""
     echo "Examples:"
     echo "  $0 num-layers \"2 4 6\" \"0 1 2\""
-    echo "  $0 lr \"1e-5 5e-5 1e-4\" \"0 1 2\""
-    echo "  $0 hidden-dim \"256 512 1024\" \"0 1 2\""
+    echo "  $0 seq-len \"256 512 1024\" \"0 1 2\" multimodal"
+    echo "  $0 lr \"1e-5 5e-5 1e-4\" \"0 1 2\" ce_loss"
     exit 1
 fi
 
 PARAM_NAME=$1
 VALUES=($2)
 GPUS=($3)
+SUFFIX=${4:-}  # Optional 4th arg for custom suffix (e.g., "multimodal")
 
-OUTPUT_DIR="checkpoints/ablation_${PARAM_NAME//[^a-zA-Z0-9]/_}"
+if [ -n "$SUFFIX" ]; then
+    OUTPUT_DIR="checkpoints/ablation_${PARAM_NAME//[^a-zA-Z0-9]/_}_${SUFFIX}"
+else
+    OUTPUT_DIR="checkpoints/ablation_${PARAM_NAME//[^a-zA-Z0-9]/_}"
+fi
 mkdir -p "$OUTPUT_DIR"
 
 echo "========================================"
@@ -47,18 +54,17 @@ for i in "${!VALUES[@]}"; do
         --no-preload \
         --data all_complete_dataset.h5 \
         --prices actual_prices_clean.h5 \
-        --data-fraction 0.01 \
-        --incremental \
-        --incremental-epochs 1 \
-        --incremental-data-fraction 0.2 \
-        --ranking-only \
-        --ranking-margin 0.01 \
-        --ranking-loss-type listnet \
+        --model-type multimodal \
+        --pred-mode classification \
+        --seq-len 512 \
         --seed 4 \
         --lr 1e-4 \
-        --gradient-accumulation-steps 1 \
-        --batch-size 80 \
+        --hidden-dim 256 \
+        --num-layers 4 \
+        --gradient-accumulation-steps 3 \
+        --batch-size 128 \
         --num-workers 0 \
+        --no-compile \
         --"$PARAM_NAME" $VALUE \
         --checkpoint-dir "$CKPT" \
         > "$CKPT.log" 2>&1 &

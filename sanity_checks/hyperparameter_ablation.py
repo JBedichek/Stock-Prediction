@@ -5,8 +5,10 @@ Hyperparameter Ablation Study Runner
 Launches parallel training runs on multiple GPUs with different hyperparameters,
 then compares results (loss, IC, IR) in a summary table.
 
+Default: Uses multimodal model with classification mode.
+
 Usage:
-    # Run ablation over num_layers on 4 GPUs
+    # Run ablation over num_layers on 4 GPUs (multimodal + classification)
     python sanity_checks/hyperparameter_ablation.py \
         --param num_layers --values 2 4 6 8 \
         --gpus 0 1 2 3
@@ -20,6 +22,12 @@ Usage:
     python sanity_checks/hyperparameter_ablation.py \
         --param num_layers --values 2 4 6 \
         --param2 num_heads --values2 4 8 \
+        --gpus 0 1 2 3
+
+    # Use transformer model instead of multimodal
+    python sanity_checks/hyperparameter_ablation.py \
+        --param num_layers --values 2 4 6 8 \
+        --model-type transformer \
         --gpus 0 1 2 3
 
     # Dry run to see commands
@@ -152,18 +160,20 @@ def run_single_ablation(
     checkpoint_dir = os.path.join(output_dir, checkpoint_name)
     result.checkpoint_dir = checkpoint_dir
 
-    # Build command
+    # Build command - base_args first, then ablation params to override
     cmd = [
         sys.executable, "-m", "training.walk_forward_training",
         f"--device", f"cuda:{gpu}",
         f"--checkpoint-dir", checkpoint_dir,
-        f"--{param_name.replace('_', '-')}", str(param_value),
     ]
+
+    cmd.extend(base_args)
+
+    # Ablation parameters AFTER base_args to override defaults
+    cmd.extend([f"--{param_name.replace('_', '-')}", str(param_value)])
 
     if param2_name and param2_value:
         cmd.extend([f"--{param2_name.replace('_', '-')}", str(param2_value)])
-
-    cmd.extend(base_args)
 
     print(f"\n[GPU {gpu}] Starting: {param_name}={param_value}" +
           (f", {param2_name}={param2_value}" if param2_name else ""))
@@ -286,18 +296,34 @@ def main():
                        help='Directory for ablation checkpoints')
 
     # Training arguments to pass through
-    parser.add_argument('--data', type=str, default='data/all_complete_dataset.h5')
-    parser.add_argument('--prices', type=str, default='data/actual_prices_clean.h5')
+    parser.add_argument('--data', type=str, default='all_complete_dataset.h5')
+    parser.add_argument('--prices', type=str, default='actual_prices_clean.h5')
     parser.add_argument('--num-folds', type=int, default=3,
                        help='Number of folds (use fewer for faster ablation)')
     parser.add_argument('--epochs-per-fold', type=int, default=5,
                        help='Epochs per fold (use fewer for faster ablation)')
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--seq-len', type=int, default=60)
+    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--seq-len', type=int, default=512)
+    parser.add_argument('--model-type', type=str, default='multimodal',
+                       choices=['transformer', 'multimodal'],
+                       help='Model architecture to use')
+    parser.add_argument('--pred-mode', type=str, default='classification',
+                       choices=['classification', 'regression'],
+                       help='Prediction mode')
     parser.add_argument('--ranking-only', action='store_true')
-    parser.add_argument('--ranking-loss-type', type=str, default='correlation')
+    parser.add_argument('--ranking-loss-type', type=str, default='listnet')
     parser.add_argument('--max-eval-dates', type=int, default=30,
                        help='Max eval dates (use fewer for faster ablation)')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=3,
+                       help='Gradient accumulation steps')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate (default for ablation)')
+    parser.add_argument('--hidden-dim', type=int, default=256,
+                       help='Hidden dimension (default for ablation)')
+    parser.add_argument('--num-layers', type=int, default=4,
+                       help='Number of layers (default for ablation)')
+    parser.add_argument('--num-workers', type=int, default=0,
+                       help='Number of data loader workers')
 
     # Other
     parser.add_argument('--dry-run', action='store_true',
@@ -314,10 +340,18 @@ def main():
         '--epochs-per-fold', str(args.epochs_per_fold),
         '--batch-size', str(args.batch_size),
         '--seq-len', str(args.seq_len),
+        '--model-type', args.model_type,
+        '--pred-mode', args.pred_mode,
         '--ranking-loss-type', args.ranking_loss_type,
         '--max-eval-dates', str(args.max_eval_dates),
+        '--gradient-accumulation-steps', str(args.gradient_accumulation_steps),
+        '--lr', str(args.lr),
+        '--hidden-dim', str(args.hidden_dim),
+        '--num-layers', str(args.num_layers),
+        '--num-workers', str(args.num_workers),
         '--seed', str(args.seed),
         '--no-compile',  # Faster startup for ablation
+        '--no-preload',  # Don't preload data for parallel runs
     ]
 
     if args.ranking_only:
@@ -335,6 +369,7 @@ def main():
     print(f"\n{'='*80}")
     print("HYPERPARAMETER ABLATION STUDY")
     print(f"{'='*80}")
+    print(f"Model: {args.model_type} ({args.pred_mode})")
     print(f"Parameter: {args.param}")
     print(f"Values: {args.values}")
     if args.param2:
@@ -343,6 +378,7 @@ def main():
     print(f"Total runs: {len(combinations)}")
     print(f"GPUs: {args.gpus}")
     print(f"Output: {args.output_dir}")
+    print(f"Base config: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, lr={args.lr}")
     print(f"{'='*80}\n")
 
     if args.dry_run:
@@ -358,11 +394,12 @@ def main():
                 "python", "-m", "training.walk_forward_training",
                 f"--device", f"cuda:{gpu}",
                 f"--checkpoint-dir", os.path.join(args.output_dir, checkpoint_name),
-                f"--{args.param.replace('_', '-')}", str(val),
             ]
+            cmd.extend(base_args)
+            # Ablation params AFTER base_args to override
+            cmd.extend([f"--{args.param.replace('_', '-')}", str(val)])
             if val2:
                 cmd.extend([f"--{args.param2.replace('_', '-')}", str(val2)])
-            cmd.extend(base_args)
 
             print(f"[GPU {gpu}] {' '.join(cmd)}\n")
         return

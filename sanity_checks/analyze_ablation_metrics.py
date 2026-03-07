@@ -84,6 +84,13 @@ class FoldMetrics:
     daily_momentum_returns: Optional[np.ndarray] = None
     daily_random_returns: Optional[np.ndarray] = None
 
+    # Training loss history (loaded from loss_history.npz)
+    best_val_loss: Optional[float] = None
+    final_val_loss: Optional[float] = None
+    best_step: Optional[int] = None
+    step_val_losses: Optional[np.ndarray] = None
+    step_eval_points: Optional[np.ndarray] = None
+
 
 @dataclass
 class AblationRun:
@@ -92,6 +99,7 @@ class AblationRun:
     path: str
     folds: List[FoldMetrics] = field(default_factory=list)
     has_daily_data: bool = False
+    has_loss_history: bool = False
 
     @property
     def num_folds(self) -> int:
@@ -146,6 +154,26 @@ class AblationRun:
                 all_returns.extend(fold.daily_model_returns)
         return np.array(all_returns)
 
+    def get_best_val_losses(self) -> np.ndarray:
+        """Get best validation loss from each fold."""
+        if not self.has_loss_history:
+            return np.array([])
+        losses = []
+        for fold in self.folds:
+            if fold.best_val_loss is not None:
+                losses.append(fold.best_val_loss)
+        return np.array(losses)
+
+    def get_final_val_losses(self) -> np.ndarray:
+        """Get final validation loss from each fold."""
+        if not self.has_loss_history:
+            return np.array([])
+        losses = []
+        for fold in self.folds:
+            if fold.final_val_loss is not None:
+                losses.append(fold.final_val_loss)
+        return np.array(losses)
+
 
 def parse_float(s: str) -> float:
     """Parse a float from a string, handling signs and percentages."""
@@ -172,6 +200,27 @@ def load_daily_metrics(run_path: str, fold_num: int) -> Optional[Dict[str, np.nd
             'daily_model_returns': data['daily_model_returns'],
             'daily_momentum_returns': data['daily_momentum_returns'],
             'daily_random_returns': data['daily_random_returns'],
+        }
+    except Exception as e:
+        print(f"Warning: Could not load {npz_path}: {e}")
+        return None
+
+
+def load_loss_history(run_path: str, fold_num: int) -> Optional[Dict[str, any]]:
+    """Load training loss history from .npz file for a fold."""
+    npz_path = os.path.join(run_path, f'fold_{fold_num}_loss_history.npz')
+    if not os.path.exists(npz_path):
+        return None
+
+    try:
+        data = np.load(npz_path, allow_pickle=True)
+        step_val_losses = data['step_val_losses']
+        return {
+            'step_val_losses': step_val_losses,
+            'step_eval_points': data['step_eval_points'],
+            'best_step': int(data['best_step']),
+            'best_val_loss': float(np.min(step_val_losses)) if len(step_val_losses) > 0 else None,
+            'final_val_loss': float(step_val_losses[-1]) if len(step_val_losses) > 0 else None,
         }
     except Exception as e:
         print(f"Warning: Could not load {npz_path}: {e}")
@@ -358,8 +407,10 @@ def load_ablation_runs(run_paths: List[str], labels: Optional[List[str]] = None)
         if folds:
             # Try to load daily metrics for each fold
             has_daily = False
+            has_loss_history = False
             daily_counts = []
             for fold in folds:
+                # Load daily metrics
                 daily_data = load_daily_metrics(path, fold.fold_num)
                 if daily_data:
                     fold.daily_ics = daily_data['daily_ics']
@@ -370,14 +421,26 @@ def load_ablation_runs(run_paths: List[str], labels: Optional[List[str]] = None)
                     has_daily = True
                     daily_counts.append(len(fold.daily_ics))
 
-            run = AblationRun(name=name, path=path, folds=folds, has_daily_data=has_daily)
+                # Load loss history
+                loss_data = load_loss_history(path, fold.fold_num)
+                if loss_data:
+                    fold.best_val_loss = loss_data['best_val_loss']
+                    fold.final_val_loss = loss_data['final_val_loss']
+                    fold.best_step = loss_data['best_step']
+                    fold.step_val_losses = loss_data['step_val_losses']
+                    fold.step_eval_points = loss_data['step_eval_points']
+                    has_loss_history = True
+
+            run = AblationRun(name=name, path=path, folds=folds,
+                             has_daily_data=has_daily, has_loss_history=has_loss_history)
             runs.append(run)
 
+            info_parts = [f"{len(folds)} folds"]
             if has_daily:
-                total_daily = sum(daily_counts)
-                print(f"Loaded {len(folds)} folds from {name} ({total_daily} daily observations)")
-            else:
-                print(f"Loaded {len(folds)} folds from {name} (no daily data)")
+                info_parts.append(f"{sum(daily_counts)} daily obs")
+            if has_loss_history:
+                info_parts.append("loss history")
+            print(f"Loaded {name}: {', '.join(info_parts)}")
         else:
             print(f"Warning: No folds found in {path}")
 
@@ -1004,6 +1067,172 @@ def plot_daily_ic_over_time(runs: List[AblationRun], output_dir: str):
     print(f"Saved: {output_dir}/daily_ic_timeseries.png")
 
 
+def plot_val_loss_vs_ic(runs: List[AblationRun], output_dir: str):
+    """
+    Plot validation loss across folds and correlate with IC metrics.
+
+    Creates:
+    1. Validation loss over time (by test period) for each run
+    2. Scatter plot of validation loss vs mean IC with correlation
+    3. Scatter plot of validation loss vs excess return
+    """
+    # Check if any runs have loss history
+    if not any(run.has_loss_history for run in runs):
+        print("No loss history data available for validation loss analysis")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(runs)))
+
+    print("\n📊 Validation Loss vs IC Analysis:")
+
+    # Plot 1: Validation loss across folds over time
+    ax = axes[0, 0]
+    for i, run in enumerate(runs):
+        if run.has_loss_history:
+            val_losses = run.get_best_val_losses()
+            fold_nums = [f.fold_num for f in run.folds if f.best_val_loss is not None]
+            if len(val_losses) > 0:
+                ax.plot(fold_nums, val_losses, 'o-', color=colors[i],
+                       label=f"{run.name}", linewidth=2, markersize=8)
+    ax.set_xlabel('Fold Number')
+    ax.set_ylabel('Best Validation Loss')
+    ax.set_title('Validation Loss Across Folds')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.ticklabel_format(useOffset=False, style='plain', axis='y')
+
+    # Plot 2: Validation loss vs Mean IC (scatter with regression)
+    ax = axes[0, 1]
+    all_correlations = []
+    for i, run in enumerate(runs):
+        if run.has_loss_history:
+            val_losses = run.get_best_val_losses()
+            mean_ics = run.get_metric_series('mean_ic')
+
+            # Make sure we have matching data
+            valid_indices = [j for j, f in enumerate(run.folds)
+                           if f.best_val_loss is not None and j < len(mean_ics)]
+            if len(valid_indices) >= 3:
+                vl = val_losses[:len(valid_indices)]
+                ic = mean_ics[valid_indices]
+
+                ax.scatter(vl, ic, color=colors[i], s=80, alpha=0.7, label=run.name)
+
+                # Compute correlation
+                corr, pval = scipy_stats.pearsonr(vl, ic)
+                all_correlations.append((run.name, corr, pval, len(vl)))
+                print(f"  {run.name}: Val Loss vs IC corr = {corr:+.3f} (p={pval:.4f}, n={len(vl)})")
+
+                # Add regression line
+                if len(vl) > 2:
+                    z = np.polyfit(vl, ic, 1)
+                    p = np.poly1d(z)
+                    x_line = np.linspace(min(vl), max(vl), 100)
+                    ax.plot(x_line, p(x_line), '--', color=colors[i], alpha=0.5)
+
+    ax.axhline(0, color='black', linestyle='-', alpha=0.3)
+    ax.set_xlabel('Best Validation Loss')
+    ax.set_ylabel('Mean IC')
+    ax.set_title('Validation Loss vs Mean IC')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.ticklabel_format(useOffset=False, style='plain', axis='x')
+
+    # Plot 3: Validation loss vs Excess Return
+    ax = axes[1, 0]
+    for i, run in enumerate(runs):
+        if run.has_loss_history:
+            val_losses = run.get_best_val_losses()
+            excess_returns = run.get_metric_series('excess_vs_random_gross')
+
+            valid_indices = [j for j, f in enumerate(run.folds)
+                           if f.best_val_loss is not None and j < len(excess_returns)]
+            if len(valid_indices) >= 3:
+                vl = val_losses[:len(valid_indices)]
+                er = excess_returns[valid_indices]
+
+                ax.scatter(vl, er * 100, color=colors[i], s=80, alpha=0.7, label=run.name)
+
+                # Compute correlation
+                corr, pval = scipy_stats.pearsonr(vl, er)
+                print(f"  {run.name}: Val Loss vs Excess Return corr = {corr:+.3f} (p={pval:.4f})")
+
+                # Add regression line
+                if len(vl) > 2:
+                    z = np.polyfit(vl, er * 100, 1)
+                    p = np.poly1d(z)
+                    x_line = np.linspace(min(vl), max(vl), 100)
+                    ax.plot(x_line, p(x_line), '--', color=colors[i], alpha=0.5)
+
+    ax.axhline(0, color='black', linestyle='-', alpha=0.3)
+    ax.set_xlabel('Best Validation Loss')
+    ax.set_ylabel('Excess Return vs Random (%)')
+    ax.set_title('Validation Loss vs Excess Return')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.ticklabel_format(useOffset=False, style='plain', axis='x')
+
+    # Plot 4: Validation loss vs Sharpe Ratio
+    ax = axes[1, 1]
+    for i, run in enumerate(runs):
+        if run.has_loss_history:
+            val_losses = run.get_best_val_losses()
+            sharpes = run.get_metric_series('sharpe_gross')
+
+            valid_indices = [j for j, f in enumerate(run.folds)
+                           if f.best_val_loss is not None and j < len(sharpes)]
+            if len(valid_indices) >= 3:
+                vl = val_losses[:len(valid_indices)]
+                sr = sharpes[valid_indices]
+
+                ax.scatter(vl, sr, color=colors[i], s=80, alpha=0.7, label=run.name)
+
+                # Compute correlation
+                corr, pval = scipy_stats.pearsonr(vl, sr)
+                print(f"  {run.name}: Val Loss vs Sharpe corr = {corr:+.3f} (p={pval:.4f})")
+
+                # Add regression line
+                if len(vl) > 2:
+                    z = np.polyfit(vl, sr, 1)
+                    p = np.poly1d(z)
+                    x_line = np.linspace(min(vl), max(vl), 100)
+                    ax.plot(x_line, p(x_line), '--', color=colors[i], alpha=0.5)
+
+    ax.axhline(0, color='black', linestyle='-', alpha=0.3)
+    ax.set_xlabel('Best Validation Loss')
+    ax.set_ylabel('Sharpe Ratio')
+    ax.set_title('Validation Loss vs Sharpe Ratio')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.ticklabel_format(useOffset=False, style='plain', axis='x')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'val_loss_vs_ic.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir}/val_loss_vs_ic.png")
+
+    # Also create a summary correlation table
+    if all_correlations:
+        corr_summary = {
+            'analysis': 'validation_loss_vs_ic',
+            'correlations': [
+                {
+                    'run': name,
+                    'val_loss_ic_corr': float(corr),
+                    'p_value': float(pval),
+                    'n_folds': int(n),
+                    'significant_0.05': bool(pval < 0.05)
+                }
+                for name, corr, pval, n in all_correlations
+            ]
+        }
+        corr_path = os.path.join(output_dir, 'val_loss_ic_correlation.json')
+        with open(corr_path, 'w') as f:
+            json.dump(corr_summary, f, indent=2)
+        print(f"Saved: {corr_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze ablation study metrics')
     parser.add_argument('--runs', nargs='+', help='Paths to ablation run directories')
@@ -1056,6 +1285,11 @@ def main():
         print("\nGenerating daily analysis plots...")
         plot_daily_ic_distributions(runs, args.output)
         plot_daily_ic_over_time(runs, args.output)
+
+    # Generate validation loss vs IC analysis (if loss history available)
+    if any(run.has_loss_history for run in runs):
+        print("\nGenerating validation loss vs IC analysis...")
+        plot_val_loss_vs_ic(runs, args.output)
 
     # Generate statistics
     print("\nGenerating statistics...")

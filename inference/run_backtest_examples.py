@@ -7,26 +7,41 @@ This script shows different ways to run backtests:
 2. Small subset (100 stocks)
 3. Different holding periods
 4. Different top-k strategies
+
+Usage:
+    python inference/run_backtest_examples.py
+    python inference/run_backtest_examples.py --device cuda:1
 """
 
+import argparse
 import subprocess
 import sys
 
 
-def run_backtest(args_dict):
+def run_backtest(args_dict, device='cuda'):
     """Run backtest with given arguments."""
     cmd = [sys.executable, 'inference/backtest_simulation.py']
+
+    # Add device first
+    args_dict['device'] = device
 
     for key, value in args_dict.items():
         cmd.append(f'--{key}')
         if value is not None:
             cmd.append(str(value))
 
-    print(f"\n🚀 Running: {' '.join(cmd)}\n")
+    print(f"\nRunning: {' '.join(cmd)}\n")
     subprocess.run(cmd)
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Run backtest examples')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to use (e.g., cuda, cuda:0, cuda:1, cpu)')
+    args = parser.parse_args()
+
+    device = args.device
+
     # Example 1: Full test set (1000 stocks), 5-day horizon
     print("\n" + "="*80)
     print("EXAMPLE 1: Full test set (1000 stocks), 5-day horizon, top-10")
@@ -43,7 +58,7 @@ def main():
         'initial-capital': 100000,
         'batch-size': 128,  # Larger batch for better GPU utilization
         'output': 'backtest_full_5day.pt'
-    })
+    }, device=device)
 
     # Example 2: Small subset (100 stocks) for quick testing
     print("\n" + "="*80)
@@ -62,7 +77,7 @@ def main():
         'initial-capital': 50000,
         'batch-size': 64,
         'output': 'backtest_subset100_5day.pt'
-    })
+    }, device=device)
 
     # Example 3: 1-day trading (day trading)
     print("\n" + "="*80)
@@ -81,7 +96,7 @@ def main():
         'initial-capital': 50000,
         'batch-size': 64,
         'output': 'backtest_daytrading.pt'
-    })
+    }, device=device)
 
     # Example 4: Long-term holding (20-day horizon)
     print("\n" + "="*80)
@@ -100,7 +115,7 @@ def main():
         'initial-capital': 50000,
         'batch-size': 64,
         'output': 'backtest_longterm.pt'
-    })
+    }, device=device)
 
     print("\n" + "="*80)
     print("✅ ALL EXAMPLES COMPLETE")

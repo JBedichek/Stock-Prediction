@@ -1,18 +1,20 @@
 #!/bin/bash
-# Ablation study: num_layers
+# Ablation study: num_layers (multimodal + classification)
 # Launches parallel training runs on different GPUs
 
 set -e
 
 # Configuration
-DATA="data/all_complete_dataset.h5"
-PRICES="data/actual_prices_clean.h5"
+DATA="all_complete_dataset.h5"
+PRICES="actual_prices_clean.h5"
 NUM_FOLDS=3
 EPOCHS=5
-BATCH_SIZE=64
-SEQ_LEN=60
+BATCH_SIZE=128
+SEQ_LEN=512
 MAX_EVAL_DATES=30
 SEED=42
+MODEL_TYPE="multimodal"
+PRED_MODE="classification"
 
 # Layers to test and corresponding GPUs
 LAYERS=(2 4 6 8)
@@ -36,18 +38,23 @@ for i in "${!LAYERS[@]}"; do
 
     echo "[GPU $GPU] Starting num_layers=$NLAYERS -> $CKPT"
 
-    CUDA_VISIBLE_DEVICES=$GPU python -m training.walk_forward_training \
+    python -m training.walk_forward_training \
+        --device cuda:$GPU \
+        --no-preload \
         --data "$DATA" \
         --prices "$PRICES" \
+        --model-type $MODEL_TYPE \
+        --pred-mode $PRED_MODE \
         --num-folds $NUM_FOLDS \
         --epochs-per-fold $EPOCHS \
         --batch-size $BATCH_SIZE \
         --seq-len $SEQ_LEN \
         --num-layers $NLAYERS \
-        --ranking-only \
-        --ranking-loss-type correlation \
+        --hidden-dim 256 \
+        --gradient-accumulation-steps 3 \
         --max-eval-dates $MAX_EVAL_DATES \
         --seed $SEED \
+        --num-workers 0 \
         --checkpoint-dir "$CKPT" \
         --no-compile \
         > "$CKPT.log" 2>&1 &

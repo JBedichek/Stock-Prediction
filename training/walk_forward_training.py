@@ -67,6 +67,10 @@ from training.multimodal_model import (
     ContrastiveMultiModalModel,
     pretrain_contrastive,
 )
+from training.cross_sectional_model import (
+    DirectPricePredictor,
+    StockEncoder,
+)
 from inference.backtest_simulation import (
     DatasetLoader, ModelPredictor, TradingSimulator
 )
@@ -1742,12 +1746,15 @@ class WalkForwardTrainer:
         auto_span: bool = True,  # Auto-calculate train/test periods to span entire dataset
         initial_train_fraction: float = 0.5,  # Fraction of data for initial training (when auto_span=True)
         # Model config
-        model_type: str = 'transformer',  # 'transformer' or 'multimodal'
+        model_type: str = 'transformer',  # 'transformer', 'multimodal', or 'direct'
         hidden_dim: int = 512,
         num_layers: int = 6,
         num_heads: int = 8,
         dropout: float = 0.1,
         pred_mode: str = 'classification',
+        # Encoder loading config (for model_type='direct')
+        encoder_path: str = None,  # Path to pretrained encoder checkpoint
+        freeze_encoder: bool = True,  # Freeze encoder weights after loading
         # Contrastive pretraining config
         contrastive_pretrain: bool = False,  # Enable contrastive pretraining
         contrastive_epochs: int = 5,  # Epochs for contrastive pretraining
@@ -1829,6 +1836,10 @@ class WalkForwardTrainer:
         self.num_heads = num_heads
         self.dropout = dropout
         self.pred_mode = pred_mode
+
+        # Encoder loading config
+        self.encoder_path = encoder_path
+        self.freeze_encoder = freeze_encoder
 
         # Contrastive pretraining config
         self.contrastive_pretrain = contrastive_pretrain
@@ -2075,7 +2086,26 @@ class WalkForwardTrainer:
         else:
             device = self.device
 
-        if self.model_type == 'multimodal':
+        if self.model_type == 'direct':
+            # DirectPricePredictor with optional pretrained encoder
+            model = DirectPricePredictor(
+                feature_config=FeatureConfig(),
+                hidden_dim=self.hidden_dim,
+                num_encoder_layers=self.num_layers,
+                num_encoder_heads=self.num_heads,
+                dropout=self.dropout,
+                max_seq_len=self.seq_len,
+                num_pred_days=4,  # Match walk-forward horizons (1, 5, 10, 20 days)
+            )
+            # Load pretrained encoder if provided
+            if self.encoder_path:
+                if is_main_process():
+                    print(f"  Loading pretrained encoder from: {self.encoder_path}")
+                model.load_encoder(self.encoder_path, freeze=self.freeze_encoder)
+                if is_main_process():
+                    frozen_status = "frozen" if self.freeze_encoder else "trainable"
+                    print(f"  Encoder loaded ({frozen_status})")
+        elif self.model_type == 'multimodal':
             if self.contrastive_pretrain:
                 # Contrastive learning wrapper for multimodal model
                 model = ContrastiveMultiModalModel(
@@ -4092,8 +4122,8 @@ def main():
 
     # Model config
     parser.add_argument('--model-type', type=str, default='transformer',
-                       choices=['transformer', 'multimodal'],
-                       help='Model architecture: transformer (single-stream) or multimodal (separate encoders)')
+                       choices=['transformer', 'multimodal', 'direct'],
+                       help='Model architecture: transformer, multimodal, or direct (DirectPricePredictor)')
     parser.add_argument('--hidden-dim', type=int, default=1024,
                        help='Hidden dimension')
     parser.add_argument('--num-layers', type=int, default=4,
@@ -4105,6 +4135,12 @@ def main():
     parser.add_argument('--pred-mode', type=str, default='regression',
                        choices=['classification', 'regression'],
                        help='Prediction mode')
+
+    # Encoder loading config (for --model-type direct)
+    parser.add_argument('--encoder-path', type=str, default=None,
+                       help='Path to pretrained encoder checkpoint (for --model-type direct)')
+    parser.add_argument('--freeze-encoder', action='store_true',
+                       help='Freeze encoder weights after loading (default: True for direct mode)')
 
     # Contrastive pretraining config
     parser.add_argument('--contrastive-pretrain', action='store_true',
@@ -4260,6 +4296,9 @@ def main():
         num_heads=args.num_heads,
         dropout=args.dropout,
         pred_mode=args.pred_mode,
+        # Encoder loading (for direct mode)
+        encoder_path=args.encoder_path,
+        freeze_encoder=args.freeze_encoder if args.encoder_path else True,
         # Contrastive pretraining
         contrastive_pretrain=args.contrastive_pretrain,
         contrastive_epochs=args.contrastive_epochs,

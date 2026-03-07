@@ -38,6 +38,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from training.model import SimpleTransformerPredictor
+from training.multimodal_model import MultiModalStockPredictor
 
 
 # ============================================================================
@@ -603,26 +604,49 @@ class PrincipledEvaluator:
                 return None
         return None
 
-    def load_model(self, checkpoint_path: str) -> Tuple[SimpleTransformerPredictor, dict]:
-        """Load model from checkpoint."""
+    def load_model(self, checkpoint_path: str) -> Tuple[torch.nn.Module, dict]:
+        """Load model from checkpoint. Supports both SimpleTransformerPredictor and MultiModalStockPredictor."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         config = checkpoint['config']
-
-        model = SimpleTransformerPredictor(
-            input_dim=self.input_dim,
-            hidden_dim=config['hidden_dim'],
-            num_layers=config['num_layers'],
-            num_heads=config['num_heads'],
-            dropout=config['dropout'],
-            num_pred_days=4,
-            pred_mode=config.get('pred_mode', 'classification')
-        )
 
         # Handle compiled model state dict
         state_dict = checkpoint['model_state_dict']
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
             state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+        # Detect model type from state dict keys
+        is_multimodal = any(k.startswith('technical_encoder.') or k.startswith('fundamentals_encoder.')
+                           for k in state_dict.keys())
+
+        if is_multimodal:
+            print(f"    Detected MultiModalStockPredictor checkpoint")
+            # Suppress model print output
+            import io, sys
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            model = MultiModalStockPredictor(
+                hidden_dim=config['hidden_dim'],
+                num_technical_layers=config.get('num_layers', 4),
+                num_technical_heads=config.get('num_heads', 4),
+                dropout=config.get('dropout', 0.1),
+                num_pred_days=4,
+                pred_mode=config.get('pred_mode', 'classification'),
+                max_seq_len=self.seq_len,
+            )
+
+            sys.stdout = old_stdout
+        else:
+            model = SimpleTransformerPredictor(
+                input_dim=self.input_dim,
+                hidden_dim=config['hidden_dim'],
+                num_layers=config['num_layers'],
+                num_heads=config['num_heads'],
+                dropout=config['dropout'],
+                num_pred_days=4,
+                pred_mode=config.get('pred_mode', 'classification')
+            )
 
         model.load_state_dict(state_dict, strict=False)
         model = model.to(self.device)
@@ -635,6 +659,11 @@ class PrincipledEvaluator:
         # Load bin edges if classification
         bin_edges = checkpoint.get('bin_edges', None)
         if bin_edges is not None:
+            # Check for corrupted bin_edges (all zeros)
+            if (bin_edges == 0).all():
+                print(f"    WARNING: bin_edges are all zeros (corrupted checkpoint)")
+                print(f"    Using uniform bins [-0.5, 0.5] as fallback")
+                bin_edges = torch.linspace(-0.5, 0.5, 101, dtype=torch.float32)
             bin_edges = bin_edges.to(self.device)
             print(f"    Bin edges on device: {bin_edges.device}")
 

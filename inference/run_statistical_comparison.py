@@ -4,12 +4,19 @@ Example runner for statistical comparison.
 
 Quick usage:
     python inference/run_statistical_comparison.py
+    python inference/run_statistical_comparison.py --device cuda:1
 """
 
+import argparse
 import subprocess
 import sys
 
 def main():
+    parser = argparse.ArgumentParser(description='Run statistical comparison')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to use (e.g., cuda, cuda:0, cuda:1, cpu)')
+    args = parser.parse_args()
+
     # Default configuration
     cmd = [
         sys.executable,
@@ -29,9 +36,10 @@ def main():
         '--batch-size', '128',
         '--output', 'statistical_comparison_results.pt',
         '--seed', '42',
+        '--device', args.device,
     ]
 
-    print("🚀 Running statistical comparison...")
+    print("Running statistical comparison...")
     print(f"Command: {' '.join(cmd)}\n")
 
     subprocess.run(cmd)
